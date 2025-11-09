@@ -17,11 +17,17 @@ tokio = { version = "1.48.0", features = ["full"] }
 # For waterfall example
 plotters = { version = "0.3.7", optional = true }
 rustfft = { version = "6.4.1", optional = true }
+clap = { version = "4.5.51", features = [
+    "color",
+    "derive",
+    "wrap_help",
+    "env",
+], optional = true }
 
 [features]
 default = []
 rtlsdr = ["dep:rtl-sdr-rs"]
-waterfall = ["plotters", "rustfft"]
+waterfall = ["plotters", "rustfft", "clap"]
 
 [[example]]
 name = "waterfall"
