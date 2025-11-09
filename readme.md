@@ -23,10 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = 96_000;
     let center_freq = 162_000_000;
     let chunk_size = 8136;
-    let reader = IqSource::from_file(path, center_freq, sample_rate, chunk_size, IqFormat::Cu8)?;
+    let iq_format = IqFormat::Cu8;
 
-
-    for samples in reader {
+    for samples in IqSource::from_file(path, center_freq, sample_rate, chunk_size, iq_format)? {
         for s in samples? {  // samples is a Result<Vec<Complex<f32>>, _>
             println!("  I: {}, Q: {}", s.re, s.im);
         }
@@ -37,17 +36,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### RTL-SDR (async version)
 
+Access to RTL-SDR devices is provided with the `rtlsdr` feature enabled.
+
 ```rust
-use desperado::{IqFormat, IqSource, RtlSdrConfig};
+use desperado::AsyncIqSource;
+use futures::StreamExt;
 
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> tokio::io::Result<()> {
     let device_index = 0;
     let sample_rate = 2_400_000;
     let center_freq = 1_090_000_000;
     let gain = Some(496);
 
-    let reader = from_rtlsdr(
+    let reader = AsyncIqSource::from_rtlsdr(
         device_index: usize,
         center_freq: u32,
         sample_rate: u32,
