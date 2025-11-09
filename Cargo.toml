@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Xavier Olive <git@xoolive.org>"]
 license = "MIT"
-description = "Basic digital processing for radio signal decoding"
-repository = "https://github.com/xoolive/voracious"
+description = "Iterate and stream I/Q samples from stdin, files, TCP streams and SDR devices"
+repository = "https://github.com/xoolive/desperado"
 keywords = ["radio", "decoder"]
 
 [dependencies]
