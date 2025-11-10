@@ -70,7 +70,7 @@ impl RtlSdrReader {
 }
 
 impl Iterator for RtlSdrReader {
-    type Item = Result<Vec<Complex<f32>>, RtlsdrError>;
+    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.end {
@@ -82,7 +82,7 @@ impl Iterator for RtlSdrReader {
                     self.pos = 0;
                     self.end = bytes_read;
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(std::io::Error::other(format!("{}", e)))),
             }
         }
 
@@ -165,7 +165,7 @@ impl AsyncRtlSdrReader {
 }
 
 impl Stream for AsyncRtlSdrReader {
-    type Item = Result<Vec<Complex<f32>>, RtlsdrError>;
+    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -173,7 +173,9 @@ impl Stream for AsyncRtlSdrReader {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
         match this.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
+            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(
+                item.map_err(|e| std::io::Error::other(format!("RtlsdrError: {}", e))),
+            )),
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }

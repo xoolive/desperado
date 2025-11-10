@@ -1,9 +1,7 @@
 #![doc = include_str!("../readme.md")]
 
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures::Stream;
 use num_complex::Complex;
@@ -33,6 +31,10 @@ pub enum IqFormat {
 pub enum IqSource {
     /// File-based IQ source
     IqFile(iqread::IqRead<std::io::BufReader<std::fs::File>>),
+    /// Stdin-based IQ source
+    IqStdin(iqread::IqRead<std::io::BufReader<std::io::Stdin>>),
+    /// TCP-based IQ source
+    IqTcp(iqread::IqRead<std::io::BufReader<std::net::TcpStream>>),
     #[cfg(feature = "rtlsdr")]
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
     RtlSdr(rtlsdr::RtlSdrReader),
@@ -44,8 +46,10 @@ impl Iterator for IqSource {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             IqSource::IqFile(source) => source.next(),
+            IqSource::IqStdin(source) => source.next(),
+            IqSource::IqTcp(source) => source.next(),
             #[cfg(feature = "rtlsdr")]
-            IqSource::RtlSdr(_source) => todo!(), /*source.next()*/
+            IqSource::RtlSdr(source) => source.next(),
         }
     }
 }
@@ -61,6 +65,29 @@ impl IqSource {
         let source =
             iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
         Ok(IqSource::IqFile(source))
+    }
+
+    pub fn from_stdin(
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> Result<IqSource, std::io::Error> {
+        let source = iqread::IqRead::from_stdin(center_freq, sample_rate, chunk_size, iq_format);
+        Ok(IqSource::IqStdin(source))
+    }
+
+    pub fn from_tcp(
+        addr: &str,
+        port: u16,
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> Result<Self, std::io::Error> {
+        let source =
+            iqread::IqRead::from_tcp(addr, port, center_freq, sample_rate, chunk_size, iq_format)?;
+        Ok(IqSource::IqTcp(source))
     }
 
     #[cfg(feature = "rtlsdr")]
@@ -173,7 +200,7 @@ impl Stream for IqAsyncSource {
             IqAsyncSource::IqAsyncStdin(source) => Pin::new(source).poll_next(cx),
             IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "rtlsdr")]
-            IqAsyncSource::RtlSdr(_source) => todo!(), /*Pin::new(source).poll_next(cx)*/
+            IqAsyncSource::RtlSdr(source) => Pin::new(source).poll_next(cx),
         }
     }
 }

@@ -44,6 +44,16 @@ pub struct IqRead<R: Read> {
     reader: R,
 }
 
+impl<R: Read> IqRead<R> {
+    fn read_samples(&mut self) -> Result<Vec<Complex<f32>>, std::io::Error> {
+        let bytes_per_sample = self.config.iq_format.bytes_per_sample();
+        let mut buffer = vec![0u8; self.config.chunk_size * bytes_per_sample];
+        self.reader.read_exact(&mut buffer)?;
+        let samples = crate::convert_bytes_to_complex(self.config.iq_format, &buffer);
+        Ok(samples)
+    }
+}
+
 impl IqRead<std::io::BufReader<std::fs::File>> {
     pub fn from_file<P: AsRef<Path>>(
         path: P,
@@ -58,17 +68,38 @@ impl IqRead<std::io::BufReader<std::fs::File>> {
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
         Ok(Self { config, reader })
     }
+}
 
-    fn read_samples(&mut self) -> Result<Vec<Complex<f32>>, std::io::Error> {
-        let bytes_per_sample = self.config.iq_format.bytes_per_sample();
-        let mut buffer = vec![0u8; self.config.chunk_size * bytes_per_sample];
-        self.reader.read_exact(&mut buffer)?;
-        let samples = crate::convert_bytes_to_complex(self.config.iq_format, &buffer);
-        Ok(samples)
+impl IqRead<std::io::BufReader<std::io::Stdin>> {
+    pub fn from_stdin(
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> Self {
+        let reader = std::io::BufReader::new(std::io::stdin());
+        let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
+        Self { config, reader }
     }
 }
 
-impl Iterator for IqRead<std::io::BufReader<std::fs::File>> {
+impl IqRead<std::io::BufReader<std::net::TcpStream>> {
+    pub fn from_tcp(
+        addr: &str,
+        port: u16,
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> Result<Self, std::io::Error> {
+        let stream = std::net::TcpStream::connect((addr, port))?;
+        let reader = std::io::BufReader::new(stream);
+        let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
+        Ok(Self { config, reader })
+    }
+}
+
+impl<R: Read> Iterator for IqRead<R> {
     type Item = Result<Vec<Complex<f32>>, std::io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
