@@ -1,3 +1,10 @@
+//! RTL-SDR I/Q Data Source Module
+//! (requires the `rtlsdr` feature)
+//!
+//! This module provides functionality to read I/Q samples from RTL-SDR devices,
+//! both synchronously and asynchronously. It uses the `rtl_sdr_rs` crate to
+//! interface with the RTL-SDR hardware.
+
 use futures::Stream;
 use num_complex::Complex;
 use rtl_sdr_rs::error::RtlsdrError;
@@ -5,6 +12,9 @@ use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
 
 use crate::IqFormat;
 
+/**
+ * RTL-SDR Configuration
+ */
 #[derive(Debug, Clone)]
 pub struct RtlSdrConfig {
     /// Device index (0 for first device)
@@ -29,6 +39,9 @@ impl RtlSdrConfig {
     }
 }
 
+/**
+ * Synchronous RTL-SDR I/Q Reader
+ */
 pub struct RtlSdrReader {
     rtlsdr: RtlSdr,
     buf: Vec<u8>,
@@ -80,6 +93,9 @@ impl Iterator for RtlSdrReader {
     }
 }
 
+/**
+ * Asynchronous RTL-SDR I/Q Reader
+ */
 pub struct AsyncRtlSdrReader {
     rx: tokio::sync::mpsc::Receiver<Result<Vec<Complex<f32>>, RtlsdrError>>,
     _handle: std::thread::JoinHandle<()>,

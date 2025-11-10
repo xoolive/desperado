@@ -1,3 +1,9 @@
+//! I/Q Data Reading Module
+//!
+//! This module provides functionality to read I/Q samples from various sources,
+//! including files, standard input, and TCP streams. It supports different I/Q
+//! data formats and provides both synchronous and asynchronous interfaces for
+//! reading I/Q samples.
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -9,6 +15,9 @@ use tokio::io::AsyncBufRead;
 
 use crate::IqFormat;
 
+/**
+ * I/Q Data Source Configuration
+ */
 pub struct IqConfig {
     pub iq_format: IqFormat,
     pub center_freq: u32,
@@ -27,15 +36,14 @@ impl IqConfig {
     }
 }
 
+/**
+ * Synchronous I/Q Reader
+ */
 pub struct IqRead<R: Read> {
     config: IqConfig,
     reader: R,
 }
 
-pub struct IqAsyncRead<R: tokio::io::AsyncBufRead + Unpin> {
-    config: IqConfig,
-    reader: R,
-}
 impl IqRead<std::io::BufReader<std::fs::File>> {
     pub fn from_file<P: AsRef<Path>>(
         path: P,
@@ -70,6 +78,14 @@ impl Iterator for IqRead<std::io::BufReader<std::fs::File>> {
             Err(e) => Some(Err(e)),
         }
     }
+}
+
+/**
+ * Asynchronous I/Q Reader
+ */
+pub struct IqAsyncRead<R: tokio::io::AsyncBufRead + Unpin> {
+    config: IqConfig,
+    reader: R,
 }
 
 impl IqAsyncRead<tokio::io::BufReader<tokio::fs::File>> {

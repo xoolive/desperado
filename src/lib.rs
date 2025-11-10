@@ -1,12 +1,4 @@
-//! I/Q Data Sources Module This module provides various I/Q data sources,
-//! including file-based and RTL-SDR-based sources.
-//!
-//! The IqSource and IqAsyncSource enums encapsulates different types of I/Q
-//! data sources, allowing for easy integration into DSP processing pipelines.
-//!
-//! The IqSource provides an iterator interface for synchronous reading of I/Q
-//! samples, while the IqAsyncSource provides an asynchronous stream interface
-//! for non-blocking reading.
+#![doc = include_str!("../readme.md")]
 
 use std::{
     pin::Pin,
@@ -20,6 +12,9 @@ pub mod iqread;
 #[cfg(feature = "rtlsdr")]
 pub mod rtlsdr;
 
+/**
+ * I/Q Data Format
+ */
 #[derive(Debug, Copy, Clone)]
 pub enum IqFormat {
     /// Complex unsigned 8-bit (Cu8)
@@ -33,7 +28,7 @@ pub enum IqFormat {
 }
 
 /**
- * I/Q Data Source
+ * Synchronous I/Q Data Source (iterable)
  */
 pub enum IqSource {
     /// File-based IQ source
@@ -88,7 +83,7 @@ impl IqSource {
 }
 
 /**
- * Asynchronous I/Q Data Source
+ * Asynchronous I/Q Data Source (streamable)
  */
 pub enum IqAsyncSource {
     /// File-based IQ source

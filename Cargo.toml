@@ -36,8 +36,8 @@ path = "examples/waterfall.rs"
 required-features = ["clap", "waterfall"]
 
 [[example]]
-name = "file_sync"
-path = "examples/file_sync.rs"
+name = "file_iter"
+path = "examples/file_iter.rs"
 required-features = ["clap"]
 
 [[example]]

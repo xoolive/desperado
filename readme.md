@@ -6,8 +6,6 @@ Desperado provides a unified interface for iterating (synchronously) and streami
 
 The library intentionally does not include demodulation, focusing instead on providing a consistent interface over various sources.
 
-While basic digital signal processing (DSP) utilities (such as those used in waterfall visualizations) may be added, the core goal is to keep the interface simple and extensible. A Python wrapper with the same interface is also planned for future development.
-
 The name “Desperado” is a playful nod to DSP (Digital Signal Processing), and tips its hat to <https://www.youtube.com/watch?v=-q93wc3-deU>.
 
 ## Usage
