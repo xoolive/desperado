@@ -27,9 +27,20 @@ clap = { version = "4.5.51", features = [
 [features]
 default = []
 rtlsdr = ["dep:rtl-sdr-rs"]
-waterfall = ["plotters", "rustfft", "clap"]
+waterfall = ["plotters", "rustfft"]
+examples = ["clap"]
 
 [[example]]
 name = "waterfall"
 path = "examples/waterfall.rs"
-required-features = ["waterfall"]
+required-features = ["clap", "waterfall"]
+
+[[example]]
+name = "file_sync"
+path = "examples/file_sync.rs"
+required-features = ["clap"]
+
+[[example]]
+name = "file_stream"
+path = "examples/file_stream.rs"
+required-features = ["clap"]
