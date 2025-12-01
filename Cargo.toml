@@ -15,7 +15,7 @@ num-complex = "0.4.6"
 rtl-sdr-rs = { version = "0.2", optional = true }
 tokio = { version = "1.48.0", features = ["full"] }
 # For examples
-clap = { version = "4.5.51", features = [
+clap = { version = "4.5.53", features = [
     "color",
     "derive",
     "wrap_help",
