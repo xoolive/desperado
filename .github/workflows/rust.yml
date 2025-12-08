@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -14,9 +15,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Set up dependencies
+        run: |
+          sudo apt-get update
+          # fontconfig is needed for plotters that use font rendering
+          # libasound2-dev is needed for audio output in some examples
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev libasound2-dev
+          # libiio-* is needed for Adalm-Pluto support
+          sudo apt-get install -y --no-install-recommends libsoapysdr-dev libiio-dev libiio-utils
 
       - name: Code linting
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

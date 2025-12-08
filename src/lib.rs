@@ -40,12 +40,14 @@ pub enum IqSource {
     IqStdin(iqread::IqRead<std::io::BufReader<std::io::Stdin>>),
     /// TCP-based IQ source
     IqTcp(iqread::IqRead<std::io::BufReader<std::net::TcpStream>>),
-    #[cfg(feature = "rtlsdr")]
     /// Adalm Pluto-based IQ source (requires "pluto" feature)
+    #[cfg(feature = "pluto")]
     PlutoSdr(pluto::PlutoSdrReader),
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
+    #[cfg(feature = "rtlsdr")]
     RtlSdr(rtlsdr::RtlSdrReader),
     /// SoapySDR-based IQ source (requires "soapy" feature)
+    #[cfg(feature = "soapy")]
     SoapySdr(soapy::SoapySdrReader),
 }
 
@@ -175,8 +177,8 @@ pub enum IqAsyncSource {
     /// Adalm Pluto-based IQ source (requires "pluto" feature)
     #[cfg(feature = "pluto")]
     PlutoSdr(pluto::AsyncPlutoSdrReader),
-    #[cfg(feature = "rtlsdr")]
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
+    #[cfg(feature = "rtlsdr")]
     RtlSdr(rtlsdr::AsyncRtlSdrReader),
     /// SoapySDR-based IQ source (requires "soapy" feature)
     #[cfg(feature = "soapy")]

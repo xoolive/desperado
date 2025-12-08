@@ -506,11 +506,11 @@ impl StereoAudioAdaptiveResampler {
 
             if let Ok(output_blocks) = Resampler::process(&mut self.resampler, &chs, None) {
                 let out_frames = output_blocks[0].len();
-                for i in 0..out_frames {
+                (0..out_frames).for_each(|i| {
                     (0..self.channels).for_each(|ch| {
                         output_interleaved.push(output_blocks[ch][i]);
                     });
-                }
+                });
             } else {
                 break;
             }
