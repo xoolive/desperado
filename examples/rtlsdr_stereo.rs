@@ -498,18 +498,18 @@ impl StereoAudioAdaptiveResampler {
             let mut chs: Vec<Vec<f32>> =
                 vec![Vec::with_capacity(input_frames_needed); self.channels];
             for frame_idx in 0..input_frames_needed {
-                for ch in 0..self.channels {
+                (0..self.channels).for_each(|ch| {
                     let idx = frame_idx * self.channels + ch;
                     chs[ch].push(chunk[idx]);
-                }
+                });
             }
 
             if let Ok(output_blocks) = Resampler::process(&mut self.resampler, &chs, None) {
                 let out_frames = output_blocks[0].len();
                 for i in 0..out_frames {
-                    for ch in 0..self.channels {
+                    (0..self.channels).for_each(|ch| {
                         output_interleaved.push(output_blocks[ch][i]);
-                    }
+                    });
                 }
             } else {
                 break;
@@ -535,6 +535,7 @@ pub struct RdsDecoder {
     bpf_lo: LowPassFir,
     lpf: LowPassFir,
     // Symbol timing recovery
+    #[allow(dead_code)]
     symbol_rate: f32,
     symbol_phase: f32,
     symbol_period: f32,
