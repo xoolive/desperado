@@ -10,7 +10,7 @@ The name “Desperado” is a playful nod to DSP (Digital Signal Processing), an
 
 ## Usage
 
-### Basic Example
+### Basic Example (synchronous version)
 
 ```rust
 use desperado::{IqFormat, IqSource};
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### RTL-SDR (async version)
+### RTL-SDR (sync and async version)
 
 Access to RTL-SDR devices is provided with the `rtlsdr` feature enabled.
 
@@ -47,12 +47,7 @@ async fn main() -> tokio::io::Result<()> {
     let center_freq = 1_090_000_000;
     let gain = Some(496);
 
-    let reader = AsyncIqSource::from_rtlsdr(
-        device_index: usize,
-        center_freq: u32,
-        sample_rate: u32,
-        gain: Option<i32>,
-    ).await?;
+    let reader = AsyncIqSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
 
     while let Some(samples) = reader.next().await {
         // Process samples...
@@ -61,3 +56,22 @@ async fn main() -> tokio::io::Result<()> {
     Ok(())
 }
 ```
+
+### More data sources
+
+Desperado supports various data sources: the following table summarizes the available sources.
+
+Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncIqSource`) versions.
+
+| **Frontend**   | Method name                    | Source format    | Optional Feature | Identifier       |
+| -------------- | ------------------------------ | ---------------- | ---------------- | ---------------- |
+| I/Q File       | `[Async]IqSource::from_file`   | any              |                  | file name        |
+| Standard Input | `[Async]IqSource::from_stdin`  | any              |                  |
+| TCP socket     | `[Async]IqSource::from_tcp`    | any              |                  | address and port |
+| RTL-SDR        | `[Async]IqSource::from_rtlsdr` | `IqFormat::Cu8`  | `rtlsdr`         | device index     |
+| Soapy          | `[Async]IqSource::from_soapy`  | `IqFormat::Cs16` | `soapy`          | device arguments |
+| Adalm-Pluto    | `[Async]IqSource::from_pluto`  | `IqFormat::Cs16` | `pluto`          | URI              |
+
+All samples are returned as `Complex<f32>` values, regardless of the source.
+
+Contributions to include more SDR frontends (LimeSDR, HackRF, etc.) are welcome.
