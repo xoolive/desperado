@@ -8,6 +8,8 @@ use num_complex::Complex;
 
 pub mod dsp;
 pub mod iqread;
+#[cfg(feature = "pluto")]
+pub mod pluto;
 #[cfg(feature = "rtlsdr")]
 pub mod rtlsdr;
 #[cfg(feature = "soapy")]
@@ -39,6 +41,8 @@ pub enum IqSource {
     /// TCP-based IQ source
     IqTcp(iqread::IqRead<std::io::BufReader<std::net::TcpStream>>),
     #[cfg(feature = "rtlsdr")]
+    /// Adalm Pluto-based IQ source (requires "pluto" feature)
+    PlutoSdr(pluto::PlutoSdrReader),
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
     RtlSdr(rtlsdr::RtlSdrReader),
     /// SoapySDR-based IQ source (requires "soapy" feature)
@@ -53,6 +57,8 @@ impl Iterator for IqSource {
             IqSource::IqFile(source) => source.next(),
             IqSource::IqStdin(source) => source.next(),
             IqSource::IqTcp(source) => source.next(),
+            #[cfg(feature = "pluto")]
+            IqSource::PlutoSdr(source) => source.next(),
             #[cfg(feature = "rtlsdr")]
             IqSource::RtlSdr(source) => source.next(),
             #[cfg(feature = "soapy")]
@@ -95,6 +101,24 @@ impl IqSource {
         let source =
             iqread::IqRead::from_tcp(addr, port, center_freq, sample_rate, chunk_size, iq_format)?;
         Ok(IqSource::IqTcp(source))
+    }
+
+    #[cfg(feature = "pluto")]
+    /// Create a new Adalm Pluto-based I/Q source
+    pub fn from_pluto(
+        uri: &str,
+        center_freq: i64,
+        sample_rate: i64,
+        gain: f64,
+    ) -> Result<Self, String> {
+        let config = pluto::PlutoConfig {
+            uri: uri.to_string(),
+            center_freq,
+            sample_rate,
+            gain,
+        };
+        let source = pluto::PlutoSdrReader::new(&config)?;
+        Ok(IqSource::PlutoSdr(source))
     }
 
     #[cfg(feature = "rtlsdr")]
@@ -148,10 +172,14 @@ pub enum IqAsyncSource {
     IqAsyncStdin(iqread::IqAsyncRead<tokio::io::BufReader<tokio::io::Stdin>>),
     /// TCP-based IQ source
     IqAsyncTcp(iqread::IqAsyncRead<tokio::io::BufReader<tokio::net::TcpStream>>),
+    /// Adalm Pluto-based IQ source (requires "pluto" feature)
+    #[cfg(feature = "pluto")]
+    PlutoSdr(pluto::AsyncPlutoSdrReader),
     #[cfg(feature = "rtlsdr")]
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
     RtlSdr(rtlsdr::AsyncRtlSdrReader),
     /// SoapySDR-based IQ source (requires "soapy" feature)
+    #[cfg(feature = "soapy")]
     SoapySdr(soapy::AsyncSoapySdrReader),
 }
 
@@ -203,6 +231,24 @@ impl IqAsyncSource {
         Ok(IqAsyncSource::IqAsyncTcp(source))
     }
 
+    #[cfg(feature = "pluto")]
+    /// Create a new Adalm Pluto-based asynchronous I/Q source
+    pub async fn from_pluto(
+        uri: &str,
+        center_freq: i64,
+        sample_rate: i64,
+        gain: f64,
+    ) -> Result<Self, String> {
+        let config = pluto::PlutoConfig {
+            uri: uri.to_string(),
+            center_freq,
+            sample_rate,
+            gain,
+        };
+        let source = pluto::AsyncPlutoSdrReader::new(&config).await?;
+        Ok(IqAsyncSource::PlutoSdr(source))
+    }
+
     #[cfg(feature = "rtlsdr")]
     /// Create a new RTL-SDR-based asynchronous I/Q source
     pub async fn from_rtlsdr(
@@ -252,6 +298,8 @@ impl Stream for IqAsyncSource {
             IqAsyncSource::IqAsyncFile(source) => Pin::new(source).poll_next(cx),
             IqAsyncSource::IqAsyncStdin(source) => Pin::new(source).poll_next(cx),
             IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "pluto")]
+            IqAsyncSource::PlutoSdr(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "rtlsdr")]
             IqAsyncSource::RtlSdr(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "soapy")]

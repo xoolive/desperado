@@ -116,7 +116,7 @@ async fn main() -> tokio::io::Result<()> {
     let mut stereo = StereoDecoderPLL::new(FM_BANDWIDTH);
     let mut deemphasis_l = DeemphasisFilter::new(FM_BANDWIDTH, 50e-6);
     let mut deemphasis_r = DeemphasisFilter::new(FM_BANDWIDTH, 50e-6);
-    //let mut rds = RdsDecoder::new(FM_BANDWIDTH);
+    let mut rds = RdsDecoder::new(FM_BANDWIDTH);
 
     let mut audio_resample =
         StereoAudioAdaptiveResampler::new(AUDIO_RATE as f64 / FM_BANDWIDTH as f64, 5, 2); // More frequent adjustments
@@ -146,7 +146,7 @@ async fn main() -> tokio::io::Result<()> {
         let deem_l = deemphasis_l.process(&left);
         let deem_r = deemphasis_r.process(&right);
 
-        //rds.process(&filtered);
+        rds.process(&filtered);
 
         // Interleave stereo
         let mut interleaved = Vec::with_capacity(deem_l.len() * 2);

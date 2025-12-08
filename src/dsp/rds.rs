@@ -177,7 +177,7 @@ impl RdsParser {
 
                 ok &= offsets[0] == 'A';
                 ok &= offsets[1] == 'B';
-                ok &= (offsets[2] == 'C' || offsets[2] == 'c');
+                ok &= offsets[2] == 'C' || offsets[2] == 'c';
                 ok &= offsets[3] == 'D';
 
                 if ok {
@@ -215,7 +215,12 @@ impl RdsParser {
 
         // Debug print minimal info
         // e.g. Group 0A, PI:
-        // println!("RDS group {}{} PI=0x{:04X}", group_type, if version==0 {'A'} else {'B'}, pi);
+        println!(
+            "RDS group {}{} PI=0x{:04X}",
+            group_type,
+            if version == 0 { 'A' } else { 'B' },
+            pi
+        );
 
         match (group_type, version) {
             (0, 0) => {
@@ -255,13 +260,13 @@ impl RdsParser {
                 let b = (block3 & 0xFF) as u8;
                 let c = ((block4 >> 8) & 0xFF) as u8;
                 let d = (block4 & 0xFF) as u8;
-                let pos = (seg as usize) * 4;
+                let pos = seg * 4;
                 if pos + 3 < self.rt.len() {
                     self.rt[pos] = a;
                     self.rt[pos + 1] = b;
                     self.rt[pos + 2] = c;
                     self.rt[pos + 3] = d;
-                    self.rt_received_mask[seg as usize] = true;
+                    self.rt_received_mask[seg] = true;
                 }
                 // Remove direct printing
             }
@@ -270,11 +275,11 @@ impl RdsParser {
                 let seg = rt_seg_addr & 0x0F;
                 let c = ((block4 >> 8) & 0xFF) as u8;
                 let d = (block4 & 0xFF) as u8;
-                let pos = (seg as usize) * 4;
+                let pos = seg * 4;
                 if pos + 1 < self.rt.len() {
                     self.rt[pos] = c;
                     self.rt[pos + 1] = d;
-                    self.rt_received_mask[seg as usize] = true;
+                    self.rt_received_mask[seg] = true;
                 }
                 // Remove direct printing
             }
