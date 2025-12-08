@@ -6,9 +6,12 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use num_complex::Complex;
 
+pub mod dsp;
 pub mod iqread;
 #[cfg(feature = "rtlsdr")]
 pub mod rtlsdr;
+#[cfg(feature = "soapy")]
+pub mod soapy;
 
 /**
  * I/Q Data Format
@@ -38,6 +41,8 @@ pub enum IqSource {
     #[cfg(feature = "rtlsdr")]
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
     RtlSdr(rtlsdr::RtlSdrReader),
+    /// SoapySDR-based IQ source (requires "soapy" feature)
+    SoapySdr(soapy::SoapySdrReader),
 }
 
 impl Iterator for IqSource {
@@ -50,6 +55,8 @@ impl Iterator for IqSource {
             IqSource::IqTcp(source) => source.next(),
             #[cfg(feature = "rtlsdr")]
             IqSource::RtlSdr(source) => source.next(),
+            #[cfg(feature = "soapy")]
+            IqSource::SoapySdr(source) => source.next(),
         }
     }
 }
@@ -107,6 +114,28 @@ impl IqSource {
         let source = rtlsdr::RtlSdrReader::new(&config)?;
         Ok(IqSource::RtlSdr(source))
     }
+
+    #[cfg(feature = "soapy")]
+    /// Create a new SoapySDR-based I/Q source
+    pub fn from_soapysdr(
+        args: &str,
+        channel: usize,
+        center_freq: u32,
+        sample_rate: u32,
+        gain: Option<f64>,
+        gain_element: &str,
+    ) -> Result<Self, soapysdr::Error> {
+        let config = soapy::SoapyConfig {
+            args: args.to_string(),
+            center_freq: center_freq as f64,
+            sample_rate: sample_rate as f64,
+            channel,
+            gain,
+            gain_element: gain_element.to_string(),
+        };
+        let source = soapy::SoapySdrReader::new(&config)?;
+        Ok(IqSource::SoapySdr(source))
+    }
 }
 
 /**
@@ -122,6 +151,8 @@ pub enum IqAsyncSource {
     #[cfg(feature = "rtlsdr")]
     /// RTL-SDR-based IQ source (requires "rtlsdr" feature)
     RtlSdr(rtlsdr::AsyncRtlSdrReader),
+    /// SoapySDR-based IQ source (requires "soapy" feature)
+    SoapySdr(soapy::AsyncSoapySdrReader),
 }
 
 impl IqAsyncSource {
@@ -189,6 +220,28 @@ impl IqAsyncSource {
         let async_reader = rtlsdr::AsyncRtlSdrReader::new(&config)?;
         Ok(IqAsyncSource::RtlSdr(async_reader))
     }
+
+    #[cfg(feature = "soapy")]
+    /// Create a new SoapySDR-based asynchronous I/Q source
+    pub async fn from_soapysdr(
+        args: &str,
+        channel: usize,
+        center_freq: u32,
+        sample_rate: u32,
+        gain: Option<f64>,
+        gain_element: &str,
+    ) -> Result<Self, soapysdr::Error> {
+        let config = soapy::SoapyConfig {
+            args: args.to_string(),
+            center_freq: center_freq as f64,
+            sample_rate: sample_rate as f64,
+            channel,
+            gain,
+            gain_element: gain_element.to_string(),
+        };
+        let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
+        Ok(IqAsyncSource::SoapySdr(async_reader))
+    }
 }
 
 impl Stream for IqAsyncSource {
@@ -201,6 +254,8 @@ impl Stream for IqAsyncSource {
             IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "rtlsdr")]
             IqAsyncSource::RtlSdr(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "soapy")]
+            IqAsyncSource::SoapySdr(source) => Pin::new(source).poll_next(cx),
         }
     }
 }
