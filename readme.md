@@ -75,7 +75,7 @@ If you're using Desperado in your project, feel free to open a PR to add it here
 
 ### Basic example (synchronous version)
 
-```rust
+```rust ignore
 use desperado::{IqFormat, IqSource};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,8 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Access to RTL-SDR devices is provided with the `rtlsdr` feature enabled.
 
-```rust
-use desperado::AsyncIqSource;
+```rust ignore
+use desperado::IqAsyncSource;
 use futures::StreamExt;
 
 #[tokio::main]
@@ -110,7 +110,7 @@ async fn main() -> tokio::io::Result<()> {
     let center_freq = 1_090_000_000;
     let gain = Some(496);
 
-    let reader = AsyncIqSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
+    let reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
 
     while let Some(samples) = reader.next().await {
         // Process samples...

@@ -8,7 +8,8 @@
 /// # Example
 /// ```
 /// use num_complex::Complex;
-/// use desperado::dsp::Rotate;
+/// use desperado::dsp::rotate::Rotate;
+/// use crate::desperado::dsp::DspBlock;
 ///
 /// let mut rotator = Rotate::new(std::f32::consts::FRAC_PI_2); // 90 degrees per sample
 /// let input = vec![Complex::new(1.0, 0.0); 4];

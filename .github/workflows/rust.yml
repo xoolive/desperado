@@ -21,6 +21,15 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Set up dependencies
+        run: |
+          sudo apt-get update
+          # fontconfig is needed for plotters that use font rendering
+          # libasound2-dev is needed for audio output in some examples
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev libasound2-dev
+          # libiio-* is needed for Adalm-Pluto support
+          sudo apt-get install -y --no-install-recommends libsoapysdr-dev libiio-dev libiio-utils
+
       - name: Code formatting
         run: cargo fmt --all --check
 
@@ -74,10 +83,13 @@ jobs:
       - name: Set up dependencies
         run: |
           sudo apt-get update
+          # fontconfig is needed for plotters that use font rendering
+          # libasound2-dev is needed for audio output in some examples
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev libasound2-dev
+          # libiio-* is needed for Adalm-Pluto support
           sudo apt-get install -y --no-install-recommends libsoapysdr-dev libiio-dev libiio-utils
 
       - name: Check docs
         env:
           RUSTDOCFLAGS: "-D rustdoc::all -A rustdoc::private-doc-tests"
         run: cargo doc --all-features --no-deps
-
