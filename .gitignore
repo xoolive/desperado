@@ -1,2 +1,11 @@
 /target
 waterfall.png
+
+# I/Q sample files
+*.iq
+*.wav
+*.bin
+
+# macOS metadata
+Icon\r
+.DS_Store
