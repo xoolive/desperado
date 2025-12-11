@@ -6,7 +6,10 @@ authors = ["Xavier Olive <git@xoolive.org>"]
 license = "MIT"
 description = "Iterate and stream I/Q samples from stdin, files, TCP streams and SDR devices"
 repository = "https://github.com/xoolive/desperado"
-keywords = ["radio", "decoder"]
+documentation = "https://docs.rs/desperado"
+readme = "readme.md"
+keywords = ["radio", "decoder", "sdr", "dsp"]
+categories = ["hardware-support", "digital-signal-processing"]
 
 [dependencies]
 dirs = "6.0.0"

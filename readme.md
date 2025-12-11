@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="logo.png" alt="Desperado Logo" width="200"/>
+</div>
+
 # Desperado
 
 Desperado is a library designed to factorize and reuse code for reading I/Q samples from files, SDR devices, and other sources.
