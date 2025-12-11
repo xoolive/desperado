@@ -12,8 +12,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Fast checks first - fail fast
+  check:
+    name: Check
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Code formatting
+        run: cargo fmt --all --check
+
+      - name: Code linting (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Code linting (no features)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+  # Build and test with different feature combinations
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - "--all-features"
+          - "--no-default-features"
+          - "--features rtlsdr"
+          - "--features soapy"
+          - "--features pluto"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -28,19 +56,28 @@ jobs:
           # libiio-* is needed for Adalm-Pluto support
           sudo apt-get install -y --no-install-recommends libsoapysdr-dev libiio-dev libiio-utils
 
-      - name: Code linting
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Code formatting
-        run: cargo fmt --all --check
-
       - name: Build
-        run: cargo build --verbose --release
+        run: cargo build --verbose ${{ matrix.features }}
 
-      - name: Run tests, examples and benchmarks
-        run: cargo test --workspace --all-features --all-targets
+      - name: Run tests
+        run: cargo test --verbose ${{ matrix.features }}
+
+  # Documentation build
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsoapysdr-dev libiio-dev libiio-utils
 
       - name: Check docs
         env:
           RUSTDOCFLAGS: "-D rustdoc::all -A rustdoc::private-doc-tests"
         run: cargo doc --all-features --no-deps
+
