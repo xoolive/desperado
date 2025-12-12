@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 use clap::Parser;
 use desperado::IqAsyncSource;
-use desperado::dsp::{DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, rds::RdsParser, rotate::Rotate};
+use desperado::dsp::{
+    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, rds::RdsParser, rotate::Rotate,
+};
 use num_complex::Complex;
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,

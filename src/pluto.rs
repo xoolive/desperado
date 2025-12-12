@@ -120,7 +120,7 @@ impl Iterator for PlutoSdrReader {
         if self.pos >= self.i_samples.len()
             && let Err(e) = self.refill_buffer()
         {
-            return Some(Err(std::io::Error::other(e)));
+            return Some(Err(error::Error::PlutoSdr(e.to_string())));
         }
 
         // Check if we have samples to return
@@ -207,7 +207,8 @@ impl AsyncPlutoSdrReader {
                 let _ = tx.blocking_send(Err(std::io::Error::other(format!(
                     "Buffer refill failed: {:?}",
                     e
-                ))));
+                ))
+                .into()));
                 break;
             }
 

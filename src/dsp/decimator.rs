@@ -271,8 +271,7 @@ mod tests {
 
         // Process in two chunks
         let chunk1: Vec<Complex<f32>> = (0..512).map(|i| Complex::new(i as f32, 0.0)).collect();
-        let chunk2: Vec<Complex<f32>> =
-            (512..1024).map(|i| Complex::new(i as f32, 0.0)).collect();
+        let chunk2: Vec<Complex<f32>> = (512..1024).map(|i| Complex::new(i as f32, 0.0)).collect();
 
         let out1 = dec.process(&chunk1);
         let out2 = dec.process(&chunk2);
