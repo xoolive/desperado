@@ -1,4 +1,12 @@
 #![doc = include_str!("../readme.md")]
+//!
+//! # API Naming Conventions
+//!
+//! This library follows consistent naming conventions:
+//! - **Synchronous types**: `IqSource`, `IqRead`, `RtlSdrReader`, etc.
+//! - **Asynchronous types**: `IqAsyncSource`, `IqAsyncRead`, `AsyncRtlSdrReader`, etc.
+//! - Async types are prefixed with `Async` or use `IqAsync` naming
+//! - All async operations return `Future`s or implement the `Stream` trait
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -19,24 +27,63 @@ pub mod soapy;
 // Re-export commonly used types
 pub use error::{Error, Result};
 
-/**
- * I/Q Data Format
- */
-#[derive(Debug, Copy, Clone)]
+/// I/Q Data Format
+///
+/// Represents the different formats for I/Q sample data. Each variant corresponds
+/// to a specific data type and encoding used for representing complex samples.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IqFormat {
     /// Complex unsigned 8-bit (Cu8)
+    ///
+    /// Two bytes per sample: I (unsigned 8-bit), Q (unsigned 8-bit)
+    /// Values range from 0-255, with 127.5 representing zero
     Cu8,
     /// Complex signed 8-bit (Cs8)
+    ///
+    /// Two bytes per sample: I (signed 8-bit), Q (signed 8-bit)
+    /// Values range from -128 to 127
     Cs8,
-    /// Complex signed 16-bit (Cs16)
+    /// Complex signed 16-bit little-endian (Cs16)
+    ///
+    /// Four bytes per sample: I (signed 16-bit LE), Q (signed 16-bit LE)
+    /// Values range from -32768 to 32767
     Cs16,
-    /// Complex 32-bit float (Cf32)
+    /// Complex 32-bit float little-endian (Cf32)
+    ///
+    /// Eight bytes per sample: I (32-bit float LE), Q (32-bit float LE)
+    /// Normalized float values
     Cf32,
 }
 
-/**
- * Synchronous I/Q Data Source (iterable)
- */
+impl std::fmt::Display for IqFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IqFormat::Cu8 => write!(f, "cu8"),
+            IqFormat::Cs8 => write!(f, "cs8"),
+            IqFormat::Cs16 => write!(f, "cs16"),
+            IqFormat::Cf32 => write!(f, "cf32"),
+        }
+    }
+}
+
+impl std::str::FromStr for IqFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "cu8" => Ok(IqFormat::Cu8),
+            "cs8" => Ok(IqFormat::Cs8),
+            "cs16" => Ok(IqFormat::Cs16),
+            "cf32" => Ok(IqFormat::Cf32),
+            _ => Err(Error::format(format!("Invalid IQ format: '{}'", s))),
+        }
+    }
+}
+
+/// Synchronous I/Q Data Source (iterable)
+///
+/// An enum representing different sources of I/Q data that can be read synchronously.
+/// Implements [`Iterator`] to yield chunks of I/Q samples as [`Complex<f32>`] vectors.
 pub enum IqSource {
     /// File-based IQ source
     IqFile(iqread::IqRead<std::io::BufReader<std::fs::File>>),
@@ -168,9 +215,12 @@ impl IqSource {
     }
 }
 
-/**
- * Asynchronous I/Q Data Source (streamable)
- */
+/// Asynchronous I/Q Data Source (streamable)
+///
+/// An enum representing different sources of I/Q data that can be read asynchronously.
+/// Implements [`Stream`] to yield chunks of I/Q samples as [`Complex<f32>`] vectors.
+///
+/// Use this when you need non-blocking I/O operations in an async runtime.
 pub enum IqAsyncSource {
     /// File-based IQ source
     IqAsyncFile(iqread::IqAsyncRead<tokio::io::BufReader<tokio::fs::File>>),
@@ -342,5 +392,51 @@ fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>
                 )
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_iqformat_display() {
+        assert_eq!(IqFormat::Cu8.to_string(), "cu8");
+        assert_eq!(IqFormat::Cs8.to_string(), "cs8");
+        assert_eq!(IqFormat::Cs16.to_string(), "cs16");
+        assert_eq!(IqFormat::Cf32.to_string(), "cf32");
+    }
+
+    #[test]
+    fn test_iqformat_fromstr() {
+        assert_eq!("cu8".parse::<IqFormat>().unwrap(), IqFormat::Cu8);
+        assert_eq!("cs8".parse::<IqFormat>().unwrap(), IqFormat::Cs8);
+        assert_eq!("cs16".parse::<IqFormat>().unwrap(), IqFormat::Cs16);
+        assert_eq!("cf32".parse::<IqFormat>().unwrap(), IqFormat::Cf32);
+    }
+
+    #[test]
+    fn test_iqformat_fromstr_case_insensitive() {
+        assert_eq!("CU8".parse::<IqFormat>().unwrap(), IqFormat::Cu8);
+        assert_eq!("Cs8".parse::<IqFormat>().unwrap(), IqFormat::Cs8);
+        assert_eq!("CS16".parse::<IqFormat>().unwrap(), IqFormat::Cs16);
+        assert_eq!("CF32".parse::<IqFormat>().unwrap(), IqFormat::Cf32);
+    }
+
+    #[test]
+    fn test_iqformat_fromstr_invalid() {
+        assert!("invalid".parse::<IqFormat>().is_err());
+        assert!("cu16".parse::<IqFormat>().is_err());
+        assert!("".parse::<IqFormat>().is_err());
+    }
+
+    #[test]
+    fn test_iqformat_roundtrip() {
+        let formats = [IqFormat::Cu8, IqFormat::Cs8, IqFormat::Cs16, IqFormat::Cf32];
+        for format in formats {
+            let s = format.to_string();
+            let parsed: IqFormat = s.parse().unwrap();
+            assert_eq!(parsed, format);
+        }
     }
 }

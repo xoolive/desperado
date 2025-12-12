@@ -1,5 +1,5 @@
 use crossbeam::channel;
-use desperado::dsp::DspBlock;
+use desperado::dsp::{DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator};
 use futures::StreamExt;
 use std::f32::consts::PI;
 use std::io::{Write, stdout};
@@ -7,7 +7,6 @@ use std::str::FromStr;
 
 use clap::Parser;
 use desperado::IqAsyncSource;
-use desperado::dsp::afc::SquareFreqOffsetCorrection;
 use num_complex::Complex;
 
 use rubato::{
@@ -95,7 +94,7 @@ async fn main() -> tokio::io::Result<()> {
     const AGC_RELEASE: f32 = 0.9999;
 
     while let Some(chunk) = iq_file.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
 
         // 1. Frequency shift (if freq_offset != 0)
         let shifted = rotate.process(&chunk);
@@ -262,53 +261,6 @@ impl PhaseExtractor {
             }
         }
         phases
-    }
-}
-
-struct Decimator {
-    factor: usize,
-    taps: usize,
-    fir: Vec<f32>,
-}
-
-impl Decimator {
-    fn new(factor: usize) -> Self {
-        // Apply a simple lowpass FIR filter before decimation to reduce aliasing.
-        // We'll use a Hamming windowed sinc filter.
-        let taps = 31;
-        let cutoff = 0.5 / factor as f32; // normalized cutoff (Nyquist = 0.5)
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
-        for n in 0..taps {
-            let x = n as isize - mid;
-            let sinc = if x == 0 {
-                2.0 * cutoff
-            } else {
-                (2.0 * cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-            let window = 0.54 - 0.46 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos();
-            fir.push(sinc * window);
-        }
-        // Normalize filter
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
-        Self { factor, taps, fir }
-    }
-    fn process(&mut self, samples: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        // Convolve and decimate
-        let mut out = Vec::new();
-        for i in (0..samples.len()).step_by(self.factor) {
-            let mut acc = Complex::<f32>::new(0.0, 0.0);
-            for j in 0..self.taps {
-                if i + j >= self.taps / 2 && i + j - self.taps / 2 < samples.len() {
-                    acc += samples[i + j - self.taps / 2] * self.fir[j];
-                }
-            }
-            out.push(acc);
-        }
-        out
     }
 }
 

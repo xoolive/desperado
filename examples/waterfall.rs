@@ -22,25 +22,12 @@ struct Args {
     center_freq: u32,
 
     /// IQ format: cu8, cs8, cs16 or cf32
-    #[arg(short, long, default_value = "cu8", value_parser = parse_iq_format)]
+    #[arg(short, long, default_value = "cu8")]
     iq_format: IqFormat,
 
     /// FFT size
     #[arg(short, long, default_value_t = 1024)]
     fft_size: usize,
-}
-
-fn parse_iq_format(fmt: &str) -> Result<IqFormat, std::io::Error> {
-    match fmt.to_lowercase().as_str() {
-        "cu8" => Ok(IqFormat::Cu8),
-        "cs8" => Ok(IqFormat::Cs8),
-        "cs16" => Ok(IqFormat::Cs16),
-        "cf32" => Ok(IqFormat::Cf32),
-        _ => Err(std::io::Error::other(format!(
-            "Unsupported IQ format: {}",
-            fmt
-        ))),
-    }
 }
 
 fn fftshift(data: &mut [Complex<f32>]) {
