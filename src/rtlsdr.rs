@@ -7,10 +7,9 @@
 
 use futures::Stream;
 use num_complex::Complex;
-use rtl_sdr_rs::error::RtlsdrError;
 use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
 
-use crate::IqFormat;
+use crate::{IqFormat, error};
 
 /**
  * RTL-SDR Configuration
@@ -50,7 +49,7 @@ pub struct RtlSdrReader {
 }
 
 impl RtlSdrReader {
-    pub fn new(config: &RtlSdrConfig) -> Result<Self, RtlsdrError> {
+    pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
         let mut rtlsdr = RtlSdr::open_with_index(config.device_index)?;
         rtlsdr.set_sample_rate(config.sample_rate)?;
         rtlsdr.set_center_freq(config.center_freq)?;
@@ -70,7 +69,7 @@ impl RtlSdrReader {
 }
 
 impl Iterator for RtlSdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.end {
@@ -82,7 +81,7 @@ impl Iterator for RtlSdrReader {
                     self.pos = 0;
                     self.end = bytes_read;
                 }
-                Err(e) => return Some(Err(std::io::Error::other(format!("{}", e)))),
+                Err(e) => return Some(Err(e.into())),
             }
         }
 
@@ -97,18 +96,18 @@ impl Iterator for RtlSdrReader {
  * Asynchronous RTL-SDR I/Q Reader
  */
 pub struct AsyncRtlSdrReader {
-    rx: tokio::sync::mpsc::Receiver<Result<Vec<Complex<f32>>, RtlsdrError>>,
+    rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl AsyncRtlSdrReader {
-    pub fn new(config: &RtlSdrConfig) -> Result<Self, RtlsdrError> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<Complex<f32>>, RtlsdrError>>(32);
-        let (tx_init, rx_init) = std::sync::mpsc::channel::<Result<(), RtlsdrError>>();
+    pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
+        let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
         let handle = std::thread::spawn(move || {
-            let init_res = (|| -> Result<RtlSdr, RtlsdrError> {
+            let init_res = (|| -> error::Result<RtlSdr> {
                 let mut rtl = RtlSdr::open_with_index(cfg.device_index)?;
                 rtl.set_sample_rate(cfg.sample_rate)?;
                 rtl.set_center_freq(cfg.center_freq)?;
@@ -141,7 +140,7 @@ impl AsyncRtlSdrReader {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.blocking_send(Err(e));
+                                let _ = tx.blocking_send(Err(e.into()));
                                 return;
                             }
                         }
@@ -159,13 +158,13 @@ impl AsyncRtlSdrReader {
                 _handle: handle,
             }),
             Ok(Err(e)) => Err(e),
-            Err(e) => Err(RtlsdrError::RtlsdrErr(format!("RecvError {}", e))),
+            Err(_) => Err(error::Error::device("Failed to initialize RTL-SDR device")),
         }
     }
 }
 
 impl Stream for AsyncRtlSdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -173,9 +172,7 @@ impl Stream for AsyncRtlSdrReader {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
         match this.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(
-                item.map_err(|e| std::io::Error::other(format!("RtlsdrError: {}", e))),
-            )),
+            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }

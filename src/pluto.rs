@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
+use crate::error;
+
 const DEFAULT_BUFFER_SIZE: usize = 32768;
 
 /**
@@ -55,7 +57,7 @@ pub struct PlutoSdrReader {
 }
 
 impl PlutoSdrReader {
-    pub fn new(config: &PlutoConfig) -> Result<Self, String> {
+    pub fn new(config: &PlutoConfig) -> error::Result<Self> {
         let pluto = Pluto::connect(&config.uri).expect("Failed to connect to Pluto");
 
         // Configure receiver
@@ -88,7 +90,7 @@ impl PlutoSdrReader {
         })
     }
 
-    fn refill_buffer(&mut self) -> Result<(), String> {
+    fn refill_buffer(&mut self) -> error::Result<()> {
         // Refill the buffer with new samples
         self.buffer
             .refill()
@@ -111,7 +113,7 @@ impl PlutoSdrReader {
 }
 
 impl Iterator for PlutoSdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Refill buffer if we've consumed all samples
@@ -145,16 +147,16 @@ impl Iterator for PlutoSdrReader {
  * Asynchronous Adalm Pluto SDR I/Q Stream
  */
 pub struct AsyncPlutoSdrReader {
-    receiver: mpsc::Receiver<Result<Vec<Complex<f32>>, std::io::Error>>,
+    receiver: mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
     _handle: tokio::task::JoinHandle<()>,
 }
 
 impl AsyncPlutoSdrReader {
-    pub async fn new(config: &PlutoConfig) -> Result<Self, String> {
+    pub async fn new(config: &PlutoConfig) -> error::Result<Self> {
         let config = config.clone();
 
         // Create channel for streaming samples
-        let (tx, rx) = mpsc::channel::<Result<Vec<Complex<f32>>, std::io::Error>>(32);
+        let (tx, rx) = mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
 
         // Spawn blocking task for Pluto SDR operations
         let handle = tokio::task::spawn_blocking(move || {
@@ -173,8 +175,8 @@ impl AsyncPlutoSdrReader {
 
     fn run_pluto_rx(
         config: PlutoConfig,
-        tx: mpsc::Sender<Result<Vec<Complex<f32>>, std::io::Error>>,
-    ) -> Result<(), String> {
+        tx: mpsc::Sender<error::Result<Vec<Complex<f32>>>>,
+    ) -> error::Result<()> {
         let pluto = Pluto::connect(&config.uri).expect("Failed to connect to Pluto");
 
         // Configure receiver
@@ -241,7 +243,7 @@ impl AsyncPlutoSdrReader {
 }
 
 impl Stream for AsyncPlutoSdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx)

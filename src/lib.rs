@@ -16,6 +16,9 @@ pub mod rtlsdr;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 
+// Re-export commonly used types
+pub use error::{Error, Result};
+
 /**
  * I/Q Data Format
  */
@@ -53,7 +56,7 @@ pub enum IqSource {
 }
 
 impl Iterator for IqSource {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -77,7 +80,7 @@ impl IqSource {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let source =
             iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
         Ok(IqSource::IqFile(source))
@@ -88,7 +91,7 @@ impl IqSource {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<IqSource, std::io::Error> {
+    ) -> error::Result<IqSource> {
         let source = iqread::IqRead::from_stdin(center_freq, sample_rate, chunk_size, iq_format);
         Ok(IqSource::IqStdin(source))
     }
@@ -100,7 +103,7 @@ impl IqSource {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let source =
             iqread::IqRead::from_tcp(addr, port, center_freq, sample_rate, chunk_size, iq_format)?;
         Ok(IqSource::IqTcp(source))
@@ -113,7 +116,7 @@ impl IqSource {
         center_freq: i64,
         sample_rate: i64,
         gain: f64,
-    ) -> Result<Self, String> {
+    ) -> error::Result<Self> {
         let config = pluto::PlutoConfig {
             uri: uri.to_string(),
             center_freq,
@@ -131,7 +134,7 @@ impl IqSource {
         center_freq: u32,
         sample_rate: u32,
         gain: Option<i32>,
-    ) -> Result<Self, rtl_sdr_rs::error::RtlsdrError> {
+    ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
             device_index,
             center_freq,
@@ -151,7 +154,7 @@ impl IqSource {
         sample_rate: u32,
         gain: Option<f64>,
         gain_element: &str,
-    ) -> Result<Self, soapysdr::Error> {
+    ) -> error::Result<Self> {
         let config = soapy::SoapyConfig {
             args: args.to_string(),
             center_freq: center_freq as f64,
@@ -194,7 +197,7 @@ impl IqAsyncSource {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let source =
             iqread::IqAsyncRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)
                 .await?;
@@ -221,7 +224,7 @@ impl IqAsyncSource {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let source = iqread::IqAsyncRead::from_tcp(
             addr,
             port,
@@ -241,7 +244,7 @@ impl IqAsyncSource {
         center_freq: i64,
         sample_rate: i64,
         gain: f64,
-    ) -> Result<Self, String> {
+    ) -> error::Result<Self> {
         let config = pluto::PlutoConfig {
             uri: uri.to_string(),
             center_freq,
@@ -259,7 +262,7 @@ impl IqAsyncSource {
         center_freq: u32,
         sample_rate: u32,
         gain: Option<i32>,
-    ) -> Result<Self, rtl_sdr_rs::error::RtlsdrError> {
+    ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
             device_index,
             center_freq,
@@ -279,7 +282,7 @@ impl IqAsyncSource {
         sample_rate: u32,
         gain: Option<f64>,
         gain_element: &str,
-    ) -> Result<Self, soapysdr::Error> {
+    ) -> error::Result<Self> {
         let config = soapy::SoapyConfig {
             args: args.to_string(),
             center_freq: center_freq as f64,
@@ -294,7 +297,7 @@ impl IqAsyncSource {
 }
 
 impl Stream for IqAsyncSource {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {

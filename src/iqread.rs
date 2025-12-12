@@ -13,7 +13,7 @@ use futures::Stream;
 use num_complex::Complex;
 use tokio::io::AsyncBufRead;
 
-use crate::IqFormat;
+use crate::{IqFormat, error};
 
 /**
  * I/Q Data Source Configuration
@@ -45,7 +45,7 @@ pub struct IqRead<R: Read> {
 }
 
 impl<R: Read> IqRead<R> {
-    fn read_samples(&mut self) -> Result<Vec<Complex<f32>>, std::io::Error> {
+    fn read_samples(&mut self) -> error::Result<Vec<Complex<f32>>> {
         let bytes_per_sample = self.config.iq_format.bytes_per_sample();
         let mut buffer = vec![0u8; self.config.chunk_size * bytes_per_sample];
         self.reader.read_exact(&mut buffer)?;
@@ -61,7 +61,7 @@ impl IqRead<std::io::BufReader<std::fs::File>> {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let path = expanduser(path.as_ref().to_path_buf());
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
@@ -91,7 +91,7 @@ impl IqRead<std::io::BufReader<std::net::TcpStream>> {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let stream = std::net::TcpStream::connect((addr, port))?;
         let reader = std::io::BufReader::new(stream);
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
@@ -100,12 +100,16 @@ impl IqRead<std::io::BufReader<std::net::TcpStream>> {
 }
 
 impl<R: Read> Iterator for IqRead<R> {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.read_samples() {
             Ok(samples) => Some(Ok(samples)),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+            Err(error::Error::Io(ref io_err))
+                if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                None
+            }
             Err(e) => Some(Err(e)),
         }
     }
@@ -127,7 +131,7 @@ impl IqAsyncRead<tokio::io::BufReader<tokio::fs::File>> {
         chunk_size: usize,
         iq_format: IqFormat,
     ) -> impl std::future::Future<
-        Output = Result<IqAsyncRead<tokio::io::BufReader<tokio::fs::File>>, std::io::Error>,
+        Output = error::Result<IqAsyncRead<tokio::io::BufReader<tokio::fs::File>>>,
     > {
         let path = expanduser(path.as_ref().to_path_buf());
         async move {
@@ -160,7 +164,7 @@ impl IqAsyncRead<tokio::io::BufReader<tokio::net::TcpStream>> {
         sample_rate: u32,
         chunk_size: usize,
         iq_format: IqFormat,
-    ) -> Result<Self, std::io::Error> {
+    ) -> error::Result<Self> {
         let stream = tokio::net::TcpStream::connect((address, port)).await?;
         let reader = tokio::io::BufReader::new(stream);
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
@@ -169,7 +173,7 @@ impl IqAsyncRead<tokio::io::BufReader<tokio::net::TcpStream>> {
 }
 
 impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -193,7 +197,7 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
                     } else if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         return Poll::Ready(None);
                     } else {
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(Some(Err(e.into())));
                     }
                 }
                 Poll::Pending => return Poll::Pending,

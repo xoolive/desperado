@@ -8,6 +8,8 @@ use futures::Stream;
 use num_complex::Complex;
 use soapysdr::{Args, Device, Direction, Error as SoapyError};
 
+use crate::error;
+
 /**
  * SoapySDR Configuration
  */
@@ -52,7 +54,7 @@ pub struct SoapySdrReader {
 }
 
 impl SoapySdrReader {
-    pub fn new(config: &SoapyConfig) -> Result<Self, SoapyError> {
+    pub fn new(config: &SoapyConfig) -> error::Result<Self> {
         let device = Device::new(config.args.as_str())?;
 
         device.set_frequency(Direction::Rx, config.channel, config.center_freq, ())?;
@@ -81,7 +83,7 @@ impl SoapySdrReader {
 }
 
 impl Iterator for SoapySdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.end {
@@ -94,7 +96,7 @@ impl Iterator for SoapySdrReader {
                     self.end = len;
                 }
                 Err(e) => {
-                    return Some(Err(std::io::Error::other(format!("SoapySDR error: {}", e))));
+                    return Some(Err(e.into()));
                 }
             }
         }
@@ -118,38 +120,37 @@ impl Iterator for SoapySdrReader {
  * Asynchronous SoapySDR I/Q Reader
  */
 pub struct AsyncSoapySdrReader {
-    rx: tokio::sync::mpsc::Receiver<Result<Vec<Complex<f32>>, SoapyError>>,
+    rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl AsyncSoapySdrReader {
-    pub fn new(config: &SoapyConfig) -> Result<Self, SoapyError> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<Complex<f32>>, SoapyError>>(32);
-        let (tx_init, rx_init) = std::sync::mpsc::channel::<Result<(), SoapyError>>();
+    pub fn new(config: &SoapyConfig) -> error::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
+        let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
         let handle = std::thread::spawn(move || {
-            let init_res =
-                (|| -> Result<(Device, soapysdr::RxStream<Complex<i16>>), SoapyError> {
-                    let device = Device::new(cfg.args.as_str())?;
+            let init_res = (|| -> error::Result<(Device, soapysdr::RxStream<Complex<i16>>)> {
+                let device = Device::new(cfg.args.as_str())?;
 
-                    device.set_frequency(Direction::Rx, cfg.channel, cfg.center_freq, ())?;
-                    device.set_sample_rate(Direction::Rx, cfg.channel, cfg.sample_rate)?;
+                device.set_frequency(Direction::Rx, cfg.channel, cfg.center_freq, ())?;
+                device.set_sample_rate(Direction::Rx, cfg.channel, cfg.sample_rate)?;
 
-                    if let Some(gain) = cfg.gain {
-                        device.set_gain_element(
-                            Direction::Rx,
-                            cfg.channel,
-                            cfg.gain_element.as_str(),
-                            gain,
-                        )?;
-                    }
+                if let Some(gain) = cfg.gain {
+                    device.set_gain_element(
+                        Direction::Rx,
+                        cfg.channel,
+                        cfg.gain_element.as_str(),
+                        gain,
+                    )?;
+                }
 
-                    let mut stream = device.rx_stream::<Complex<i16>>(&[cfg.channel])?;
-                    stream.activate(None)?;
+                let mut stream = device.rx_stream::<Complex<i16>>(&[cfg.channel])?;
+                stream.activate(None)?;
 
-                    Ok((device, stream))
-                })();
+                Ok((device, stream))
+            })();
 
             match init_res {
                 Ok((_device, mut stream)) => {
@@ -179,7 +180,7 @@ impl AsyncSoapySdrReader {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.blocking_send(Err(e));
+                                let _ = tx.blocking_send(Err(e.into()));
                                 return;
                             }
                         }
@@ -197,16 +198,13 @@ impl AsyncSoapySdrReader {
                 _handle: handle,
             }),
             Ok(Err(e)) => Err(e),
-            Err(e) => Err(SoapyError {
-                code: soapysdr::ErrorCode::Other,
-                message: format!("RecvError: {}", e),
-            }),
+            Err(_) => Err(error::Error::device("Failed to initialize SoapySDR device")),
         }
     }
 }
 
 impl Stream for AsyncSoapySdrReader {
-    type Item = Result<Vec<Complex<f32>>, std::io::Error>;
+    type Item = error::Result<Vec<Complex<f32>>>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -214,9 +212,7 @@ impl Stream for AsyncSoapySdrReader {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
         match this.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(
-                item.map_err(|e| std::io::Error::other(format!("SoapySDR error: {}", e))),
-            )),
+            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }

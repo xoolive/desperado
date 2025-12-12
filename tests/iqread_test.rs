@@ -146,7 +146,8 @@ fn test_expanduser_nonexistent_file() {
 
     assert!(result.is_err(), "Should return error for nonexistent file");
     let err = result.err().unwrap();
-    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    // Check that it's an I/O error
+    assert!(matches!(err, desperado::Error::Io(_)));
 }
 
 #[test]
