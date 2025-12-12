@@ -7,6 +7,7 @@ use futures::Stream;
 use num_complex::Complex;
 
 pub mod dsp;
+pub mod error;
 pub mod iqread;
 #[cfg(feature = "pluto")]
 pub mod pluto;
