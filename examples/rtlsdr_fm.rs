@@ -46,7 +46,7 @@ const MONO_SIGNAL_BW: f32 = 15_000.0;
 const AUDIO_RATE: usize = 48_000;
 
 #[tokio::main]
-async fn main() -> tokio::io::Result<()> {
+async fn main() -> desperado::Result<()> {
     let args = Args::parse();
     let mut iq_file = IqAsyncSource::from_rtlsdr(
         0,
@@ -54,8 +54,7 @@ async fn main() -> tokio::io::Result<()> {
         args.sample_rate,
         args.gain,
     )
-    .await
-    .map_err(|e| std::io::Error::other(format!("{}", e)))?;
+    .await?;
 
     // Setup audio output (48kHz mono)
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2); // ~2 sec buffer

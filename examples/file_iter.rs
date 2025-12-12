@@ -22,7 +22,7 @@ struct Args {
     iq_format: IqFormat,
 }
 
-fn main() -> io::Result<()> {
+fn main() -> desperado::Result<()> {
     let args = Args::parse();
     let iq_file = IqSource::from_file(
         &args.bin_file,

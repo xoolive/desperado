@@ -23,7 +23,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> tokio::io::Result<()> {
+async fn main() -> desperado::Result<()> {
     let args = Args::parse();
     let mut iq_file = IqAsyncSource::from_file(
         &args.bin_file,

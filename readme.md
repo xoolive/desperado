@@ -78,7 +78,7 @@ If you're using Desperado in your project, feel free to open a PR to add it here
 ```rust ignore
 use desperado::{IqFormat, IqSource};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> desperado::Result<()> {
     // Create an IQ source from a binary file
     let path = "sample.iq";
     let sample_rate = 96_000;
@@ -104,7 +104,7 @@ use desperado::IqAsyncSource;
 use futures::StreamExt;
 
 #[tokio::main]
-async fn main() -> tokio::io::Result<()> {
+async fn main() -> desperado::Result<()> {
     let device_index = 0;
     let sample_rate = 2_400_000;
     let center_freq = 1_090_000_000;

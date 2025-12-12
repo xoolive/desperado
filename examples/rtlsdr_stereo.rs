@@ -59,7 +59,7 @@ const MONO_SIGNAL_BW: f32 = 15_000.0;
 const AUDIO_RATE: usize = 48_000;
 
 #[tokio::main]
-async fn main() -> tokio::io::Result<()> {
+async fn main() -> desperado::Result<()> {
     let args = Args::parse();
 
     /*let mut source = IqAsyncSource::from_rtlsdr(
@@ -68,8 +68,7 @@ async fn main() -> tokio::io::Result<()> {
         args.sample_rate,
         args.gain,
     )
-    .await
-    .map_err(|e| std::io::Error::other(format!("{}", e)))?;*/
+    .await?;*/
 
     let mut source = IqAsyncSource::from_soapysdr(
         "rtlsdr",
@@ -79,8 +78,7 @@ async fn main() -> tokio::io::Result<()> {
         args.gain.map(|g| g as f64),
         "TUNER",
     )
-    .await
-    .map_err(|e| std::io::Error::other(format!("{}", e)))?;
+    .await?;
 
     /*let mut source = IqAsyncSource::from_file(
         "/Users/xo/Documents/isae/pybook/python_web_github/data/samples.rtl",
@@ -89,8 +87,7 @@ async fn main() -> tokio::io::Result<()> {
         16_384,
         desperado::IqFormat::Cu8,
     )
-    .await
-    .map_err(|e| std::io::Error::other(format!("{}", e)))?;*/
+    .await?;*/
 
     // --- Stereo audio output ---
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2); // Reduce buffer to 1 sec
