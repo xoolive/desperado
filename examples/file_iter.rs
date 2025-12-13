@@ -1,6 +1,5 @@
 use clap::Parser;
 use desperado::{IqFormat, IqSource};
-use std::io;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
