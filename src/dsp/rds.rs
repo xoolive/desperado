@@ -295,3 +295,7 @@ impl Default for RdsParser {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "rds_tests.rs"]
+mod tests;
