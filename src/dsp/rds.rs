@@ -241,12 +241,12 @@ impl RdsParser {
                 // 0A - PS name (2 ASCII chars in block4)
                 // NOTE: Testing bit inversion + byte swap on block3
                 let seg = c_bits as usize; // 0..3
-                
+
                 // Try: invert bits then swap bytes on block3
                 let block3_inv = block3 ^ 0xFFFF;
-                let ch1 = (block3_inv & 0xFF) as u8;  // Low byte
-                let ch2 = ((block3_inv >> 8) & 0xFF) as u8;  // High byte
-                
+                let ch1 = (block3_inv & 0xFF) as u8; // Low byte
+                let ch2 = ((block3_inv >> 8) & 0xFF) as u8; // High byte
+
                 let pos = seg * 2;
                 if pos + 1 < 8 {
                     self.ps[pos] = ch1;
@@ -259,8 +259,16 @@ impl RdsParser {
                             seg,
                             ch1,
                             ch2,
-                            if ch1.is_ascii_graphic() || ch1 == b' ' { ch1 as char } else { '?' },
-                            if ch2.is_ascii_graphic() || ch2 == b' ' { ch2 as char } else { '?' },
+                            if ch1.is_ascii_graphic() || ch1 == b' ' {
+                                ch1 as char
+                            } else {
+                                '?'
+                            },
+                            if ch2.is_ascii_graphic() || ch2 == b' ' {
+                                ch2 as char
+                            } else {
+                                '?'
+                            },
                             self.ps_received_mask,
                             block3,
                             ((ch2 as u16) << 8) | (ch1 as u16)
@@ -286,8 +294,16 @@ impl RdsParser {
                             seg,
                             ch1,
                             ch2,
-                            if ch1.is_ascii_graphic() || ch1 == b' ' { ch1 as char } else { '?' },
-                            if ch2.is_ascii_graphic() || ch2 == b' ' { ch2 as char } else { '?' },
+                            if ch1.is_ascii_graphic() || ch1 == b' ' {
+                                ch1 as char
+                            } else {
+                                '?'
+                            },
+                            if ch2.is_ascii_graphic() || ch2 == b' ' {
+                                ch2 as char
+                            } else {
+                                '?'
+                            },
                             self.ps_received_mask
                         );
                     }
@@ -315,11 +331,30 @@ impl RdsParser {
                         println!(
                             "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X} = '{}{}{}{}' ({}/16 segments)",
                             seg,
-                            a, b, c, d,
-                            if a.is_ascii_graphic() || a == b' ' { a as char } else { '?' },
-                            if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' },
-                            if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' },
-                            if d.is_ascii_graphic() || d == b' ' { d as char } else { '?' },
+                            a,
+                            b,
+                            c,
+                            d,
+                            if a.is_ascii_graphic() || a == b' ' {
+                                a as char
+                            } else {
+                                '?'
+                            },
+                            if b.is_ascii_graphic() || b == b' ' {
+                                b as char
+                            } else {
+                                '?'
+                            },
+                            if c.is_ascii_graphic() || c == b' ' {
+                                c as char
+                            } else {
+                                '?'
+                            },
+                            if d.is_ascii_graphic() || d == b' ' {
+                                d as char
+                            } else {
+                                '?'
+                            },
                             received_count
                         );
                     }
@@ -342,9 +377,18 @@ impl RdsParser {
                         println!(
                             "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} = '{}{}' ({}/16 segments)",
                             seg,
-                            c, d,
-                            if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' },
-                            if d.is_ascii_graphic() || d == b' ' { d as char } else { '?' },
+                            c,
+                            d,
+                            if c.is_ascii_graphic() || c == b' ' {
+                                c as char
+                            } else {
+                                '?'
+                            },
+                            if d.is_ascii_graphic() || d == b' ' {
+                                d as char
+                            } else {
+                                '?'
+                            },
                             received_count
                         );
                     }

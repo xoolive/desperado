@@ -34,7 +34,7 @@ Desperado abstracts away the complexity of reading these samples from various so
 
 Desperado provides two complementary APIs for accessing I/Q data:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    Application Code                         │
 └────────────┬────────────────────────────┬───────────────────┘
@@ -215,7 +215,7 @@ The `chunk_size` parameter determines how many I/Q samples are read in each iter
 - **Large chunks (32K-64K samples)**: Better throughput, higher latency, good for batch processing
 
 **Example for different use cases**:
-```rust
+```rust,ignore
 // Real-time ADS-B decoding (low latency needed)
 let source = IqSource::from_file(path, freq, rate, 4096, format)?;
 

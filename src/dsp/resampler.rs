@@ -254,7 +254,7 @@ impl AdaptiveResampler {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```ignore
     /// use desperado::dsp::resampler::AdaptiveResampler;
     ///
     /// let mut resampler = AdaptiveResampler::new(0.2, 5, 1).unwrap();

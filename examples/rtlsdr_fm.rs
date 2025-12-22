@@ -75,12 +75,14 @@ async fn main() -> desperado::Result<()> {
             sample_rate: AUDIO_RATE,
             channel_sample_count: 1024,
         };
-        Some(run_output_device(config, move |data| {
-            for sample in data.iter_mut() {
-                *sample = rx.try_recv().unwrap_or(0.0); // fill silence if buffer underruns
-            }
-        })
-        .unwrap())
+        Some(
+            run_output_device(config, move |data| {
+                for sample in data.iter_mut() {
+                    *sample = rx.try_recv().unwrap_or(0.0); // fill silence if buffer underruns
+                }
+            })
+            .unwrap(),
+        )
     } else {
         println!("Audio output disabled (--no-audio)");
         None
