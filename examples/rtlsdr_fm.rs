@@ -276,6 +276,7 @@ async fn main() -> desperado::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mono(
     iq_source: &mut IqAsyncSource,
     args: &Args,
@@ -296,12 +297,9 @@ async fn run_mono(
 
     // Real-time pacing for file playback - track absolute time to prevent drift
     let is_file_source = matches!(args.source, SourceType::File);
-    let mut total_samples_processed = 0u64;
 
     while let Some(chunk) = iq_source.next().await {
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
-
-        let chunk_samples = chunk.len() as u64;
 
         let shifted = rotate.process(&chunk);
         let decimated = decimator.process(&shifted);
@@ -375,13 +373,12 @@ async fn run_mono(
                 }
             }
         }
-
-        total_samples_processed += chunk_samples;
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stereo(
     iq_source: &mut IqAsyncSource,
     args: &Args,
@@ -402,12 +399,9 @@ async fn run_stereo(
 
     // Real-time pacing for file playback - track absolute time to prevent drift
     let is_file_source = matches!(args.source, SourceType::File);
-    let mut total_samples_processed = 0u64;
 
     while let Some(chunk) = iq_source.next().await {
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
-
-        let chunk_samples = chunk.len() as u64;
 
         let shifted = rotate.process(&chunk);
         let decimated = decimator.process(&shifted);
@@ -456,7 +450,6 @@ async fn run_stereo(
                 }
             }
         }
-        total_samples_processed += chunk_samples;
     }
 
     Ok(())
@@ -594,6 +587,7 @@ impl AudioAdaptiveResampler {
                 let mut chs: Vec<Vec<f32>> =
                     vec![Vec::with_capacity(input_frames_needed); self.channels];
                 for frame_idx in 0..input_frames_needed {
+                    #[allow(clippy::needless_range_loop)]
                     for ch in 0..self.channels {
                         let idx = frame_idx * self.channels + ch;
                         chs[ch].push(chunk[idx]);
@@ -609,6 +603,7 @@ impl AudioAdaptiveResampler {
                     } else {
                         // Re-interleave stereo
                         let out_frames = output_block[0].len();
+                        #[allow(clippy::needless_range_loop)]
                         for i in 0..out_frames {
                             for ch in 0..self.channels {
                                 output.push(output_block[ch][i]);
