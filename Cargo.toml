@@ -40,8 +40,9 @@ pluto = ["dep:pluto-sdr", "dep:industrial-io"]
 rtlsdr = ["dep:rtl-sdr-rs"]
 soapy = ["dep:soapysdr"]
 clap = ["dep:clap"]
+adaptive = ["dep:rubato"]
 waterfall = ["dep:plotters", "dep:rustfft", "clap"]
-audio = ["dep:tinyaudio", "dep:crossbeam", "dep:rubato", "rtlsdr", "soapy", "clap"]
+audio = ["adaptive", "dep:tinyaudio", "dep:crossbeam", "rtlsdr", "soapy", "clap"]
 
 [[example]]
 name = "waterfall"
