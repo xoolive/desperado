@@ -30,46 +30,6 @@ Together, I and Q samples capture both the amplitude and phase information of a 
 
 Desperado abstracts away the complexity of reading these samples from various sources (files, devices, network streams), providing a consistent interface regardless of the source or format (8-bit, 16-bit, float, etc.).
 
-## Architecture
-
-Desperado provides two complementary APIs for accessing I/Q data:
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                    Application Code                         │
-└────────────┬────────────────────────────┬───────────────────┘
-             │                            │
-    ┌────────▼────────┐        ┌─────────▼──────────┐
-    │   IqSource      │        │  IqAsyncSource     │
-    │   (Iterator)    │        │    (Stream)        │
-    └────────┬────────┘        └─────────┬──────────┘
-             │                            │
-    ┌────────▼────────────────────────────▼──────────┐
-    │          Unified Interface Layer                │
-    │   (Converts all formats to Complex<f32>)        │
-    └────────┬────────────────────────────┬──────────┘
-             │                            │
-    ┌────────▼────────┐        ┌─────────▼──────────┐
-    │  File/Stdin/TCP │        │   Hardware SDR      │
-    │  (Cu8/Cs8/Cs16/ │        │  (RTL-SDR/SoapySDR/ │
-    │      Cf32)      │        │     PlutoSDR)       │
-    └─────────────────┘        └────────────────────┘
-```
-
-### Data Flow
-
-1. **Source Layer**: Various input sources (files, devices, network streams)
-2. **Format Conversion**: All I/Q data is converted to normalized `Complex<f32>` format
-3. **API Layer**: Choice between synchronous `Iterator` or asynchronous `Stream`
-4. **Application**: Your DSP processing, demodulation, or analysis code
-
-### Sync vs Async
-
-- **`IqSource`** (Iterator): Blocking I/O, simpler code, good for file processing
-- **`IqAsyncSource`** (Stream): Non-blocking I/O, better for real-time SDR, network sources
-
-Both APIs provide the same underlying functionality - choose based on your application's needs.
-
 ## Installation
 
 Add Desperado to your `Cargo.toml`:
@@ -210,11 +170,13 @@ Use Asynchronous (`AsyncIqSource`) when:
 The `chunk_size` parameter determines how many I/Q samples are read in each iteration. Choosing the right size affects both performance and latency:
 
 **General guidelines**:
+
 - **Small chunks (1K-4K samples)**: Lower latency, more overhead, good for interactive applications
 - **Medium chunks (8K-16K samples)**: Balanced performance, recommended for most applications
 - **Large chunks (32K-64K samples)**: Better throughput, higher latency, good for batch processing
 
 **Example for different use cases**:
+
 ```rust,ignore
 // Real-time ADS-B decoding (low latency needed)
 let source = IqSource::from_file(path, freq, rate, 4096, format)?;
@@ -229,16 +191,19 @@ let source = IqSource::from_file(path, freq, rate, 65536, format)?;
 ### Hardware SDR Performance
 
 **RTL-SDR tips**:
+
 - Sample rates above 2.4 MS/s may cause USB bandwidth issues
 - Use manual gain instead of AGC for better performance
 - On Linux, consider increasing USB buffer size: `sudo modprobe rtl2832_sdr buffering=1`
 
 **SoapySDR tips**:
+
 - Check device-specific documentation for optimal buffer sizes
 - Some devices benefit from specific stream arguments
 - Monitor for dropped samples with verbose logging
 
 **PlutoSDR tips**:
+
 - Buffer sizes should match your processing requirements
 - Network latency affects performance for IP-connected devices
 - Use USB 3.0 connections when possible
@@ -247,11 +212,11 @@ let source = IqSource::from_file(path, freq, rate, 65536, format)?;
 
 Different I/Q formats have different performance characteristics:
 
-| Format | Bandwidth | Precision | Use Case |
-|--------|-----------|-----------|----------|
-| Cu8    | Lowest    | 8-bit     | RTL-SDR, bandwidth-limited scenarios |
-| Cs8    | Low       | 8-bit     | Signed 8-bit devices |
-| Cs16   | Medium    | 16-bit    | Higher dynamic range, HackRF |
+| Format | Bandwidth | Precision | Use Case                               |
+| ------ | --------- | --------- | -------------------------------------- |
+| Cu8    | Lowest    | 8-bit     | RTL-SDR, bandwidth-limited scenarios   |
+| Cs8    | Low       | 8-bit     | Signed 8-bit devices                   |
+| Cs16   | Medium    | 16-bit    | Higher dynamic range, HackRF           |
 | Cf32   | Highest   | 32-bit    | Pre-processed files, maximum precision |
 
 **Recommendation**: Use the native format of your source when possible to avoid unnecessary conversions.
