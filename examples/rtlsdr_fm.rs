@@ -1,15 +1,55 @@
+//! FM Demodulator for various IQ sources (mono or stereo with RDS)
+//!
+//! This example demonstrates FM demodulation with support for:
+//! - RTL-SDR devices
+//! - SoapySDR-compatible devices
+//! - IQ file playback
+//! - Mono or stereo decoding
+//! - RDS (Radio Data System) decoding
+//!
+//! # Usage Examples
+//!
+//! ## RTL-SDR (mono)
+//! ```bash
+//! cargo run --example rtlsdr_fm --features "rtlsdr audio clap" -- \
+//!     -c 105.1M --source rtlsdr
+//! ```
+//!
+//! ## RTL-SDR (stereo with RDS)
+//! ```bash
+//! cargo run --example rtlsdr_fm --features "rtlsdr audio clap" -- \
+//!     -c 105.1M --source rtlsdr --stereo -v
+//! ```
+//!
+//! ## SoapySDR
+//! ```bash
+//! cargo run --example rtlsdr_fm --features "soapy audio clap" -- \
+//!     -c 105.1M --source soapy --soapy-args "driver=hackrf"
+//! ```
+//!
+//! ## IQ File Playback
+//! ```bash
+//! cargo run --example rtlsdr_fm --features "audio clap" -- \
+//!     -c 105.1M --source file --file samples.iq --format cu8
+//! ```
+
 use crossbeam::channel;
 use desperado::dsp::{
-    afc::SquareFreqOffsetCorrection, decimator::Decimator, filters::LowPassFir,
-    fm::{DeemphasisFilter, PhaseExtractor}, rds::RdsParser, rotate::Rotate, DspBlock,
+    DspBlock,
+    afc::SquareFreqOffsetCorrection,
+    decimator::Decimator,
+    filters::LowPassFir,
+    fm::{DeemphasisFilter, PhaseExtractor},
+    rds::RdsParser,
+    rotate::Rotate,
 };
 use futures::StreamExt;
 use std::f32::consts::PI;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::str::FromStr;
 
-use clap::Parser;
-use desperado::IqAsyncSource;
+use clap::{Parser, ValueEnum};
+use desperado::{IqAsyncSource, IqFormat};
 
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -19,8 +59,15 @@ use tinyaudio::prelude::*;
 #[derive(Debug, Clone, Copy)]
 struct Frequency(u32);
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SourceType {
+    Rtlsdr,
+    Soapy,
+    File,
+}
+
 #[derive(Parser, Debug)]
-#[command(author, version, about = "FM demodulator from RTL-SDR (mono or stereo)", long_about = None)]
+#[command(author, version, about = "FM demodulator from various IQ sources (mono or stereo)", long_about = None)]
 struct Args {
     /// Center frequency in Hz (accepts k/M suffix, e.g. 105.1M)
     #[arg(short, long, value_parser = Frequency::from_str)]
@@ -34,8 +81,8 @@ struct Args {
     #[arg(short, long, default_value = None)]
     gain: Option<i32>,
 
-    /// Frequency offset in Hz
-    #[arg(short, long, default_value_t = 200_000)]
+    /// Frequency offset in Hz (can be negative)
+    #[arg(short, long, default_value_t = 200_000, allow_hyphen_values = true)]
     offset_freq: i32,
 
     /// Enable automatic frequency correction
@@ -53,6 +100,30 @@ struct Args {
     /// Disable audio output (for SSH/headless operation)
     #[arg(long, default_value_t = false)]
     no_audio: bool,
+
+    /// Source type: rtlsdr, soapy, or file
+    #[arg(long, default_value = "rtlsdr")]
+    source: SourceType,
+
+    /// Input file path (required when source=file)
+    #[arg(long)]
+    file: Option<String>,
+
+    /// IQ format for file input (cu8, cs8, cs16, cf32)
+    #[arg(long, default_value = "cu8")]
+    format: String,
+
+    /// SoapySDR device arguments (e.g., "driver=rtlsdr")
+    #[arg(long, default_value = "driver=rtlsdr")]
+    soapy_args: String,
+
+    /// SoapySDR channel
+    #[arg(long, default_value_t = 0)]
+    soapy_channel: usize,
+
+    /// RTL-SDR device index
+    #[arg(long, default_value_t = 0)]
+    device_index: usize,
 }
 
 const FM_BANDWIDTH: f32 = 240_000.0;
@@ -62,18 +133,87 @@ const AUDIO_RATE: usize = 48_000;
 #[tokio::main]
 async fn main() -> desperado::Result<()> {
     let args = Args::parse();
-    let mut iq_file = IqAsyncSource::from_rtlsdr(
-        0,
-        args.center_freq.0 - args.offset_freq as u32,
-        args.sample_rate,
-        args.gain,
-    )
-    .await?;
+
+    // Create IQ source based on selected type
+    // Calculate tuning frequency: center_freq - offset_freq (handles negative offset)
+    let tuning_freq = if args.offset_freq >= 0 {
+        args.center_freq.0 - args.offset_freq as u32
+    } else {
+        args.center_freq.0 + (-args.offset_freq) as u32
+    };
+
+    let mut iq_source = match args.source {
+        SourceType::Rtlsdr => {
+            #[cfg(feature = "rtlsdr")]
+            {
+                IqAsyncSource::from_rtlsdr(
+                    args.device_index,
+                    tuning_freq,
+                    args.sample_rate,
+                    args.gain,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "rtlsdr"))]
+            {
+                eprintln!("Error: rtlsdr feature not enabled. Rebuild with --features rtlsdr");
+                std::process::exit(1);
+            }
+        }
+        SourceType::Soapy => {
+            #[cfg(feature = "soapy")]
+            {
+                IqAsyncSource::from_soapysdr(
+                    &args.soapy_args,
+                    args.soapy_channel,
+                    tuning_freq,
+                    args.sample_rate,
+                    args.gain.map(|g| g as f64),
+                    "TUNER",
+                )
+                .await?
+            }
+            #[cfg(not(feature = "soapy"))]
+            {
+                eprintln!("Error: soapy feature not enabled. Rebuild with --features soapy");
+                std::process::exit(1);
+            }
+        }
+        SourceType::File => {
+            let file_path = args
+                .file
+                .as_ref()
+                .expect("--file is required when source=file");
+            let format = IqFormat::from_str(&args.format)
+                .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
+
+            IqAsyncSource::from_file(
+                file_path,
+                tuning_freq,
+                args.sample_rate,
+                16384, // chunk size
+                format,
+            )
+            .await?
+        }
+    };
+
+    println!(
+        "FM demodulator: {} mode, source: {:?}",
+        if args.stereo { "stereo" } else { "mono" },
+        args.source
+    );
 
     let channels = if args.stereo { 2 } else { 1 };
 
-    // Setup audio output
-    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2);
+    // Setup audio output - larger buffer for file playback to prevent underruns
+    let is_file_source = matches!(args.source, SourceType::File);
+    let buffer_size = if is_file_source {
+        AUDIO_RATE * 4 // 4 seconds for file playback
+    } else {
+        AUDIO_RATE * 2 // 2 seconds for live sources
+    };
+    let (tx, rx) = channel::bounded::<f32>(buffer_size);
 
     let _device = if !args.no_audio {
         let config = OutputDeviceParameters {
@@ -108,7 +248,7 @@ async fn main() -> desperado::Result<()> {
     if args.stereo {
         println!("Running stereo FM demodulator with RDS...");
         run_stereo(
-            &mut iq_file,
+            &mut iq_source,
             &args,
             &mut rotate,
             &mut phase_extractor,
@@ -121,7 +261,7 @@ async fn main() -> desperado::Result<()> {
     } else {
         println!("Running mono FM demodulator...");
         run_mono(
-            &mut iq_file,
+            &mut iq_source,
             &args,
             &mut rotate,
             &mut phase_extractor,
@@ -137,7 +277,7 @@ async fn main() -> desperado::Result<()> {
 }
 
 async fn run_mono(
-    iq_file: &mut IqAsyncSource,
+    iq_source: &mut IqAsyncSource,
     args: &Args,
     rotate: &mut Rotate,
     phase_extractor: &mut PhaseExtractor,
@@ -154,8 +294,14 @@ async fn run_mono(
     const AGC_ATTACK: f32 = 0.999;
     const AGC_RELEASE: f32 = 0.9999;
 
-    while let Some(chunk) = iq_file.next().await {
+    // Real-time pacing for file playback - track absolute time to prevent drift
+    let is_file_source = matches!(args.source, SourceType::File);
+    let mut total_samples_processed = 0u64;
+
+    while let Some(chunk) = iq_source.next().await {
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
+
+        let chunk_samples = chunk.len() as u64;
 
         let shifted = rotate.process(&chunk);
         let decimated = decimator.process(&shifted);
@@ -197,30 +343,47 @@ async fn run_mono(
             .collect();
 
         if !args.no_audio {
-            audio_resample.adjust_ratio(tx.len() as f64 / (AUDIO_RATE * 2) as f64);
-
-            if tx.len() > (AUDIO_RATE * 2) * 9 / 10 {
-                println!(
-                    "\n[DROP] Buffer >90% full, dropping {} samples",
-                    processed.len()
-                );
-                continue;
+            // Only do adaptive resampling for live sources (not files)
+            if !is_file_source {
+                audio_resample.adjust_ratio(tx.len() as f64 / (AUDIO_RATE * 2) as f64);
             }
 
-            for sample in processed {
-                if tx.try_send(sample).is_err() {
-                    println!("\n[WARNING] Audio buffer full");
-                    break;
+            // For file sources, use blocking send to let audio buffer control pacing
+            // For live sources, use non-blocking to avoid dropping samples from hardware
+            if is_file_source {
+                // Blocking send - wait for buffer space (natural pacing)
+                for sample in processed {
+                    if tx.send(sample).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                // Non-blocking for live sources
+                if tx.len() > (AUDIO_RATE * 2) * 9 / 10 {
+                    println!(
+                        "\n[DROP] Buffer >90% full, dropping {} samples",
+                        processed.len()
+                    );
+                    continue;
+                }
+
+                for sample in processed {
+                    if tx.try_send(sample).is_err() {
+                        println!("\n[WARNING] Audio buffer full");
+                        break;
+                    }
                 }
             }
         }
+
+        total_samples_processed += chunk_samples;
     }
 
     Ok(())
 }
 
 async fn run_stereo(
-    iq_file: &mut IqAsyncSource,
+    iq_source: &mut IqAsyncSource,
     args: &Args,
     rotate: &mut Rotate,
     phase_extractor: &mut PhaseExtractor,
@@ -237,8 +400,14 @@ async fn run_stereo(
     let mut audio_resample =
         AudioAdaptiveResampler::new(AUDIO_RATE as f64 / FM_BANDWIDTH as f64, 5, 2);
 
-    while let Some(chunk) = iq_file.next().await {
+    // Real-time pacing for file playback - track absolute time to prevent drift
+    let is_file_source = matches!(args.source, SourceType::File);
+    let mut total_samples_processed = 0u64;
+
+    while let Some(chunk) = iq_source.next().await {
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
+
+        let chunk_samples = chunk.len() as u64;
 
         let shifted = rotate.process(&chunk);
         let decimated = decimator.process(&shifted);
@@ -266,12 +435,28 @@ async fn run_stereo(
         let audio = audio_resample.process(&interleaved);
 
         if !args.no_audio {
-            for sample in audio {
-                if tx.try_send(sample).is_err() {
-                    break;
+            // Only do adaptive resampling for live sources (not files)
+            if !is_file_source {
+                audio_resample.adjust_ratio(tx.len() as f64 / (AUDIO_RATE * 2) as f64);
+            }
+
+            // For file sources, use blocking send to let audio buffer control pacing
+            // For live sources, use non-blocking to avoid dropouts
+            if is_file_source {
+                for sample in audio {
+                    if tx.send(sample).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                for sample in audio {
+                    if tx.try_send(sample).is_err() {
+                        break;
+                    }
                 }
             }
         }
+        total_samples_processed += chunk_samples;
     }
 
     Ok(())
@@ -322,14 +507,8 @@ impl AudioAdaptiveResampler {
 
         let output_frames = 1024;
 
-        let resampler = SincFixedOut::<f32>::new(
-            initial_ratio,
-            2.0,
-            params,
-            output_frames,
-            channels,
-        )
-        .unwrap();
+        let resampler =
+            SincFixedOut::<f32>::new(initial_ratio, 2.0, params, output_frames, channels).unwrap();
 
         Self {
             resampler,

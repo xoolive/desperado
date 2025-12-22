@@ -372,7 +372,7 @@ fn test_rds_parser_continuous_bitstream() {
 
     // Should have detected exactly one block
     assert!(
-        parser.pending_blocks.len() >= 1,
+        !parser.pending_blocks.is_empty(),
         "Should detect at least one block"
     );
 
