@@ -9,7 +9,6 @@ repository = "https://github.com/xoolive/desperado"
 documentation = "https://docs.rs/desperado"
 readme = "readme.md"
 keywords = ["radio", "decoder", "sdr", "dsp"]
-categories = ["hardware-support", "digital-signal-processing"]
 
 [dependencies]
 dirs = "6.0.0"
