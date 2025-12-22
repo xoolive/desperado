@@ -1,5 +1,8 @@
 use crossbeam::channel;
-use desperado::dsp::{DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, fm::{PhaseExtractor, DeemphasisFilter}};
+use desperado::dsp::{
+    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, 
+    filters::LowPassFir, fm::{PhaseExtractor, DeemphasisFilter}
+};
 use futures::StreamExt;
 use std::f32::consts::PI;
 use std::io::{Write, stdout};
@@ -235,64 +238,6 @@ impl Rotate {
 }
 
 
-
-struct LowPassFir {
-    fir: Vec<f32>,
-}
-
-impl LowPassFir {
-    fn new(cutoff_freq: f32, sample_rate: f32, taps: usize) -> Self {
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
-        let norm_cutoff = cutoff_freq / (sample_rate / 2.0);
-
-        // Calculate FIR coefficients using the Remez exchange algorithm (Parks-McClellan).
-        // For now, we use a windowed-sinc as a placeholder,
-        // but you can use the reez for sharper filters.
-        //
-        // let bands = vec![
-        //     Band::new(0.0, norm_cutoff, 1.0), // Passband
-        //     Band::new(norm_cutoff + 0.05, 0.5, 0.0), // Stopband
-        // ];
-        // let coeffs = remez(taps, &bands, FilterType::LowPass).unwrap();
-        // fir.extend(coeffs);
-        //
-        // For now, fallback to Blackman-windowed sinc:
-        for n in 0..taps {
-            let x = n as isize - mid;
-            let sinc = if x == 0 {
-                2.0 * norm_cutoff
-            } else {
-                (2.0 * norm_cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-            let window = 0.42 - 0.5 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos()
-                + 0.08 * ((4.0 * PI * n as f32) / (taps as f32 - 1.0)).cos(); // Blackman
-            fir.push(sinc * window);
-        }
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
-        Self { fir }
-    }
-
-    fn process(&self, samples: &[f32]) -> Vec<f32> {
-        let taps = self.fir.len();
-        let mid = taps / 2;
-        let mut out = vec![0.0f32; samples.len()];
-        for (i, out_elem) in out.iter_mut().enumerate() {
-            let mut acc = 0.0f32;
-            for j in 0..taps {
-                let idx = i as isize + j as isize - mid as isize;
-                if idx >= 0 && (idx as usize) < samples.len() {
-                    acc += samples[idx as usize] * self.fir[j];
-                }
-            }
-            *out_elem = acc;
-        }
-        out
-    }
-}
 
 
 

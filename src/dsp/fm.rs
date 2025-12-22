@@ -81,7 +81,7 @@ impl PhaseExtractor {
             phases.push(d);
             self.last = sample;
         }
-        
+
         // Normalize to [-1, 1] to prevent clipping
         let max_val = phases.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
         if max_val > 0.0 {
@@ -212,18 +212,21 @@ mod tests {
         let mut extractor = PhaseExtractor::new();
         let samples = vec![Complex::new(1.0, 0.0); 10];
         let phase = extractor.process(&samples);
-        
+
         // Constant phase should produce near-zero phase differences (after normalization)
         assert_eq!(phase.len(), 10);
         for &p in &phase {
-            assert!(p.abs() < 0.1, "Phase difference should be near zero for constant signal");
+            assert!(
+                p.abs() < 0.1,
+                "Phase difference should be near zero for constant signal"
+            );
         }
     }
 
     #[test]
     fn test_phase_extractor_rotating_signal() {
         let mut extractor = PhaseExtractor::new();
-        
+
         // Create a signal rotating at constant frequency
         let n = 100;
         let mut samples = Vec::with_capacity(n);
@@ -232,10 +235,10 @@ mod tests {
             let phase = 2.0 * std::f32::consts::PI * freq * i as f32;
             samples.push(Complex::new(phase.cos(), phase.sin()));
         }
-        
+
         let phase_diff = extractor.process(&samples);
         assert_eq!(phase_diff.len(), n);
-        
+
         // All phase differences should be similar for constant rotation
         // (after ignoring the first few samples for settling)
         if n > 10 {
@@ -251,7 +254,7 @@ mod tests {
         let mut extractor = PhaseExtractor::new();
         let samples = vec![Complex::new(0.5, 0.5); 5];
         let _ = extractor.process(&samples);
-        
+
         extractor.reset();
         assert_eq!(extractor.last, Complex::new(1.0, 0.0));
     }
@@ -259,7 +262,7 @@ mod tests {
     #[test]
     fn test_deemphasis_new() {
         let filter = DeemphasisFilter::new(240_000.0, 50e-6);
-        
+
         // Coefficients should sum to approximately 1 for DC gain of 1
         assert_relative_eq!(filter.a + filter.b, 1.0, epsilon = 1e-6);
         assert_eq!(filter.prev_y, 0.0);
@@ -271,7 +274,7 @@ mod tests {
         let dc_value = 0.5;
         let samples = vec![dc_value; 100];
         let output = filter.process(&samples);
-        
+
         // DC signal should eventually settle to input value
         assert_eq!(output.len(), 100);
         let final_value = output[output.len() - 1];
@@ -281,13 +284,13 @@ mod tests {
     #[test]
     fn test_deemphasis_impulse_response() {
         let mut filter = DeemphasisFilter::new(240_000.0, 50e-6);
-        
+
         // Impulse: [1.0, 0.0, 0.0, ...]
         let mut samples = vec![0.0; 10];
         samples[0] = 1.0;
-        
+
         let output = filter.process(&samples);
-        
+
         // Impulse response should decay exponentially
         assert!(output[0] > 0.0, "First sample should be positive");
         assert!(output[1] < output[0], "Should decay");
@@ -299,7 +302,7 @@ mod tests {
         let mut filter = DeemphasisFilter::new(240_000.0, 50e-6);
         let samples = vec![1.0; 5];
         let _ = filter.process(&samples);
-        
+
         filter.reset();
         assert_eq!(filter.prev_y, 0.0);
     }
@@ -309,9 +312,12 @@ mod tests {
         // Test both common time constants
         let filter_eu = DeemphasisFilter::new(240_000.0, 50e-6);
         let filter_na = DeemphasisFilter::new(240_000.0, 75e-6);
-        
+
         // European (50μs) should have faster decay (smaller 'a')
-        assert!(filter_eu.a < filter_na.a, "50μs should decay faster than 75μs");
+        assert!(
+            filter_eu.a < filter_na.a,
+            "50μs should decay faster than 75μs"
+        );
     }
 
     #[test]

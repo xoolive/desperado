@@ -7,7 +7,8 @@ use clap::Parser;
 use desperado::IqAsyncSource;
 use desperado::dsp::{
     DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, 
-    fm::{PhaseExtractor, DeemphasisFilter}, rds::RdsParser, rotate::Rotate,
+    filters::LowPassFir, fm::{PhaseExtractor, DeemphasisFilter}, 
+    rds::RdsParser, rotate::Rotate,
 };
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -183,49 +184,6 @@ async fn main() -> desperado::Result<()> {
     Ok(())
 }
 
-
-struct LowPassFir {
-    fir: Vec<f32>,
-}
-impl LowPassFir {
-    fn new(cutoff_freq: f32, sample_rate: f32, taps: usize) -> Self {
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
-        let norm_cutoff = cutoff_freq / (sample_rate / 2.0);
-        for n in 0..taps {
-            let x = n as isize - mid;
-            let sinc = if x == 0 {
-                2.0 * norm_cutoff
-            } else {
-                (2.0 * norm_cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-            let win = 0.42 - 0.5 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos()
-                + 0.08 * ((4.0 * PI * n as f32) / (taps as f32 - 1.0)).cos();
-            fir.push(sinc * win);
-        }
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
-        Self { fir }
-    }
-    fn process(&self, s: &[f32]) -> Vec<f32> {
-        let taps = self.fir.len();
-        let mid = taps / 2;
-        let mut out = vec![0.0; s.len()];
-        for (i, o) in out.iter_mut().enumerate() {
-            let mut acc = 0.0;
-            for j in 0..taps {
-                let idx = i as isize + j as isize - mid as isize;
-                if idx >= 0 && (idx as usize) < s.len() {
-                    acc += s[idx as usize] * self.fir[j];
-                }
-            }
-            *o = acc;
-        }
-        out
-    }
-}
 
 
 // Use the exact implementations we discussed earlier.

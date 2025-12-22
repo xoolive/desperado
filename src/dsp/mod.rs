@@ -7,6 +7,7 @@
 /// # Modules
 /// - `afc`: Automatic Frequency Control related functionality.
 /// - `decimator`: Sample rate reduction with anti-aliasing filtering.
+/// - `filters`: Digital filter implementations (FIR low-pass, etc.).
 /// - `fm`: FM demodulation blocks (phase extraction, de-emphasis filtering).
 /// - `rds`: Radio Data System processing.
 /// - `rotate`: Utilities for rotating complex samples.
@@ -18,6 +19,7 @@ use num_complex::Complex;
 
 pub mod afc;
 pub mod decimator;
+pub mod filters;
 pub mod fm;
 pub mod rds;
 pub mod rotate;
