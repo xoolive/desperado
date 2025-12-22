@@ -121,6 +121,26 @@ impl Iterator for IqSource {
 }
 impl IqSource {
     /// Create a new file-based I/Q source
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use desperado::{IqSource, IqFormat};
+    ///
+    /// let source = IqSource::from_file(
+    ///     "samples.iq",
+    ///     100_000_000,  // 100 MHz center frequency
+    ///     2_048_000,    // 2.048 MS/s sample rate
+    ///     16384,        // 16K samples per chunk
+    ///     IqFormat::Cu8
+    /// )?;
+    ///
+    /// for chunk in source {
+    ///     let samples = chunk?;
+    ///     println!("Read {} samples", samples.len());
+    /// }
+    /// # Ok::<(), desperado::Error>(())
+    /// ```
     pub fn from_file<P: AsRef<std::path::Path>>(
         path: P,
         center_freq: u32,
@@ -133,6 +153,22 @@ impl IqSource {
         Ok(IqSource::IqFile(source))
     }
 
+    /// Create a new stdin-based I/Q source
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use desperado::{IqSource, IqFormat};
+    ///
+    /// // Read from piped input: cat samples.iq | my_program
+    /// let source = IqSource::from_stdin(
+    ///     100_000_000,  // 100 MHz
+    ///     2_048_000,    // 2.048 MS/s
+    ///     16384,        // 16K samples per chunk
+    ///     IqFormat::Cu8
+    /// )?;
+    /// # Ok::<(), desperado::Error>(())
+    /// ```
     pub fn from_stdin(
         center_freq: u32,
         sample_rate: u32,
@@ -241,6 +277,30 @@ pub enum IqAsyncSource {
 
 impl IqAsyncSource {
     /// Create a new file-based asynchronous I/Q source
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use desperado::{IqAsyncSource, IqFormat};
+    /// use futures::StreamExt;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), desperado::Error> {
+    /// let mut source = IqAsyncSource::from_file(
+    ///     "samples.iq",
+    ///     100_000_000,  // 100 MHz
+    ///     2_048_000,    // 2.048 MS/s
+    ///     16384,        // 16K samples per chunk
+    ///     IqFormat::Cu8
+    /// ).await?;
+    ///
+    /// while let Some(chunk) = source.next().await {
+    ///     let samples = chunk?;
+    ///     println!("Read {} samples", samples.len());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn from_file<P: AsRef<std::path::Path>>(
         path: P,
         center_freq: u32,
@@ -255,6 +315,23 @@ impl IqAsyncSource {
     }
 
     /// Create a new stdin-based asynchronous I/Q source
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use desperado::{IqAsyncSource, IqFormat};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), desperado::Error> {
+    /// let source = IqAsyncSource::from_stdin(
+    ///     100_000_000,  // 100 MHz
+    ///     2_048_000,    // 2.048 MS/s
+    ///     16384,
+    ///     IqFormat::Cu8
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn from_stdin(
         center_freq: u32,
         sample_rate: u32,
