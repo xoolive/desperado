@@ -63,8 +63,3 @@ required-features = ["clap"]
 name = "rtlsdr_fm"
 path = "examples/rtlsdr_fm.rs"
 required-features = ["audio"]
-
-[[example]]
-name = "rtlsdr_stereo"
-path = "examples/rtlsdr_stereo.rs"
-required-features = ["audio"]
