@@ -6,9 +6,13 @@ use std::str::FromStr;
 use clap::Parser;
 use desperado::IqAsyncSource;
 use desperado::dsp::{
-    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, 
-    filters::LowPassFir, fm::{PhaseExtractor, DeemphasisFilter}, 
-    rds::RdsParser, rotate::Rotate,
+    DspBlock,
+    afc::SquareFreqOffsetCorrection,
+    decimator::Decimator,
+    filters::LowPassFir,
+    fm::{DeemphasisFilter, PhaseExtractor},
+    rds::RdsParser,
+    rotate::Rotate,
 };
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -183,8 +187,6 @@ async fn main() -> desperado::Result<()> {
 
     Ok(())
 }
-
-
 
 // Use the exact implementations we discussed earlier.
 /// Stereo decoder using a complex PLL locked to the 19 kHz pilot tone.

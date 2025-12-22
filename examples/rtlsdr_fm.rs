@@ -1,7 +1,11 @@
 use crossbeam::channel;
 use desperado::dsp::{
-    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, 
-    filters::LowPassFir, fm::{PhaseExtractor, DeemphasisFilter}
+    DspBlock,
+    afc::SquareFreqOffsetCorrection,
+    decimator::Decimator,
+    filters::LowPassFir,
+    fm::{DeemphasisFilter, PhaseExtractor},
+    rotate::Rotate,
 };
 use futures::StreamExt;
 use std::f32::consts::PI;
@@ -10,7 +14,6 @@ use std::str::FromStr;
 
 use clap::Parser;
 use desperado::IqAsyncSource;
-use num_complex::Complex;
 
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -196,50 +199,6 @@ impl FromStr for Frequency {
         }
     }
 }
-
-pub struct Rotate {
-    /// Current rotation phasor.
-    rot: Complex<f32>,
-    /// Rotation step multiplier.
-    mult: Complex<f32>,
-}
-
-impl Rotate {
-    pub fn new(angle: f32) -> Self {
-        Self {
-            rot: Complex::new(1.0, 0.0),
-            mult: Complex::new(angle.cos(), angle.sin()),
-        }
-    }
-
-    pub fn process(&mut self, data: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        let mut output_up = Vec::with_capacity(data.len());
-
-        for &sample in data {
-            let rr = sample.re * self.rot.re;
-            let ii = sample.im * self.rot.im;
-            let ri = sample.re * self.rot.im;
-            let ir = sample.im * self.rot.re;
-
-            output_up.push(Complex::new(rr - ii, ir + ri));
-
-            // Update rotation phasor
-            self.rot *= self.mult;
-        }
-
-        // Normalize to prevent drift
-        let norm = self.rot.norm();
-        if norm > 0.0 {
-            self.rot /= norm;
-        }
-
-        output_up
-    }
-}
-
-
-
-
 
 struct AudioAdaptiveResampler {
     resampler: SincFixedOut<f32>,
