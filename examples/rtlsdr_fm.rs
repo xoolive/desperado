@@ -1,5 +1,5 @@
 use crossbeam::channel;
-use desperado::dsp::{DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator};
+use desperado::dsp::{DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, fm::{PhaseExtractor, DeemphasisFilter}};
 use futures::StreamExt;
 use std::f32::consts::PI;
 use std::io::{Write, stdout};
@@ -234,34 +234,7 @@ impl Rotate {
     }
 }
 
-struct PhaseExtractor {
-    last: Complex<f32>,
-}
 
-impl PhaseExtractor {
-    fn new() -> Self {
-        Self {
-            last: Complex::<f32>::new(1.0, 0.0),
-        }
-    }
-
-    fn process(&mut self, samples: &[Complex<f32>]) -> Vec<f32> {
-        let mut phases = Vec::with_capacity(samples.len());
-        for &sample in samples {
-            let d = (sample * self.last.conj()).arg();
-            phases.push(d);
-            self.last = sample;
-        }
-        // Normalize to [-1, 1]
-        let max_val = phases.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
-        if max_val > 0.0 {
-            for p in phases.iter_mut() {
-                *p /= max_val;
-            }
-        }
-        phases
-    }
-}
 
 struct LowPassFir {
     fir: Vec<f32>,
@@ -321,31 +294,7 @@ impl LowPassFir {
     }
 }
 
-struct DeemphasisFilter {
-    a: f32,
-    b: f32,
-    prev_y: f32,
-}
 
-impl DeemphasisFilter {
-    fn new(sample_rate: f32, tau: f32) -> Self {
-        let dt = 1.0 / sample_rate;
-        let decay = (-dt / tau).exp();
-        let b = 1.0 - decay;
-        let a = decay;
-        Self { a, b, prev_y: 0.0 }
-    }
-
-    fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        let mut y = Vec::with_capacity(samples.len());
-        for &x in samples {
-            let out = self.b * x + self.a * self.prev_y;
-            y.push(out);
-            self.prev_y = out;
-        }
-        y
-    }
-}
 
 struct AudioAdaptiveResampler {
     resampler: SincFixedOut<f32>,

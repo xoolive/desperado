@@ -6,9 +6,9 @@ use std::str::FromStr;
 use clap::Parser;
 use desperado::IqAsyncSource;
 use desperado::dsp::{
-    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, rds::RdsParser, rotate::Rotate,
+    DspBlock, afc::SquareFreqOffsetCorrection, decimator::Decimator, 
+    fm::{PhaseExtractor, DeemphasisFilter}, rds::RdsParser, rotate::Rotate,
 };
-use num_complex::Complex;
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -183,28 +183,7 @@ async fn main() -> desperado::Result<()> {
     Ok(())
 }
 
-// --- PhaseExtractor ---
-struct PhaseExtractor {
-    last: Complex<f32>,
-}
-impl PhaseExtractor {
-    fn new() -> Self {
-        Self {
-            last: Complex::new(1.0, 0.0),
-        }
-    }
-    fn process(&mut self, s: &[Complex<f32>]) -> Vec<f32> {
-        let mut out = Vec::with_capacity(s.len());
-        for &x in s {
-            let d = (x * self.last.conj()).arg();
-            out.push(d);
-            self.last = x;
-        }
-        out
-    }
-}
 
-// --- LowPassFir ---
 struct LowPassFir {
     fir: Vec<f32>,
 }
@@ -248,32 +227,7 @@ impl LowPassFir {
     }
 }
 
-// --- Deemphasis ---
-struct DeemphasisFilter {
-    a: f32,
-    b: f32,
-    prev_y: f32,
-}
-impl DeemphasisFilter {
-    fn new(rate: f32, tau: f32) -> Self {
-        let dt = 1.0 / rate;
-        let decay = (-dt / tau).exp();
-        let b = 1.0 - decay;
-        let a = decay;
-        Self { a, b, prev_y: 0.0 }
-    }
-    fn process(&mut self, s: &[f32]) -> Vec<f32> {
-        let mut y = Vec::with_capacity(s.len());
-        for &x in s {
-            let out = self.b * x + self.a * self.prev_y;
-            y.push(out);
-            self.prev_y = out;
-        }
-        y
-    }
-}
 
-// --- StereoDecoderPLL and StereoAudioAdaptiveResampler ---
 // Use the exact implementations we discussed earlier.
 /// Stereo decoder using a complex PLL locked to the 19 kHz pilot tone.
 /// Regenerates 38 kHz carrier to demodulate L−R DSBSC component.
