@@ -128,6 +128,24 @@ fn test_rds_parser_new() {
 }
 
 #[test]
+fn test_rds_parser_verbose_mode() {
+    let mut parser = RdsParser::new();
+    assert!(!parser.verbose, "Verbose should be false by default");
+
+    parser.set_verbose(true);
+    assert!(
+        parser.verbose,
+        "Verbose should be true after set_verbose(true)"
+    );
+
+    parser.set_verbose(false);
+    assert!(
+        !parser.verbose,
+        "Verbose should be false after set_verbose(false)"
+    );
+}
+
+#[test]
 fn test_rds_parser_station_name_empty() {
     let parser = RdsParser::new();
     assert_eq!(

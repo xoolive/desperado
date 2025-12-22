@@ -69,6 +69,8 @@ pub struct RdsParser {
     /// Radiotext buffer (64 chars for 2A), track received segments
     rt: Vec<u8>,
     rt_received_mask: Vec<bool>,
+    /// Enable verbose debug output
+    verbose: bool,
 }
 
 impl fmt::Debug for RdsParser {
@@ -88,7 +90,13 @@ impl RdsParser {
             ps_received_mask: 0,
             rt: vec![b' '; 64],
             rt_received_mask: vec![false; 16], // 16 segments of 4 chars for RT 2A
+            verbose: false,
         }
+    }
+
+    /// Enable verbose debug output showing all received groups
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
     }
 
     /// Get the current station name (PS) if at least one segment has been received
@@ -213,53 +221,87 @@ impl RdsParser {
         // for RT version A segment address is low 4 bits
         let rt_seg_addr = (block2 & 0x0F) as usize;
 
-        // Debug print minimal info
-        // e.g. Group 0A, PI:
-        println!(
-            "RDS group {}{} PI=0x{:04X}",
-            group_type,
-            if version == 0 { 'A' } else { 'B' },
-            pi
-        );
+        // Only print debug for groups we parse, or if verbose mode is enabled
+        let is_parsed_group = matches!((group_type, version), (0, 0) | (0, 1) | (2, 0) | (2, 1));
+
+        if is_parsed_group || self.verbose {
+            println!(
+                "RDS group {}{} PI=0x{:04X} B2=0x{:04X} B3=0x{:04X} B4=0x{:04X}",
+                group_type,
+                if version == 0 { 'A' } else { 'B' },
+                pi,
+                block2,
+                block3,
+                block4
+            );
+        }
 
         match (group_type, version) {
             (0, 0) => {
-                // 0A - PS name (2 ASCII chars in block3)
+                // 0A - PS name (2 ASCII chars in block4)
+                // NOTE: Testing bit inversion + byte swap on block3
                 let seg = c_bits as usize; // 0..3
-                let ch1 = ((block3 >> 8) & 0xFF) as u8;
-                let ch2 = (block3 & 0xFF) as u8;
+                
+                // Try: invert bits then swap bytes on block3
+                let block3_inv = block3 ^ 0xFFFF;
+                let ch1 = (block3_inv & 0xFF) as u8;  // Low byte
+                let ch2 = ((block3_inv >> 8) & 0xFF) as u8;  // High byte
+                
                 let pos = seg * 2;
                 if pos + 1 < 8 {
                     self.ps[pos] = ch1;
                     self.ps[pos + 1] = ch2;
                     self.ps_received_mask |= 1 << seg;
+
+                    if self.verbose {
+                        println!(
+                            "  [PS] Segment {}/4: 0x{:02X} 0x{:02X} = '{}{}' (mask: {:04b}) [B3=0x{:04X}→inv+swap=0x{:04X}]",
+                            seg,
+                            ch1,
+                            ch2,
+                            if ch1.is_ascii_graphic() || ch1 == b' ' { ch1 as char } else { '?' },
+                            if ch2.is_ascii_graphic() || ch2 == b' ' { ch2 as char } else { '?' },
+                            self.ps_received_mask,
+                            block3,
+                            ((ch2 as u16) << 8) | (ch1 as u16)
+                        );
+                    }
                 }
-                // Remove direct printing here, let caller handle it
-                // if self.ps_received_mask == 0x0F {
-                //     let ps_str = String::from_utf8_lossy(&self.ps);
-                //     println!("[RDS] PS = {}", ps_str);
-                // }
             }
             (0, 1) => {
-                // 0B - PS variant (block3 contains PI and block4 has chars)
-                let ch1 = ((block4 >> 8) & 0xFF) as u8;
-                let ch2 = (block4 & 0xFF) as u8;
+                // 0B - PS variant (block4 has chars)
+                let block4_inv = block4 ^ 0xFFFF;
+                let ch1 = (block4_inv & 0xFF) as u8;
+                let ch2 = ((block4_inv >> 8) & 0xFF) as u8;
                 let seg = c_bits as usize;
                 let pos = seg * 2;
                 if pos + 1 < 8 {
                     self.ps[pos] = ch1;
                     self.ps[pos + 1] = ch2;
                     self.ps_received_mask |= 1 << seg;
+
+                    if self.verbose {
+                        println!(
+                            "  [PS] Segment {}/4: 0x{:02X} 0x{:02X} = '{}{}' (mask: {:04b})",
+                            seg,
+                            ch1,
+                            ch2,
+                            if ch1.is_ascii_graphic() || ch1 == b' ' { ch1 as char } else { '?' },
+                            if ch2.is_ascii_graphic() || ch2 == b' ' { ch2 as char } else { '?' },
+                            self.ps_received_mask
+                        );
+                    }
                 }
-                // Remove direct printing
             }
             (2, 0) => {
                 // 2A - Radiotext
                 let seg = rt_seg_addr & 0x0F;
-                let a = ((block3 >> 8) & 0xFF) as u8;
-                let b = (block3 & 0xFF) as u8;
-                let c = ((block4 >> 8) & 0xFF) as u8;
-                let d = (block4 & 0xFF) as u8;
+                let block3_inv = block3 ^ 0xFFFF;
+                let block4_inv = block4 ^ 0xFFFF;
+                let a = (block3_inv & 0xFF) as u8;
+                let b = ((block3_inv >> 8) & 0xFF) as u8;
+                let c = (block4_inv & 0xFF) as u8;
+                let d = ((block4_inv >> 8) & 0xFF) as u8;
                 let pos = seg * 4;
                 if pos + 3 < self.rt.len() {
                     self.rt[pos] = a;
@@ -267,24 +309,52 @@ impl RdsParser {
                     self.rt[pos + 2] = c;
                     self.rt[pos + 3] = d;
                     self.rt_received_mask[seg] = true;
+
+                    if self.verbose {
+                        let received_count = self.rt_received_mask.iter().filter(|&&x| x).count();
+                        println!(
+                            "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X} = '{}{}{}{}' ({}/16 segments)",
+                            seg,
+                            a, b, c, d,
+                            if a.is_ascii_graphic() || a == b' ' { a as char } else { '?' },
+                            if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' },
+                            if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' },
+                            if d.is_ascii_graphic() || d == b' ' { d as char } else { '?' },
+                            received_count
+                        );
+                    }
                 }
-                // Remove direct printing
             }
             (2, 1) => {
                 // 2B - Radiotext version B
                 let seg = rt_seg_addr & 0x0F;
-                let c = ((block4 >> 8) & 0xFF) as u8;
-                let d = (block4 & 0xFF) as u8;
+                let block4_inv = block4 ^ 0xFFFF;
+                let c = (block4_inv & 0xFF) as u8;
+                let d = ((block4_inv >> 8) & 0xFF) as u8;
                 let pos = seg * 4;
                 if pos + 1 < self.rt.len() {
                     self.rt[pos] = c;
                     self.rt[pos + 1] = d;
                     self.rt_received_mask[seg] = true;
+
+                    if self.verbose {
+                        let received_count = self.rt_received_mask.iter().filter(|&&x| x).count();
+                        println!(
+                            "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} = '{}{}' ({}/16 segments)",
+                            seg,
+                            c, d,
+                            if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' },
+                            if d.is_ascii_graphic() || d == b' ' { d as char } else { '?' },
+                            received_count
+                        );
+                    }
                 }
-                // Remove direct printing
             }
             _ => {
-                // For other group types you may add parsing here
+                // For other group types, only print if verbose
+                if self.verbose {
+                    println!("  [Unhandled group type]");
+                }
             }
         }
     }

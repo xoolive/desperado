@@ -37,6 +37,12 @@ struct Args {
 
     #[arg(short, long, default_value_t = false)]
     afc: bool,
+
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,15 +73,15 @@ const AUDIO_RATE: usize = 48_000;
 async fn main() -> desperado::Result<()> {
     let args = Args::parse();
 
-    /*let mut source = IqAsyncSource::from_rtlsdr(
+    let mut source = IqAsyncSource::from_rtlsdr(
         0,
         args.center_freq.0 - args.offset_freq as u32,
         args.sample_rate,
         args.gain,
     )
-    .await?;*/
+    .await?;
 
-    let mut source = IqAsyncSource::from_soapysdr(
+    /*let mut source = IqAsyncSource::from_soapysdr(
         "rtlsdr",
         0,
         (args.center_freq.0 as i32 - args.offset_freq) as u32,
@@ -83,10 +89,10 @@ async fn main() -> desperado::Result<()> {
         args.gain.map(|g| g as f64),
         "TUNER",
     )
-    .await?;
+    .await?;*/
 
     /*let mut source = IqAsyncSource::from_file(
-        "/Users/xo/Documents/isae/pybook/python_web_github/data/samples.rtl",
+        "/Users/xo/Documents/pybook/python_web_github/data/samples.rtl",
         args.center_freq.0 - args.offset_freq as u32,
         args.sample_rate,
         16_384,
@@ -96,17 +102,24 @@ async fn main() -> desperado::Result<()> {
 
     // --- Stereo audio output ---
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2); // Reduce buffer to 1 sec
-    let config = OutputDeviceParameters {
-        channels_count: 2,
-        sample_rate: AUDIO_RATE,
-        channel_sample_count: 1024,
+    let _device = if !args.no_audio {
+        let config = OutputDeviceParameters {
+            channels_count: 2,
+            sample_rate: AUDIO_RATE,
+            channel_sample_count: 1024,
+        };
+        Some(
+            run_output_device(config, move |data| {
+                for sample in data.iter_mut() {
+                    *sample = rx.try_recv().unwrap_or(0.0);
+                }
+            })
+            .unwrap(),
+        )
+    } else {
+        println!("Audio output disabled (--no-audio)");
+        None
     };
-    let _device = run_output_device(config, move |data| {
-        for sample in data.iter_mut() {
-            *sample = rx.try_recv().unwrap_or(0.0);
-        }
-    })
-    .unwrap();
 
     let mut rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
     let mut phase_extractor = PhaseExtractor::new();
@@ -120,7 +133,7 @@ async fn main() -> desperado::Result<()> {
     let mut stereo = StereoDecoderPLL::new(FM_BANDWIDTH);
     let mut deemphasis_l = DeemphasisFilter::new(FM_BANDWIDTH, 50e-6);
     let mut deemphasis_r = DeemphasisFilter::new(FM_BANDWIDTH, 50e-6);
-    let mut rds = RdsDecoder::new(FM_BANDWIDTH);
+    let mut rds = RdsDecoder::new(FM_BANDWIDTH, args.verbose);
 
     let mut audio_resample =
         StereoAudioAdaptiveResampler::new(AUDIO_RATE as f64 / FM_BANDWIDTH as f64, 5, 2); // More frequent adjustments
@@ -165,11 +178,13 @@ async fn main() -> desperado::Result<()> {
         //let buffer_fill = tx.len() as f64 / (AUDIO_RATE * 2) as f64;
         //audio_resample.adjust_ratio(buffer_fill);
 
-        // Send to audio
-        for sample in audio {
-            if tx.try_send(sample).is_err() {
-                // Drop samples if buffer is full instead of breaking
-                break;
+        // Send to audio (skip if audio disabled)
+        if !args.no_audio {
+            for sample in audio {
+                if tx.try_send(sample).is_err() {
+                    // Drop samples if buffer is full instead of breaking
+                    break;
+                }
             }
         }
 
@@ -420,8 +435,11 @@ pub struct RdsDecoder {
 }
 
 impl RdsDecoder {
-    pub fn new(sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32, verbose: bool) -> Self {
         let nominal = 57_000.0_f64;
+        let mut rds_parser = RdsParser::new();
+        rds_parser.set_verbose(verbose);
+
         Self {
             sample_rate,
             pll_phase: 0.0,
@@ -439,7 +457,7 @@ impl RdsDecoder {
             ted_gain: 0.01,
             last_bit: 0,
             bits: Vec::new(),
-            rds_parser: RdsParser::new(),
+            rds_parser,
             last_station: None,
             last_radiotext: None,
         }

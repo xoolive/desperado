@@ -45,6 +45,10 @@ struct Args {
     /// Enable automatic frequency correction
     #[arg(short, long, default_value_t = false)]
     afc: bool,
+
+    /// Disable audio output (for SSH/headless operation)
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
 }
 
 const FM_BANDWIDTH: f32 = 240_000.0; // this is a multiple of 48_000 (audio rate)
@@ -65,17 +69,22 @@ async fn main() -> desperado::Result<()> {
     // Setup audio output (48kHz mono)
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2); // ~2 sec buffer
 
-    let config = OutputDeviceParameters {
-        channels_count: 1,
-        sample_rate: AUDIO_RATE,
-        channel_sample_count: 1024,
+    let _device = if !args.no_audio {
+        let config = OutputDeviceParameters {
+            channels_count: 1,
+            sample_rate: AUDIO_RATE,
+            channel_sample_count: 1024,
+        };
+        Some(run_output_device(config, move |data| {
+            for sample in data.iter_mut() {
+                *sample = rx.try_recv().unwrap_or(0.0); // fill silence if buffer underruns
+            }
+        })
+        .unwrap())
+    } else {
+        println!("Audio output disabled (--no-audio)");
+        None
     };
-    let _device = run_output_device(config, move |data| {
-        for sample in data.iter_mut() {
-            *sample = rx.try_recv().unwrap_or(0.0); // fill silence if buffer underruns
-        }
-    })
-    .unwrap();
 
     let mut rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
     let mut phase_extractor = PhaseExtractor::new();
@@ -159,22 +168,25 @@ async fn main() -> desperado::Result<()> {
             })
             .collect();
 
-        audio_resample.adjust_ratio(tx.len() as f64 / (AUDIO_RATE * 2) as f64);
+        // Skip audio processing if disabled
+        if !args.no_audio {
+            audio_resample.adjust_ratio(tx.len() as f64 / (AUDIO_RATE * 2) as f64);
 
-        // If buffer is very full, skip this chunk entirely
-        if tx.len() > (AUDIO_RATE * 2) * 9 / 10 {
-            println!(
-                "\n[DROP] Buffer >90% full, dropping {} samples",
-                processed.len()
-            );
-            continue; // Skip to next IQ chunk
-        }
+            // If buffer is very full, skip this chunk entirely
+            if tx.len() > (AUDIO_RATE * 2) * 9 / 10 {
+                println!(
+                    "\n[DROP] Buffer >90% full, dropping {} samples",
+                    processed.len()
+                );
+                continue; // Skip to next IQ chunk
+            }
 
-        // Send entire buffer at once
-        for sample in processed {
-            if tx.try_send(sample).is_err() {
-                println!("\n[WARNING] Audio buffer full");
-                break;
+            // Send entire buffer at once
+            for sample in processed {
+                if tx.try_send(sample).is_err() {
+                    println!("\n[WARNING] Audio buffer full");
+                    break;
+                }
             }
         }
     }
