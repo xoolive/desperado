@@ -163,7 +163,7 @@ async fn main() -> desperado::Result<()> {
         SourceType::Soapy => {
             #[cfg(feature = "soapy")]
             {
-                IqAsyncSource::from_soapysdr(
+                IqAsyncSource::from_soapy(
                     &args.soapy_args,
                     args.soapy_channel,
                     tuning_freq,

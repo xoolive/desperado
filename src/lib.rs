@@ -230,7 +230,7 @@ impl IqSource {
 
     #[cfg(feature = "soapy")]
     /// Create a new SoapySDR-based I/Q source
-    pub fn from_soapysdr(
+    pub fn from_soapy(
         args: &str,
         channel: usize,
         center_freq: u32,
@@ -402,7 +402,7 @@ impl IqAsyncSource {
 
     #[cfg(feature = "soapy")]
     /// Create a new SoapySDR-based asynchronous I/Q source
-    pub async fn from_soapysdr(
+    pub async fn from_soapy(
         args: &str,
         channel: usize,
         center_freq: u32,
