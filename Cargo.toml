@@ -1,6 +1,6 @@
 [package]
 name = "desperado"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Xavier Olive <git@xoolive.org>"]
 license = "MIT"
