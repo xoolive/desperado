@@ -55,6 +55,15 @@ pub enum IqFormat {
     Cf32,
 }
 
+pub enum DeviceConfig {
+    #[cfg(feature = "pluto")]
+    Pluto(pluto::PlutoConfig),
+    #[cfg(feature = "rtlsdr")]
+    RtlSdr(rtlsdr::RtlSdrConfig),
+    #[cfg(feature = "soapy")]
+    Soapy(soapy::SoapyConfig),
+}
+
 impl std::fmt::Display for IqFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -190,6 +199,27 @@ impl IqSource {
         let source =
             iqread::IqRead::from_tcp(addr, port, center_freq, sample_rate, chunk_size, iq_format)?;
         Ok(IqSource::IqTcp(source))
+    }
+
+    /// Create a new I/Q source from a device configuration
+    pub fn from_device_config(config: DeviceConfig) -> error::Result<Self> {
+        match config {
+            #[cfg(feature = "pluto")]
+            DeviceConfig::Pluto(cfg) => {
+                let source = pluto::PlutoSdrReader::new(&cfg)?;
+                Ok(IqSource::PlutoSdr(source))
+            }
+            #[cfg(feature = "rtlsdr")]
+            DeviceConfig::RtlSdr(cfg) => {
+                let source = rtlsdr::RtlSdrReader::new(&cfg)?;
+                Ok(IqSource::RtlSdr(source))
+            }
+            #[cfg(feature = "soapy")]
+            DeviceConfig::Soapy(cfg) => {
+                let source = soapy::SoapySdrReader::new(&cfg)?;
+                Ok(IqSource::SoapySdr(source))
+            }
+        }
     }
 
     #[cfg(feature = "pluto")]
