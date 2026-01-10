@@ -116,6 +116,250 @@ pub enum DeviceConfig {
     Soapy(soapy::SoapyConfig),
 }
 
+impl std::str::FromStr for DeviceConfig {
+    type Err = Error;
+
+    /// Parse device configuration from URL-style string
+    ///
+    /// Supported formats:
+    /// - `rtlsdr://[device_index]?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
+    /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>`
+    /// - `pluto://<uri>?freq=<hz>&rate=<hz>&gain=<db|auto>`
+    /// - `plutoip://<ip>`  (shorthand for pluto://ip:<ip>)
+    /// - `plutousb://<usb>`  (shorthand for pluto://usb:<usb>)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use desperado::DeviceConfig;
+    /// use std::str::FromStr;
+    ///
+    /// // RTL-SDR device 0 at 1090 MHz, 2.4 MSPS, auto gain
+    /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090000000&rate=2400000&gain=auto").unwrap();
+    /// ```
+    fn from_str(s: &str) -> Result<Self> {
+        // Parse URL scheme
+        let parts: Vec<&str> = s.splitn(2, "://").collect();
+        if parts.len() != 2 {
+            return Err(Error::other(
+                "Invalid device URL: missing '://' separator".to_string(),
+            ));
+        }
+
+        let scheme = parts[0];
+        let rest = parts[1];
+
+        match scheme {
+            #[cfg(feature = "rtlsdr")]
+            "rtlsdr" => {
+                // Parse: rtlsdr://[device_index]?freq=...&rate=...&gain=...&bias_tee=...
+                let (device_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let device_index = if device_part.is_empty() {
+                    0
+                } else {
+                    device_part.parse::<usize>().map_err(|_| {
+                        Error::other(format!("Invalid device index: {}", device_part))
+                    })?
+                };
+
+                // Parse query parameters
+                let mut center_freq: Option<u32> = None;
+                let mut sample_rate: Option<u32> = None;
+                let mut gain = Gain::Auto;
+                let mut bias_tee = false;
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid frequency: {}", kv[1]))
+                            })?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid sample rate: {}", kv[1]))
+                            })?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        "bias_tee" | "bias-tee" => {
+                            bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::RtlSdr(rtlsdr::RtlSdrConfig {
+                    device_index,
+                    center_freq,
+                    sample_rate,
+                    gain,
+                    bias_tee,
+                }))
+            }
+            #[cfg(feature = "soapy")]
+            "soapy" => {
+                // Parse: soapy://<args>?freq=...&rate=...&gain=...
+                let (args_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let args = args_part.to_string();
+
+                // Parse query parameters
+                let mut center_freq: Option<f64> = None;
+                let mut sample_rate: Option<f64> = None;
+                let mut gain = Gain::Auto;
+                let channel = 0;
+                let gain_element = "TUNER".to_string();
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid frequency: {}", kv[1]))
+                            })?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid sample rate: {}", kv[1]))
+                            })?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::Soapy(soapy::SoapyConfig {
+                    args,
+                    center_freq,
+                    sample_rate,
+                    channel,
+                    gain,
+                    gain_element,
+                }))
+            }
+            #[cfg(feature = "pluto")]
+            "pluto" | "plutoip" | "plutousb" => {
+                // Parse: pluto://<uri>?freq=...&rate=...&gain=...
+                // Or shorthand: plutoip://<ip> or plutousb://<usb>
+                let (uri_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                // Convert shorthand schemes to full URI
+                let uri = match scheme {
+                    "plutoip" => format!("ip:{}", uri_part),
+                    "plutousb" => format!("usb:{}", uri_part),
+                    _ => uri_part.to_string(),
+                };
+
+                // Parse query parameters
+                let mut center_freq: Option<i64> = None;
+                let mut sample_rate: Option<i64> = None;
+                let mut gain = Gain::Manual(40.0); // Default manual gain for Pluto
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid frequency: {}", kv[1]))
+                            })?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid sample rate: {}", kv[1]))
+                            })?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::Pluto(pluto::PlutoConfig {
+                    uri,
+                    center_freq,
+                    sample_rate,
+                    gain,
+                }))
+            }
+            _ => Err(Error::other(format!("Unknown device scheme: {}", scheme))),
+        }
+    }
+}
+
+
 impl std::fmt::Display for IqFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
