@@ -55,6 +55,60 @@ pub fn expanduser(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Parse a numeric value with optional SI suffix (k, M, G)
+///
+/// Supports both integer and floating-point values with SI multipliers:
+/// - `k` or `K`: multiply by 1,000 (kilo)
+/// - `M`: multiply by 1,000,000 (mega)
+/// - `G`: multiply by 1,000,000,000 (giga)
+///
+/// # Examples
+///
+/// ```
+/// use desperado::parse_si_value;
+///
+/// assert_eq!(parse_si_value::<u32>("1090M").unwrap(), 1090000000);
+/// assert_eq!(parse_si_value::<u32>("2400k").unwrap(), 2400000);
+/// assert_eq!(parse_si_value::<u32>("1090000000").unwrap(), 1090000000);
+/// assert_eq!(parse_si_value::<f64>("2.4M").unwrap(), 2400000.0);
+/// assert_eq!(parse_si_value::<i64>("1090M").unwrap(), 1090000000);
+/// ```
+pub fn parse_si_value<T>(s: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    let s = s.trim();
+    
+    // Check for SI suffix
+    let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix('G') {
+        (stripped, 1_000_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix('M') {
+        (stripped, 1_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix(['k', 'K']) {
+        (stripped, 1_000.0)
+    } else {
+        // No suffix - try to parse directly
+        return s.parse().map_err(|e| {
+            Error::other(format!("Invalid numeric value '{}': {}", s, e))
+        });
+    };
+
+    // Parse as f64 first to handle both integers and floats with suffixes
+    let value_f64: f64 = num_str.parse().map_err(|e| {
+        Error::other(format!("Invalid numeric value '{}': {}", num_str, e))
+    })?;
+
+    // Apply multiplier
+    let result = value_f64 * multiplier;
+    
+    // Convert to string and parse as target type (handles rounding for integers)
+    let result_str = format!("{:.0}", result);
+    result_str.parse().map_err(|e| {
+        Error::other(format!("Failed to convert '{}' to target type: {}", result_str, e))
+    })
+}
+
 /// Unified gain configuration across all SDR devices
 ///
 /// This enum provides a consistent interface for configuring tuner gain
@@ -130,17 +184,25 @@ impl std::str::FromStr for DeviceConfig {
     ///
     /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
     ///
+    /// Frequency and sample rate values support SI suffixes (k/K, M, G):
+    /// - `1090M` = 1,090,000,000 Hz
+    /// - `2.4M` = 2,400,000 Hz
+    /// - `1090000000` (raw Hz values also supported)
+    ///
     /// # Examples
     ///
     /// ```
     /// use desperado::DeviceConfig;
     /// use std::str::FromStr;
     ///
-    /// // RTL-SDR device 0 (explicit)
+    /// // RTL-SDR with SI suffixes (most convenient)
+    /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090M&rate=2.4M&gain=auto").unwrap();
+    ///
+    /// // RTL-SDR with raw Hz values
     /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090000000&rate=2400000&gain=auto").unwrap();
     ///
     /// // RTL-SDR first available device (implicit device 0)
-    /// let config = DeviceConfig::from_str("rtlsdr://?freq=1090000000&rate=2400000&gain=49.6").unwrap();
+    /// let config = DeviceConfig::from_str("rtlsdr://?freq=1090M&rate=2.4M&gain=49.6").unwrap();
     /// ```
     fn from_str(s: &str) -> Result<Self> {
         // Parse URL scheme
@@ -188,14 +250,10 @@ impl std::str::FromStr for DeviceConfig {
                     }
                     match kv[0] {
                         "freq" | "frequency" => {
-                            center_freq = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid frequency: {}", kv[1]))
-                            })?);
+                            center_freq = Some(parse_si_value(kv[1])?);
                         }
                         "rate" | "sample_rate" => {
-                            sample_rate = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid sample rate: {}", kv[1]))
-                            })?);
+                            sample_rate = Some(parse_si_value(kv[1])?);
                         }
                         "gain" => {
                             if kv[1].to_lowercase() == "auto" {
@@ -255,14 +313,10 @@ impl std::str::FromStr for DeviceConfig {
                     }
                     match kv[0] {
                         "freq" | "frequency" => {
-                            center_freq = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid frequency: {}", kv[1]))
-                            })?);
+                            center_freq = Some(parse_si_value(kv[1])?);
                         }
                         "rate" | "sample_rate" => {
-                            sample_rate = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid sample rate: {}", kv[1]))
-                            })?);
+                            sample_rate = Some(parse_si_value(kv[1])?);
                         }
                         "gain" => {
                             if kv[1].to_lowercase() == "auto" {
@@ -324,14 +378,10 @@ impl std::str::FromStr for DeviceConfig {
                     }
                     match kv[0] {
                         "freq" | "frequency" => {
-                            center_freq = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid frequency: {}", kv[1]))
-                            })?);
+                            center_freq = Some(parse_si_value(kv[1])?);
                         }
                         "rate" | "sample_rate" => {
-                            sample_rate = Some(kv[1].parse().map_err(|_| {
-                                Error::other(format!("Invalid sample rate: {}", kv[1]))
-                            })?);
+                            sample_rate = Some(parse_si_value(kv[1])?);
                         }
                         "gain" => {
                             if kv[1].to_lowercase() == "auto" {
