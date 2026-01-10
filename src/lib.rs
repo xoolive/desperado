@@ -128,14 +128,19 @@ impl std::str::FromStr for DeviceConfig {
     /// - `plutoip://<ip>`  (shorthand for pluto://ip:<ip>)
     /// - `plutousb://<usb>`  (shorthand for pluto://usb:<usb>)
     ///
+    /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
+    ///
     /// # Examples
     ///
     /// ```
     /// use desperado::DeviceConfig;
     /// use std::str::FromStr;
     ///
-    /// // RTL-SDR device 0 at 1090 MHz, 2.4 MSPS, auto gain
+    /// // RTL-SDR device 0 (explicit)
     /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090000000&rate=2400000&gain=auto").unwrap();
+    ///
+    /// // RTL-SDR first available device (implicit device 0)
+    /// let config = DeviceConfig::from_str("rtlsdr://?freq=1090000000&rate=2400000&gain=49.6").unwrap();
     /// ```
     fn from_str(s: &str) -> Result<Self> {
         // Parse URL scheme

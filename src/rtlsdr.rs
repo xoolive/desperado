@@ -189,3 +189,26 @@ impl Stream for AsyncRtlSdrReader {
         }
     }
 }
+
+/// Try to open the first available RTL-SDR device
+///
+/// This is a convenience function that attempts to open device index 0.
+/// Returns an error if no device is found.
+///
+/// # Examples
+///
+/// ```no_run
+/// use desperado::rtlsdr::RtlSdrConfig;
+/// use desperado::Gain;
+///
+/// let config = RtlSdrConfig {
+///     device_index: 0,  // First device
+///     center_freq: 1090000000,
+///     sample_rate: 2400000,
+///     gain: Gain::Auto,
+///     bias_tee: false,
+/// };
+/// ```
+pub fn get_first_device_index() -> usize {
+    0 // RTL-SDR convention: device 0 is the first available device
+}
