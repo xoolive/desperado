@@ -196,6 +196,8 @@ impl std::str::FromStr for DeviceConfig {
     /// # Examples
     ///
     /// ```
+    /// # #[cfg(feature = "rtlsdr")]
+    /// # {
     /// use desperado::DeviceConfig;
     /// use std::str::FromStr;
     ///
@@ -207,6 +209,18 @@ impl std::str::FromStr for DeviceConfig {
     ///
     /// // RTL-SDR first available device (implicit device 0)
     /// let config = DeviceConfig::from_str("rtlsdr://?freq=1090M&rate=2.4M&gain=49.6").unwrap();
+    /// # }
+    /// ```
+    ///
+    /// ```
+    /// # #[cfg(feature = "pluto")]
+    /// # {
+    /// use desperado::DeviceConfig;
+    /// use std::str::FromStr;
+    ///
+    /// // PlutoSDR with IP address
+    /// let config = DeviceConfig::from_str("plutoip://192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    /// # }
     /// ```
     fn from_str(s: &str) -> Result<Self> {
         // Parse URL scheme
