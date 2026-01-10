@@ -8,7 +8,7 @@ use futures::Stream;
 use num_complex::Complex;
 use soapysdr::{Args, Device, Direction, Error as SoapyError};
 
-use crate::error;
+use crate::{error, Gain};
 
 /**
  * SoapySDR Configuration
@@ -23,8 +23,8 @@ pub struct SoapyConfig {
     pub sample_rate: f64,
     /// Channel index (typically 0)
     pub channel: usize,
-    /// Tuner gain in dB (None for AGC)
-    pub gain: Option<f64>,
+    /// Tuner gain (Auto or Manual in dB)
+    pub gain: Gain,
     /// Gain element name (e.g., "TUNER")
     pub gain_element: String,
 }
@@ -37,7 +37,7 @@ impl SoapyConfig {
             center_freq,
             sample_rate,
             channel: 0,
-            gain: None,
+            gain: Gain::Auto,
             gain_element: "TUNER".to_string(),
         }
     }
@@ -60,13 +60,18 @@ impl SoapySdrReader {
         device.set_frequency(Direction::Rx, config.channel, config.center_freq, ())?;
         device.set_sample_rate(Direction::Rx, config.channel, config.sample_rate)?;
 
-        if let Some(gain) = config.gain {
-            device.set_gain_element(
-                Direction::Rx,
-                config.channel,
-                config.gain_element.as_str(),
-                gain,
-            )?;
+        match config.gain {
+            Gain::Manual(gain_db) => {
+                device.set_gain_element(
+                    Direction::Rx,
+                    config.channel,
+                    config.gain_element.as_str(),
+                    gain_db,
+                )?;
+            }
+            Gain::Auto => {
+                // SoapySDR uses automatic gain when no manual gain is set
+            }
         }
 
         let mut stream = device.rx_stream::<Complex<i16>>(&[config.channel])?;
@@ -137,13 +142,18 @@ impl AsyncSoapySdrReader {
                 device.set_frequency(Direction::Rx, cfg.channel, cfg.center_freq, ())?;
                 device.set_sample_rate(Direction::Rx, cfg.channel, cfg.sample_rate)?;
 
-                if let Some(gain) = cfg.gain {
-                    device.set_gain_element(
-                        Direction::Rx,
-                        cfg.channel,
-                        cfg.gain_element.as_str(),
-                        gain,
-                    )?;
+                match cfg.gain {
+                    Gain::Manual(gain_db) => {
+                        device.set_gain_element(
+                            Direction::Rx,
+                            cfg.channel,
+                            cfg.gain_element.as_str(),
+                            gain_db,
+                        )?;
+                    }
+                    Gain::Auto => {
+                        // SoapySDR uses automatic gain when no manual gain is set
+                    }
                 }
 
                 let mut stream = device.rx_stream::<Complex<i16>>(&[cfg.channel])?;

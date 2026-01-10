@@ -5,7 +5,7 @@
 //! data formats and provides both synchronous and asynchronous interfaces for
 //! reading I/Q samples.
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -13,7 +13,7 @@ use futures::Stream;
 use num_complex::Complex;
 use tokio::io::AsyncBufRead;
 
-use crate::{IqFormat, error};
+use crate::{error, expanduser, IqFormat};
 
 /**
  * I/Q Data Source Configuration
@@ -222,15 +222,4 @@ impl IqFormat {
             IqFormat::Cf32 => 8,
         }
     }
-}
-
-fn expanduser(path: PathBuf) -> PathBuf {
-    // Check if the path starts with "~"
-    if let Some(stripped) = path.to_str().and_then(|p| p.strip_prefix("~"))
-        && let Some(home_dir) = dirs::home_dir()
-    {
-        // Join the home directory with the rest of the path
-        return home_dir.join(stripped.trim_start_matches('/'));
-    }
-    path
 }

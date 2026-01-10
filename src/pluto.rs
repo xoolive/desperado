@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
-use crate::error;
+use crate::{Gain, error};
 
 const DEFAULT_BUFFER_SIZE: usize = 32768;
 
@@ -28,13 +28,13 @@ pub struct PlutoConfig {
     pub center_freq: i64,
     /// Sample rate in Hz
     pub sample_rate: i64,
-    /// Tuner gain in dB (None for auto gain)
-    pub gain: f64,
+    /// Tuner gain (Auto or Manual in dB)
+    pub gain: Gain,
 }
 
 impl PlutoConfig {
     /// Create a new Adalm Pluto SDR configuration with specified parameters
-    pub fn new(address: String, center_freq: i64, sample_rate: i64, gain: f64) -> Self {
+    pub fn new(address: String, center_freq: i64, sample_rate: i64, gain: Gain) -> Self {
         Self {
             uri: address,
             center_freq,
@@ -68,7 +68,17 @@ impl PlutoSdrReader {
         let bandwidth = config.sample_rate;
         let _ = pluto.set_rf_bandwidth(bandwidth, RX);
         // Set gain
-        let _ = pluto.set_hwgain(config.gain, RX);
+        match config.gain {
+            Gain::Manual(gain_db) => {
+                let _ = pluto.set_hwgain(gain_db, RX);
+            }
+            Gain::Auto => {
+                // PlutoSDR auto gain mode - hardware dependent
+                // Some versions support AGC via setting gain to a special value
+                // Default to manual mode with a typical value if AGC not available
+                let _ = pluto.set_hwgain(40.0, RX);
+            }
+        }
 
         // Get RX channels
         let (rx_i, rx_q) = pluto.rx_ch0();
@@ -186,7 +196,17 @@ impl AsyncPlutoSdrReader {
         let bandwidth = (config.sample_rate as f64 * 0.8) as i64;
         let _ = pluto.set_rf_bandwidth(bandwidth, RX);
 
-        let _ = pluto.set_hwgain(config.gain, RX);
+        match config.gain {
+            Gain::Manual(gain_db) => {
+                let _ = pluto.set_hwgain(gain_db, RX);
+            }
+            Gain::Auto => {
+                // PlutoSDR auto gain mode - hardware dependent
+                // Some versions support AGC via setting gain to a special value
+                // Default to manual mode with a typical value if AGC not available
+                let _ = pluto.set_hwgain(40.0, RX);
+            }
+        }
 
         // Get RX channels
         let (rx_i, rx_q) = pluto.rx_ch0();

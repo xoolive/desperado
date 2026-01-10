@@ -7,9 +7,9 @@
 
 use futures::Stream;
 use num_complex::Complex;
-use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
+use rtl_sdr_rs::{RtlSdr, TunerGain, DEFAULT_BUF_LENGTH};
 
-use crate::{IqFormat, error};
+use crate::{error, Gain, IqFormat};
 
 /**
  * RTL-SDR Configuration
@@ -22,18 +22,21 @@ pub struct RtlSdrConfig {
     pub center_freq: u32,
     /// Sample rate in Hz
     pub sample_rate: u32,
-    /// Tuner gain (None for AGC, Some(gain) for manual)
-    pub gain: Option<i32>,
+    /// Tuner gain (Auto or Manual in dB)
+    pub gain: Gain,
+    /// Enable bias tee (default: false)
+    pub bias_tee: bool,
 }
 
 impl RtlSdrConfig {
     /// Create a new RTL-SDR configuration with specified parameters
-    pub fn new(device_index: usize, center_freq: u32, sample_rate: u32, gain: Option<i32>) -> Self {
+    pub fn new(device_index: usize, center_freq: u32, sample_rate: u32, gain: Gain) -> Self {
         Self {
             device_index,
             center_freq,
             sample_rate,
             gain,
+            bias_tee: false,
         }
     }
 }
@@ -54,10 +57,14 @@ impl RtlSdrReader {
         rtlsdr.set_sample_rate(config.sample_rate)?;
         rtlsdr.set_center_freq(config.center_freq)?;
         match config.gain {
-            Some(gain) => rtlsdr.set_tuner_gain(TunerGain::Manual(gain))?,
-            None => rtlsdr.set_tuner_gain(TunerGain::Auto)?,
+            Gain::Manual(gain_db) => {
+                // Convert dB to rtl-sdr units (gain * 10)
+                let gain_tenths = (gain_db * 10.0) as i32;
+                rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+            }
+            Gain::Auto => rtlsdr.set_tuner_gain(TunerGain::Auto)?,
         };
-        let _ = rtlsdr.set_bias_tee(false);
+        let _ = rtlsdr.set_bias_tee(config.bias_tee);
         rtlsdr.reset_buffer()?;
         Ok(Self {
             rtlsdr,
@@ -112,10 +119,14 @@ impl AsyncRtlSdrReader {
                 rtl.set_sample_rate(cfg.sample_rate)?;
                 rtl.set_center_freq(cfg.center_freq)?;
                 match cfg.gain {
-                    Some(gain) => rtl.set_tuner_gain(TunerGain::Manual(gain))?,
-                    None => rtl.set_tuner_gain(TunerGain::Auto)?,
+                    Gain::Manual(gain_db) => {
+                        // Convert dB to rtl-sdr units (gain * 10)
+                        let gain_tenths = (gain_db * 10.0) as i32;
+                        rtl.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+                    }
+                    Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto)?,
                 };
-                let _ = rtl.set_bias_tee(false);
+                let _ = rtl.set_bias_tee(cfg.bias_tee);
                 rtl.reset_buffer()?;
                 Ok(rtl)
             })();

@@ -8,6 +8,7 @@
 //! - Async types are prefixed with `Async` or use `IqAsync` naming
 //! - All async operations return `Future`s or implement the `Stream` trait
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -26,6 +27,57 @@ pub mod soapy;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
+
+/// Expand tilde (~) in path to home directory
+///
+/// This function expands paths starting with `~` to the user's home directory.
+/// If the path doesn't start with `~` or the home directory cannot be determined,
+/// the original path is returned unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use desperado::expanduser;
+///
+/// let path = PathBuf::from("~/Documents/data.iq");
+/// let expanded = expanduser(path);
+/// // On Unix: /home/username/Documents/data.iq
+/// ```
+pub fn expanduser(path: PathBuf) -> PathBuf {
+    // Check if the path starts with "~"
+    if let Some(stripped) = path.to_str().and_then(|p| p.strip_prefix("~"))
+        && let Some(home_dir) = dirs::home_dir()
+    {
+        // Join the home directory with the rest of the path
+        return home_dir.join(stripped.trim_start_matches('/'));
+    }
+    path
+}
+
+/// Unified gain configuration across all SDR devices
+///
+/// This enum provides a consistent interface for configuring tuner gain
+/// across different SDR hardware (RTL-SDR, SoapySDR, PlutoSDR).
+///
+/// # Examples
+///
+/// ```
+/// use desperado::Gain;
+///
+/// // Automatic gain control
+/// let auto_gain = Gain::Auto;
+///
+/// // Manual gain of 49.6 dB
+/// let manual_gain = Gain::Manual(49.6);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gain {
+    /// Automatic gain control (AGC)
+    Auto,
+    /// Manual gain in dB
+    Manual(f64),
+}
 
 /// I/Q Data Format
 ///
@@ -234,7 +286,7 @@ impl IqSource {
             uri: uri.to_string(),
             center_freq,
             sample_rate,
-            gain,
+            gain: Gain::Manual(gain),
         };
         let source = pluto::PlutoSdrReader::new(&config)?;
         Ok(IqSource::PlutoSdr(source))
@@ -252,7 +304,11 @@ impl IqSource {
             device_index,
             center_freq,
             sample_rate,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual((g as f64) / 10.0),
+                None => Gain::Auto,
+            },
+            bias_tee: false,
         };
         let source = rtlsdr::RtlSdrReader::new(&config)?;
         Ok(IqSource::RtlSdr(source))
@@ -273,7 +329,10 @@ impl IqSource {
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual(g),
+                None => Gain::Auto,
+            },
             gain_element: gain_element.to_string(),
         };
         let source = soapy::SoapySdrReader::new(&config)?;
@@ -406,7 +465,7 @@ impl IqAsyncSource {
             uri: uri.to_string(),
             center_freq,
             sample_rate,
-            gain,
+            gain: Gain::Manual(gain),
         };
         let source = pluto::AsyncPlutoSdrReader::new(&config).await?;
         Ok(IqAsyncSource::PlutoSdr(source))
@@ -424,7 +483,11 @@ impl IqAsyncSource {
             device_index,
             center_freq,
             sample_rate,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual((g as f64) / 10.0),
+                None => Gain::Auto,
+            },
+            bias_tee: false,
         };
         let async_reader = rtlsdr::AsyncRtlSdrReader::new(&config)?;
         Ok(IqAsyncSource::RtlSdr(async_reader))
@@ -445,7 +508,10 @@ impl IqAsyncSource {
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual(g),
+                None => Gain::Auto,
+            },
             gain_element: gain_element.to_string(),
         };
         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
