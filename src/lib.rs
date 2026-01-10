@@ -182,9 +182,9 @@ impl std::str::FromStr for DeviceConfig {
     /// Supported formats:
     /// - `rtlsdr://[device_index]?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
     /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>`
-    /// - `pluto://<uri>?freq=<hz>&rate=<hz>&gain=<db|auto>`
-    /// - `plutoip://<ip>`  (shorthand for pluto://ip:<ip>)
-    /// - `plutousb://<usb>`  (shorthand for pluto://usb:<usb>)
+    /// - `pluto://<uri>?freq=<hz>&gain=<db|auto>`
+    /// - `plutoip://<ip>` (shorthand for `pluto://ip:<ip>`)
+    /// - `plutousb://<usb>` (shorthand for `pluto://usb:<usb>`)
     ///
     /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
     ///
