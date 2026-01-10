@@ -20,7 +20,7 @@ const DEFAULT_BUFFER_SIZE: usize = 32768;
 /**
  * Adalm Pluto SDR Configuration
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlutoConfig {
     /// Device address (e.g., "ip:192.168.2.1" or "usb:1.2.3"); use iio_info -s to find out the proper uri
     pub uri: String,

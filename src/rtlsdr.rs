@@ -7,14 +7,14 @@
 
 use futures::Stream;
 use num_complex::Complex;
-use rtl_sdr_rs::{RtlSdr, TunerGain, DEFAULT_BUF_LENGTH};
+use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
 
-use crate::{error, Gain, IqFormat};
+use crate::{Gain, IqFormat, error};
 
 /**
  * RTL-SDR Configuration
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RtlSdrConfig {
     /// Device index (0 for first device)
     pub device_index: usize,

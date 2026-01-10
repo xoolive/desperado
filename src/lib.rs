@@ -79,7 +79,7 @@ where
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {
     let s = s.trim();
-    
+
     // Check for SI suffix
     let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix('G') {
         (stripped, 1_000_000_000.0)
@@ -89,23 +89,26 @@ where
         (stripped, 1_000.0)
     } else {
         // No suffix - try to parse directly
-        return s.parse().map_err(|e| {
-            Error::other(format!("Invalid numeric value '{}': {}", s, e))
-        });
+        return s
+            .parse()
+            .map_err(|e| Error::other(format!("Invalid numeric value '{}': {}", s, e)));
     };
 
     // Parse as f64 first to handle both integers and floats with suffixes
-    let value_f64: f64 = num_str.parse().map_err(|e| {
-        Error::other(format!("Invalid numeric value '{}': {}", num_str, e))
-    })?;
+    let value_f64: f64 = num_str
+        .parse()
+        .map_err(|e| Error::other(format!("Invalid numeric value '{}': {}", num_str, e)))?;
 
     // Apply multiplier
     let result = value_f64 * multiplier;
-    
+
     // Convert to string and parse as target type (handles rounding for integers)
     let result_str = format!("{:.0}", result);
     result_str.parse().map_err(|e| {
-        Error::other(format!("Failed to convert '{}' to target type: {}", result_str, e))
+        Error::other(format!(
+            "Failed to convert '{}' to target type: {}",
+            result_str, e
+        ))
     })
 }
 
@@ -161,6 +164,7 @@ pub enum IqFormat {
     Cf32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeviceConfig {
     #[cfg(feature = "pluto")]
     Pluto(pluto::PlutoConfig),
@@ -413,7 +417,6 @@ impl std::str::FromStr for DeviceConfig {
         }
     }
 }
-
 
 impl std::fmt::Display for IqFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -815,6 +818,30 @@ impl IqAsyncSource {
         };
         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
         Ok(IqAsyncSource::SoapySdr(async_reader))
+    }
+
+    /// Create a new asynchronous I/Q source from a DeviceConfig
+    ///
+    /// This is a convenience method that dispatches to the appropriate device-specific
+    /// constructor based on the DeviceConfig variant.
+    pub async fn from_device_config(config: &DeviceConfig) -> error::Result<Self> {
+        match config {
+            #[cfg(feature = "rtlsdr")]
+            DeviceConfig::RtlSdr(cfg) => {
+                let async_reader = rtlsdr::AsyncRtlSdrReader::new(cfg)?;
+                Ok(IqAsyncSource::RtlSdr(async_reader))
+            }
+            #[cfg(feature = "pluto")]
+            DeviceConfig::Pluto(cfg) => {
+                let async_reader = pluto::AsyncPlutoSdrReader::new(cfg).await?;
+                Ok(IqAsyncSource::PlutoSdr(async_reader))
+            }
+            #[cfg(feature = "soapy")]
+            DeviceConfig::Soapy(cfg) => {
+                let async_reader = soapy::AsyncSoapySdrReader::new(cfg)?;
+                Ok(IqAsyncSource::SoapySdr(async_reader))
+            }
+        }
     }
 }
 

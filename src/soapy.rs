@@ -8,12 +8,12 @@ use futures::Stream;
 use num_complex::Complex;
 use soapysdr::{Args, Device, Direction, Error as SoapyError};
 
-use crate::{error, Gain};
+use crate::{Gain, error};
 
 /**
  * SoapySDR Configuration
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SoapyConfig {
     /// Device arguments (e.g., "driver=rtlsdr")
     pub args: String,

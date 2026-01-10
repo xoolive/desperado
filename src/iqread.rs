@@ -13,7 +13,7 @@ use futures::Stream;
 use num_complex::Complex;
 use tokio::io::AsyncBufRead;
 
-use crate::{error, expanduser, IqFormat};
+use crate::{IqFormat, error, expanduser};
 
 /**
  * I/Q Data Source Configuration
