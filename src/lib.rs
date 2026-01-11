@@ -183,10 +183,13 @@ impl std::str::FromStr for DeviceConfig {
     /// - `rtlsdr://[device_index]?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
     /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>`
     /// - `pluto://<uri>?freq=<hz>&gain=<db|auto>`
-    /// - `plutoip://<ip>` (shorthand for `pluto://ip:<ip>`)
-    /// - `plutousb://<usb>` (shorthand for `pluto://usb:<usb>`)
     ///
     /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
+    ///
+    /// For PlutoSDR, the URI can be:
+    /// - An IP address: `pluto://192.168.2.1`
+    /// - With ip: prefix: `pluto://ip:192.168.2.1`
+    /// - USB device: `pluto://usb:` or `pluto://usb:1`
     ///
     /// Frequency and sample rate values support SI suffixes (k/K, M, G):
     /// - `1090M` = 1,090,000,000 Hz
@@ -219,7 +222,13 @@ impl std::str::FromStr for DeviceConfig {
     /// use std::str::FromStr;
     ///
     /// // PlutoSDR with IP address
-    /// let config = DeviceConfig::from_str("plutoip://192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    /// let config = DeviceConfig::from_str("pluto://192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    ///
+    /// // PlutoSDR with explicit ip: prefix
+    /// let config = DeviceConfig::from_str("pluto://ip:192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    ///
+    /// // PlutoSDR via USB
+    /// let config = DeviceConfig::from_str("pluto://usb:?freq=1090M&rate=2.4M&gain=40").unwrap();
     /// # }
     /// ```
     fn from_str(s: &str) -> Result<Self> {
@@ -366,21 +375,16 @@ impl std::str::FromStr for DeviceConfig {
                 }))
             }
             #[cfg(feature = "pluto")]
-            "pluto" | "plutoip" | "plutousb" => {
+            "pluto" => {
                 // Parse: pluto://<uri>?freq=...&rate=...&gain=...
-                // Or shorthand: plutoip://<ip> or plutousb://<usb>
+                // URI can be: ip:192.168.2.1, usb:, usb:1, or plain IP like 192.168.2.1
                 let (uri_part, query) = if let Some(q_pos) = rest.find('?') {
                     (&rest[..q_pos], &rest[q_pos + 1..])
                 } else {
                     (rest, "")
                 };
 
-                // Convert shorthand schemes to full URI
-                let uri = match scheme {
-                    "plutoip" => format!("ip:{}", uri_part),
-                    "plutousb" => format!("usb:{}", uri_part),
-                    _ => uri_part.to_string(),
-                };
+                let uri = uri_part.to_string();
 
                 // Parse query parameters
                 let mut center_freq: Option<i64> = None;
