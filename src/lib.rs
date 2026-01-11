@@ -189,7 +189,7 @@ impl std::str::FromStr for DeviceConfig {
     /// For PlutoSDR, the URI can be:
     /// - An IP address: `pluto://192.168.2.1`
     /// - With ip: prefix: `pluto://ip:192.168.2.1`
-    /// - USB device: `pluto://usb:` or `pluto://usb:1`
+    /// - USB device: `pluto://usb:` or `pluto:///usb:1.18.5` (use triple slash for URIs with colons/dots)
     ///
     /// Frequency and sample rate values support SI suffixes (k/K, M, G):
     /// - `1090M` = 1,090,000,000 Hz
@@ -227,8 +227,8 @@ impl std::str::FromStr for DeviceConfig {
     /// // PlutoSDR with explicit ip: prefix
     /// let config = DeviceConfig::from_str("pluto://ip:192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
     ///
-    /// // PlutoSDR via USB
-    /// let config = DeviceConfig::from_str("pluto://usb:?freq=1090M&rate=2.4M&gain=40").unwrap();
+    /// // PlutoSDR via USB (use triple slash for USB URIs with version numbers)
+    /// let config = DeviceConfig::from_str("pluto:///usb:1.18.5?freq=1090M&rate=2.4M&gain=40").unwrap();
     /// # }
     /// ```
     fn from_str(s: &str) -> Result<Self> {
@@ -377,11 +377,16 @@ impl std::str::FromStr for DeviceConfig {
             #[cfg(feature = "pluto")]
             "pluto" => {
                 // Parse: pluto://<uri>?freq=...&rate=...&gain=...
-                // URI can be: ip:192.168.2.1, usb:, usb:1, or plain IP like 192.168.2.1
-                let (uri_part, query) = if let Some(q_pos) = rest.find('?') {
-                    (&rest[..q_pos], &rest[q_pos + 1..])
+                // URI can be: ip:192.168.2.1, usb:, usb:1, usb:1.18.5, or plain IP like 192.168.2.1
+                // Also supports path format: pluto:///usb:1.18.5 (triple slash for URIs with colons)
+
+                // Strip leading slash if present (from pluto:///uri format)
+                let rest_trimmed = rest.strip_prefix('/').unwrap_or(rest);
+
+                let (uri_part, query) = if let Some(q_pos) = rest_trimmed.find('?') {
+                    (&rest_trimmed[..q_pos], &rest_trimmed[q_pos + 1..])
                 } else {
-                    (rest, "")
+                    (rest_trimmed, "")
                 };
 
                 let uri = uri_part.to_string();
@@ -956,6 +961,44 @@ mod tests {
             let s = format.to_string();
             let parsed: IqFormat = s.parse().unwrap();
             assert_eq!(parsed, format);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pluto")]
+    fn test_pluto_uri_parsing() {
+        use std::str::FromStr;
+
+        // Test IP address
+        let config = DeviceConfig::from_str("pluto://192.168.2.1?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "192.168.2.1");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test explicit ip: prefix
+        let config = DeviceConfig::from_str("pluto://ip:192.168.2.1?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "ip:192.168.2.1");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test USB with triple slash (for URIs containing colons)
+        let config = DeviceConfig::from_str("pluto:///usb:1.18.5?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "usb:1.18.5");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test simple USB
+        let config = DeviceConfig::from_str("pluto:///usb:?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "usb:");
+        } else {
+            panic!("Expected PlutoSDR config");
         }
     }
 }
