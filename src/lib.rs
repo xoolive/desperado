@@ -306,7 +306,7 @@ impl std::str::FromStr for DeviceConfig {
                     .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
 
                 Ok(DeviceConfig::RtlSdr(rtlsdr::RtlSdrConfig {
-                    device_index,
+                    device: rtlsdr::DeviceSelector::Index(device_index),
                     center_freq,
                     sample_rate,
                     gain,
@@ -627,7 +627,7 @@ impl IqSource {
         gain: Option<i32>,
     ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
-            device_index,
+            device: rtlsdr::DeviceSelector::Index(device_index),
             center_freq,
             sample_rate,
             gain: match gain {
@@ -806,7 +806,7 @@ impl IqAsyncSource {
         gain: Option<i32>,
     ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
-            device_index,
+            device: rtlsdr::DeviceSelector::Index(device_index),
             center_freq,
             sample_rate,
             gain: match gain {
