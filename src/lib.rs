@@ -8,6 +8,7 @@
 //! - Async types are prefixed with `Async` or use `IqAsync` naming
 //! - All async operations return `Future`s or implement the `Stream` trait
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -26,6 +27,114 @@ pub mod soapy;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
+
+/// Expand tilde (~) in path to home directory
+///
+/// This function expands paths starting with `~` to the user's home directory.
+/// If the path doesn't start with `~` or the home directory cannot be determined,
+/// the original path is returned unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use desperado::expanduser;
+///
+/// let path = PathBuf::from("~/Documents/data.iq");
+/// let expanded = expanduser(path);
+/// // On Unix: /home/username/Documents/data.iq
+/// ```
+pub fn expanduser(path: PathBuf) -> PathBuf {
+    // Check if the path starts with "~"
+    if let Some(stripped) = path.to_str().and_then(|p| p.strip_prefix("~"))
+        && let Some(home_dir) = dirs::home_dir()
+    {
+        // Join the home directory with the rest of the path
+        return home_dir.join(stripped.trim_start_matches('/'));
+    }
+    path
+}
+
+/// Parse a numeric value with optional SI suffix (k, M, G)
+///
+/// Supports both integer and floating-point values with SI multipliers:
+/// - `k` or `K`: multiply by 1,000 (kilo)
+/// - `M`: multiply by 1,000,000 (mega)
+/// - `G`: multiply by 1,000,000,000 (giga)
+///
+/// # Examples
+///
+/// ```
+/// use desperado::parse_si_value;
+///
+/// assert_eq!(parse_si_value::<u32>("1090M").unwrap(), 1090000000);
+/// assert_eq!(parse_si_value::<u32>("2400k").unwrap(), 2400000);
+/// assert_eq!(parse_si_value::<u32>("1090000000").unwrap(), 1090000000);
+/// assert_eq!(parse_si_value::<f64>("2.4M").unwrap(), 2400000.0);
+/// assert_eq!(parse_si_value::<i64>("1090M").unwrap(), 1090000000);
+/// ```
+pub fn parse_si_value<T>(s: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    let s = s.trim();
+
+    // Check for SI suffix
+    let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix('G') {
+        (stripped, 1_000_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix('M') {
+        (stripped, 1_000_000.0)
+    } else if let Some(stripped) = s.strip_suffix(['k', 'K']) {
+        (stripped, 1_000.0)
+    } else {
+        // No suffix - try to parse directly
+        return s
+            .parse()
+            .map_err(|e| Error::other(format!("Invalid numeric value '{}': {}", s, e)));
+    };
+
+    // Parse as f64 first to handle both integers and floats with suffixes
+    let value_f64: f64 = num_str
+        .parse()
+        .map_err(|e| Error::other(format!("Invalid numeric value '{}': {}", num_str, e)))?;
+
+    // Apply multiplier
+    let result = value_f64 * multiplier;
+
+    // Convert to string and parse as target type (handles rounding for integers)
+    let result_str = format!("{:.0}", result);
+    result_str.parse().map_err(|e| {
+        Error::other(format!(
+            "Failed to convert '{}' to target type: {}",
+            result_str, e
+        ))
+    })
+}
+
+/// Unified gain configuration across all SDR devices
+///
+/// This enum provides a consistent interface for configuring tuner gain
+/// across different SDR hardware (RTL-SDR, SoapySDR, PlutoSDR).
+///
+/// # Examples
+///
+/// ```
+/// use desperado::Gain;
+///
+/// // Automatic gain control
+/// let auto_gain = Gain::Auto;
+///
+/// // Manual gain of 49.6 dB
+/// let manual_gain = Gain::Manual(49.6);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gain {
+    /// Automatic gain control (AGC)
+    Auto,
+    /// Manual gain in dB
+    Manual(f64),
+}
 
 /// I/Q Data Format
 ///
@@ -53,6 +162,289 @@ pub enum IqFormat {
     /// Eight bytes per sample: I (32-bit float LE), Q (32-bit float LE)
     /// Normalized float values
     Cf32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeviceConfig {
+    #[cfg(feature = "pluto")]
+    Pluto(pluto::PlutoConfig),
+    #[cfg(feature = "rtlsdr")]
+    RtlSdr(rtlsdr::RtlSdrConfig),
+    #[cfg(feature = "soapy")]
+    Soapy(soapy::SoapyConfig),
+}
+
+impl std::str::FromStr for DeviceConfig {
+    type Err = Error;
+
+    /// Parse device configuration from URL-style string
+    ///
+    /// Supported formats:
+    /// - `rtlsdr://[device_index]?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
+    /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
+    /// - `pluto://<uri>?freq=<hz>&gain=<db|auto>`
+    ///
+    /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
+    ///
+    /// For PlutoSDR, the URI can be:
+    /// - An IP address: `pluto://192.168.2.1`
+    /// - With ip: prefix: `pluto://ip:192.168.2.1`
+    /// - USB device: `pluto://usb:` or `pluto:///usb:1.18.5` (use triple slash for URIs with colons/dots)
+    ///
+    /// Frequency and sample rate values support SI suffixes (k/K, M, G):
+    /// - `1090M` = 1,090,000,000 Hz
+    /// - `2.4M` = 2,400,000 Hz
+    /// - `1090000000` (raw Hz values also supported)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "rtlsdr")]
+    /// # {
+    /// use desperado::DeviceConfig;
+    /// use std::str::FromStr;
+    ///
+    /// // RTL-SDR with SI suffixes (most convenient)
+    /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090M&rate=2.4M&gain=auto").unwrap();
+    ///
+    /// // RTL-SDR with raw Hz values
+    /// let config = DeviceConfig::from_str("rtlsdr://0?freq=1090000000&rate=2400000&gain=auto").unwrap();
+    ///
+    /// // RTL-SDR first available device (implicit device 0)
+    /// let config = DeviceConfig::from_str("rtlsdr://?freq=1090M&rate=2.4M&gain=49.6").unwrap();
+    /// # }
+    /// ```
+    ///
+    /// ```
+    /// # #[cfg(feature = "pluto")]
+    /// # {
+    /// use desperado::DeviceConfig;
+    /// use std::str::FromStr;
+    ///
+    /// // PlutoSDR with IP address
+    /// let config = DeviceConfig::from_str("pluto://192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    ///
+    /// // PlutoSDR with explicit ip: prefix
+    /// let config = DeviceConfig::from_str("pluto://ip:192.168.2.1?freq=1090M&rate=2.4M&gain=40").unwrap();
+    ///
+    /// // PlutoSDR via USB (use triple slash for USB URIs with version numbers)
+    /// let config = DeviceConfig::from_str("pluto:///usb:1.18.5?freq=1090M&rate=2.4M&gain=40").unwrap();
+    /// # }
+    /// ```
+    fn from_str(s: &str) -> Result<Self> {
+        // Parse URL scheme
+        let parts: Vec<&str> = s.splitn(2, "://").collect();
+        if parts.len() != 2 {
+            return Err(Error::other(
+                "Invalid device URL: missing '://' separator".to_string(),
+            ));
+        }
+
+        let scheme = parts[0];
+        #[allow(unused_variables)]
+        let rest = parts[1];
+
+        match scheme {
+            #[cfg(feature = "rtlsdr")]
+            "rtlsdr" => {
+                // Parse: rtlsdr://[device_index]?freq=...&rate=...&gain=...&bias_tee=...
+                let (device_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let device_index = if device_part.is_empty() {
+                    0
+                } else {
+                    device_part.parse::<usize>().map_err(|_| {
+                        Error::other(format!("Invalid device index: {}", device_part))
+                    })?
+                };
+
+                // Parse query parameters
+                let mut center_freq: Option<u32> = None;
+                let mut sample_rate: Option<u32> = None;
+                let mut gain = Gain::Auto;
+                let mut bias_tee = false;
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(parse_si_value(kv[1])?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(parse_si_value(kv[1])?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        "bias_tee" | "bias-tee" => {
+                            bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::RtlSdr(rtlsdr::RtlSdrConfig {
+                    device: rtlsdr::DeviceSelector::Index(device_index),
+                    center_freq,
+                    sample_rate,
+                    gain,
+                    bias_tee,
+                }))
+            }
+            #[cfg(feature = "soapy")]
+            "soapy" => {
+                // Parse: soapy://<args>?freq=...&rate=...&gain=...
+                let (args_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let args = args_part.to_string();
+
+                // Parse query parameters
+                let mut center_freq: Option<f64> = None;
+                let mut sample_rate: Option<f64> = None;
+                let mut gain = Gain::Auto;
+                let channel = 0;
+                let gain_element = "TUNER".to_string();
+                let mut bias_tee = false;
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(parse_si_value(kv[1])?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(parse_si_value(kv[1])?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        "bias_tee" | "bias-tee" => {
+                            bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::Soapy(soapy::SoapyConfig {
+                    args,
+                    center_freq,
+                    sample_rate,
+                    channel,
+                    gain,
+                    gain_element,
+                    bias_tee,
+                }))
+            }
+            #[cfg(feature = "pluto")]
+            "pluto" => {
+                // Parse: pluto://<uri>?freq=...&rate=...&gain=...
+                // URI can be: ip:192.168.2.1, usb:, usb:1, usb:1.18.5, or plain IP like 192.168.2.1
+                // Also supports path format: pluto:///usb:1.18.5 (triple slash for URIs with colons)
+
+                // Strip leading slash if present (from pluto:///uri format)
+                let rest_trimmed = rest.strip_prefix('/').unwrap_or(rest);
+
+                let (uri_part, query) = if let Some(q_pos) = rest_trimmed.find('?') {
+                    (&rest_trimmed[..q_pos], &rest_trimmed[q_pos + 1..])
+                } else {
+                    (rest_trimmed, "")
+                };
+
+                let uri = uri_part.to_string();
+
+                // Parse query parameters
+                let mut center_freq: Option<i64> = None;
+                let mut sample_rate: Option<i64> = None;
+                let mut gain = Gain::Manual(40.0); // Default manual gain for Pluto
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(parse_si_value(kv[1])?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(parse_si_value(kv[1])?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::Pluto(pluto::PlutoConfig {
+                    uri,
+                    center_freq,
+                    sample_rate,
+                    gain,
+                }))
+            }
+            _ => Err(Error::other(format!("Unknown device scheme: {}", scheme))),
+        }
+    }
 }
 
 impl std::fmt::Display for IqFormat {
@@ -192,6 +584,27 @@ impl IqSource {
         Ok(IqSource::IqTcp(source))
     }
 
+    /// Create a new I/Q source from a device configuration
+    pub fn from_device_config(config: DeviceConfig) -> error::Result<Self> {
+        match config {
+            #[cfg(feature = "pluto")]
+            DeviceConfig::Pluto(cfg) => {
+                let source = pluto::PlutoSdrReader::new(&cfg)?;
+                Ok(IqSource::PlutoSdr(source))
+            }
+            #[cfg(feature = "rtlsdr")]
+            DeviceConfig::RtlSdr(cfg) => {
+                let source = rtlsdr::RtlSdrReader::new(&cfg)?;
+                Ok(IqSource::RtlSdr(source))
+            }
+            #[cfg(feature = "soapy")]
+            DeviceConfig::Soapy(cfg) => {
+                let source = soapy::SoapySdrReader::new(&cfg)?;
+                Ok(IqSource::SoapySdr(source))
+            }
+        }
+    }
+
     #[cfg(feature = "pluto")]
     /// Create a new Adalm Pluto-based I/Q source
     pub fn from_pluto(
@@ -204,7 +617,7 @@ impl IqSource {
             uri: uri.to_string(),
             center_freq,
             sample_rate,
-            gain,
+            gain: Gain::Manual(gain),
         };
         let source = pluto::PlutoSdrReader::new(&config)?;
         Ok(IqSource::PlutoSdr(source))
@@ -219,10 +632,14 @@ impl IqSource {
         gain: Option<i32>,
     ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
-            device_index,
+            device: rtlsdr::DeviceSelector::Index(device_index),
             center_freq,
             sample_rate,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual((g as f64) / 10.0),
+                None => Gain::Auto,
+            },
+            bias_tee: false,
         };
         let source = rtlsdr::RtlSdrReader::new(&config)?;
         Ok(IqSource::RtlSdr(source))
@@ -243,8 +660,12 @@ impl IqSource {
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual(g),
+                None => Gain::Auto,
+            },
             gain_element: gain_element.to_string(),
+            bias_tee: false,
         };
         let source = soapy::SoapySdrReader::new(&config)?;
         Ok(IqSource::SoapySdr(source))
@@ -376,7 +797,7 @@ impl IqAsyncSource {
             uri: uri.to_string(),
             center_freq,
             sample_rate,
-            gain,
+            gain: Gain::Manual(gain),
         };
         let source = pluto::AsyncPlutoSdrReader::new(&config).await?;
         Ok(IqAsyncSource::PlutoSdr(source))
@@ -391,10 +812,14 @@ impl IqAsyncSource {
         gain: Option<i32>,
     ) -> error::Result<Self> {
         let config = rtlsdr::RtlSdrConfig {
-            device_index,
+            device: rtlsdr::DeviceSelector::Index(device_index),
             center_freq,
             sample_rate,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual((g as f64) / 10.0),
+                None => Gain::Auto,
+            },
+            bias_tee: false,
         };
         let async_reader = rtlsdr::AsyncRtlSdrReader::new(&config)?;
         Ok(IqAsyncSource::RtlSdr(async_reader))
@@ -415,11 +840,40 @@ impl IqAsyncSource {
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain,
+            gain: match gain {
+                Some(g) => Gain::Manual(g),
+                None => Gain::Auto,
+            },
             gain_element: gain_element.to_string(),
+            bias_tee: false,
         };
         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
         Ok(IqAsyncSource::SoapySdr(async_reader))
+    }
+
+    /// Create a new asynchronous I/Q source from a DeviceConfig
+    ///
+    /// This is a convenience method that dispatches to the appropriate device-specific
+    /// constructor based on the DeviceConfig variant.
+    #[cfg(any(feature = "rtlsdr", feature = "pluto", feature = "soapy"))]
+    pub async fn from_device_config(config: &DeviceConfig) -> error::Result<Self> {
+        match config {
+            #[cfg(feature = "rtlsdr")]
+            DeviceConfig::RtlSdr(cfg) => {
+                let async_reader = rtlsdr::AsyncRtlSdrReader::new(cfg)?;
+                Ok(IqAsyncSource::RtlSdr(async_reader))
+            }
+            #[cfg(feature = "pluto")]
+            DeviceConfig::Pluto(cfg) => {
+                let async_reader = pluto::AsyncPlutoSdrReader::new(cfg).await?;
+                Ok(IqAsyncSource::PlutoSdr(async_reader))
+            }
+            #[cfg(feature = "soapy")]
+            DeviceConfig::Soapy(cfg) => {
+                let async_reader = soapy::AsyncSoapySdrReader::new(cfg)?;
+                Ok(IqAsyncSource::SoapySdr(async_reader))
+            }
+        }
     }
 }
 
@@ -514,6 +968,44 @@ mod tests {
             let s = format.to_string();
             let parsed: IqFormat = s.parse().unwrap();
             assert_eq!(parsed, format);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pluto")]
+    fn test_pluto_uri_parsing() {
+        use std::str::FromStr;
+
+        // Test IP address
+        let config = DeviceConfig::from_str("pluto://192.168.2.1?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "192.168.2.1");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test explicit ip: prefix
+        let config = DeviceConfig::from_str("pluto://ip:192.168.2.1?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "ip:192.168.2.1");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test USB with triple slash (for URIs containing colons)
+        let config = DeviceConfig::from_str("pluto:///usb:1.18.5?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "usb:1.18.5");
+        } else {
+            panic!("Expected PlutoSDR config");
+        }
+
+        // Test simple USB
+        let config = DeviceConfig::from_str("pluto:///usb:?freq=1090M&rate=2.4M").unwrap();
+        if let DeviceConfig::Pluto(pluto_config) = config {
+            assert_eq!(pluto_config.uri, "usb:");
+        } else {
+            panic!("Expected PlutoSDR config");
         }
     }
 }
