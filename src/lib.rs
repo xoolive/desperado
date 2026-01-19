@@ -181,7 +181,7 @@ impl std::str::FromStr for DeviceConfig {
     ///
     /// Supported formats:
     /// - `rtlsdr://[device_index]?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
-    /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>`
+    /// - `soapy://<driver>?freq=<hz>&rate=<hz>&gain=<db|auto>&bias_tee=<bool>`
     /// - `pluto://<uri>?freq=<hz>&gain=<db|auto>`
     ///
     /// For RTL-SDR, if `device_index` is omitted, it defaults to 0 (first device).
@@ -330,6 +330,7 @@ impl std::str::FromStr for DeviceConfig {
                 let mut gain = Gain::Auto;
                 let channel = 0;
                 let gain_element = "TUNER".to_string();
+                let mut bias_tee = false;
 
                 for param in query.split('&') {
                     if param.is_empty() {
@@ -356,6 +357,9 @@ impl std::str::FromStr for DeviceConfig {
                                 gain = Gain::Manual(gain_db);
                             }
                         }
+                        "bias_tee" | "bias-tee" => {
+                            bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -372,6 +376,7 @@ impl std::str::FromStr for DeviceConfig {
                     channel,
                     gain,
                     gain_element,
+                    bias_tee,
                 }))
             }
             #[cfg(feature = "pluto")]
@@ -660,6 +665,7 @@ impl IqSource {
                 None => Gain::Auto,
             },
             gain_element: gain_element.to_string(),
+            bias_tee: false,
         };
         let source = soapy::SoapySdrReader::new(&config)?;
         Ok(IqSource::SoapySdr(source))
@@ -839,6 +845,7 @@ impl IqAsyncSource {
                 None => Gain::Auto,
             },
             gain_element: gain_element.to_string(),
+            bias_tee: false,
         };
         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
         Ok(IqAsyncSource::SoapySdr(async_reader))

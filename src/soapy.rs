@@ -27,6 +27,8 @@ pub struct SoapyConfig {
     pub gain: Gain,
     /// Gain element name (e.g., "TUNER")
     pub gain_element: String,
+    /// Enable bias tee for powering external LNA (default: false)
+    pub bias_tee: bool,
 }
 
 impl SoapyConfig {
@@ -39,6 +41,7 @@ impl SoapyConfig {
             channel: 0,
             gain: Gain::Auto,
             gain_element: "TUNER".to_string(),
+            bias_tee: false,
         }
     }
 }
@@ -72,6 +75,11 @@ impl SoapySdrReader {
             Gain::Auto => {
                 // SoapySDR uses automatic gain when no manual gain is set
             }
+        }
+
+        // Configure bias-tee if enabled
+        if config.bias_tee {
+            let _ = device.write_setting("biastee", "true");
         }
 
         let mut stream = device.rx_stream::<Complex<i16>>(&[config.channel])?;
@@ -154,6 +162,11 @@ impl AsyncSoapySdrReader {
                     Gain::Auto => {
                         // SoapySDR uses automatic gain when no manual gain is set
                     }
+                }
+
+                // Configure bias-tee if enabled
+                if cfg.bias_tee {
+                    let _ = device.write_setting("biastee", "true");
                 }
 
                 let mut stream = device.rx_stream::<Complex<i16>>(&[cfg.channel])?;
