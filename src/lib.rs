@@ -8,12 +8,13 @@
 //! - Async types are prefixed with `Async` or use `IqAsync` naming
 //! - All async operations return `Future`s or implement the `Stream` trait
 
+pub use error::{Error, Result};
+use futures::Stream;
+use num_complex::Complex;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-use futures::Stream;
-use num_complex::Complex;
 
 pub mod dsp;
 pub mod error;
@@ -24,9 +25,6 @@ pub mod pluto;
 pub mod rtlsdr;
 #[cfg(feature = "soapy")]
 pub mod soapy;
-
-// Re-export commonly used types
-pub use error::{Error, Result};
 
 /// Expand tilde (~) in path to home directory
 ///
@@ -128,12 +126,203 @@ where
 /// // Manual gain of 49.6 dB
 /// let manual_gain = Gain::Manual(49.6);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Gain {
     /// Automatic gain control (AGC)
     Auto,
-    /// Manual gain in dB
+    /// Manual gain in dB (global setting)
     Manual(f64),
+    /// Element-specific gain settings (e.g., LNA, MIX, IF for different devices)
+    Elements(Vec<GainElement>),
+}
+
+/// Individual gain element configuration
+///
+/// Represents a named gain element with its value in dB.
+/// Different SDR devices support different gain elements (e.g., TUNER, LNA, MIX, IF, PGA).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GainElement {
+    pub name: GainElementName,
+    pub value_db: f64,
+}
+
+/// Gain element identifier
+///
+/// Common gain elements across different SDR devices.
+/// Devices validate which elements they support.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub enum GainElementName {
+    // RTL-SDR element
+    Tuner,
+    // Airspy elements
+    Lna,
+    Mix,
+    Vga,
+    // PlutoSDR element
+    Pga,
+    // Extensible for custom element names
+    Custom(String),
+}
+
+impl<'de> Deserialize<'de> for Gain {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct GainVisitor;
+
+        impl<'de> Visitor<'de> for GainVisitor {
+            type Value = Gain;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(r#""auto", a number (e.g., 49.6), or a map of gain elements (e.g., { LNA = 5, VGA = 5 })"#)
+            }
+
+            // Handle "auto" string
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Gain, E>
+            where
+                E: de::Error,
+            {
+                if value.eq_ignore_ascii_case("auto") {
+                    Ok(Gain::Auto)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "expected \"auto\", got \"{}\"",
+                        value
+                    )))
+                }
+            }
+
+            // Handle numeric gain value
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Gain, E>
+            where
+                E: de::Error,
+            {
+                Ok(Gain::Manual(value as f64))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Gain, E>
+            where
+                E: de::Error,
+            {
+                Ok(Gain::Manual(value as f64))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Gain, E>
+            where
+                E: de::Error,
+            {
+                Ok(Gain::Manual(value))
+            }
+
+            // Handle { LNA = 5, VGA = 5, MIX = 0 } style map
+            fn visit_map<M>(self, mut map: M) -> std::result::Result<Gain, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut elements = Vec::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    let value: f64 = map.next_value()?;
+
+                    // Parse the gain element name
+                    let name = match key.to_uppercase().as_str() {
+                        "TUNER" => GainElementName::Tuner,
+                        "LNA" => GainElementName::Lna,
+                        "MIX" => GainElementName::Mix,
+                        "VGA" => GainElementName::Vga,
+                        "PGA" => GainElementName::Pga,
+                        custom => GainElementName::Custom(custom.to_string()),
+                    };
+
+                    elements.push(GainElement {
+                        name,
+                        value_db: value,
+                    });
+                }
+
+                if elements.is_empty() {
+                    Err(de::Error::custom("gain elements map cannot be empty"))
+                } else {
+                    Ok(Gain::Elements(elements))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(GainVisitor)
+    }
+}
+
+impl Gain {
+    /// Parse a gain setting from a string
+    ///
+    /// Supports:
+    /// - "auto" -> Gain::Auto
+    /// - "48.6" -> Gain::Manual(48.6)
+    /// - "IF=8,LNA=8,MIX=0" -> Gain::Elements(...)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use desperado::Gain;
+    ///
+    /// let auto = Gain::parse("auto").unwrap();
+    /// let manual = Gain::parse("48.6").unwrap();
+    /// let elements = Gain::parse("IF=8,LNA=8,MIX=0").unwrap();
+    /// ```
+    pub fn parse(input: &str) -> error::Result<Self> {
+        let input = input.trim();
+
+        if input.eq_ignore_ascii_case("auto") {
+            return Ok(Gain::Auto);
+        }
+
+        // Try parsing as a single numeric value
+        if let Ok(value) = input.parse::<f64>() {
+            return Ok(Gain::Manual(value));
+        }
+
+        // Parse as element list: NAME=VALUE,NAME=VALUE
+        let mut elements = Vec::new();
+
+        for part in input.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            let (name, value) = part.split_once('=').ok_or_else(|| {
+                Error::other(format!(
+                    "Invalid gain element '{}', expected format NAME=VALUE",
+                    part
+                ))
+            })?;
+
+            let value_db = value.trim().parse::<f64>().map_err(|_| {
+                Error::other(format!("Invalid gain value '{}', expected a number", value))
+            })?;
+
+            let name = match name.trim().to_ascii_uppercase().as_str() {
+                "TUNER" => GainElementName::Tuner,
+                "LNA" => GainElementName::Lna,
+                "MIX" => GainElementName::Mix,
+                "VGA" => GainElementName::Vga,
+                "PGA" => GainElementName::Pga,
+                other => GainElementName::Custom(other.to_string()),
+            };
+
+            elements.push(GainElement { name, value_db });
+        }
+
+        if elements.is_empty() {
+            return Err(Error::other(format!("Invalid gain setting: '{}'", input)));
+        }
+
+        Ok(Gain::Elements(elements))
+    }
 }
 
 /// I/Q Data Format
@@ -329,7 +518,6 @@ impl std::str::FromStr for DeviceConfig {
                 let mut sample_rate: Option<f64> = None;
                 let mut gain = Gain::Auto;
                 let channel = 0;
-                let gain_element = "TUNER".to_string();
                 let mut bias_tee = false;
 
                 for param in query.split('&') {
@@ -348,14 +536,7 @@ impl std::str::FromStr for DeviceConfig {
                             sample_rate = Some(parse_si_value(kv[1])?);
                         }
                         "gain" => {
-                            if kv[1].to_lowercase() == "auto" {
-                                gain = Gain::Auto;
-                            } else {
-                                let gain_db: f64 = kv[1].parse().map_err(|_| {
-                                    Error::other(format!("Invalid gain: {}", kv[1]))
-                                })?;
-                                gain = Gain::Manual(gain_db);
-                            }
+                            gain = Gain::parse(kv[1])?;
                         }
                         "bias_tee" | "bias-tee" => {
                             bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
@@ -375,7 +556,6 @@ impl std::str::FromStr for DeviceConfig {
                     sample_rate,
                     channel,
                     gain,
-                    gain_element,
                     bias_tee,
                 }))
             }
@@ -652,19 +832,14 @@ impl IqSource {
         channel: usize,
         center_freq: u32,
         sample_rate: u32,
-        gain: Option<f64>,
-        gain_element: &str,
+        gain: Gain,
     ) -> error::Result<Self> {
         let config = soapy::SoapyConfig {
             args: args.to_string(),
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain: match gain {
-                Some(g) => Gain::Manual(g),
-                None => Gain::Auto,
-            },
-            gain_element: gain_element.to_string(),
+            gain,
             bias_tee: false,
         };
         let source = soapy::SoapySdrReader::new(&config)?;
@@ -832,19 +1007,14 @@ impl IqAsyncSource {
         channel: usize,
         center_freq: u32,
         sample_rate: u32,
-        gain: Option<f64>,
-        gain_element: &str,
+        gain: Gain,
     ) -> error::Result<Self> {
         let config = soapy::SoapyConfig {
             args: args.to_string(),
             center_freq: center_freq as f64,
             sample_rate: sample_rate as f64,
             channel,
-            gain: match gain {
-                Some(g) => Gain::Manual(g),
-                None => Gain::Auto,
-            },
-            gain_element: gain_element.to_string(),
+            gain,
             bias_tee: false,
         };
         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;

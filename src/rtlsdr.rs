@@ -306,6 +306,12 @@ impl RtlSdrReader {
                 rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
             }
             Gain::Auto => rtlsdr.set_tuner_gain(TunerGain::Auto)?,
+            Gain::Elements(_) => {
+                eprintln!(
+                    "Warning: RTL-SDR does not support element-based gain control, using auto gain"
+                );
+                rtlsdr.set_tuner_gain(TunerGain::Auto)?
+            }
         };
         let _ = rtlsdr.set_bias_tee(config.bias_tee);
         rtlsdr.reset_buffer()?;
@@ -368,6 +374,12 @@ impl AsyncRtlSdrReader {
                         rtl.set_tuner_gain(TunerGain::Manual(gain_tenths))?
                     }
                     Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto)?,
+                    Gain::Elements(_) => {
+                        eprintln!(
+                            "Warning: RTL-SDR does not support element-based gain control, using auto gain"
+                        );
+                        rtl.set_tuner_gain(TunerGain::Auto)?
+                    }
                 };
                 let _ = rtl.set_bias_tee(cfg.bias_tee);
                 rtl.reset_buffer()?;

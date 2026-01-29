@@ -78,6 +78,12 @@ impl PlutoSdrReader {
                 // Default to manual mode with a typical value if AGC not available
                 let _ = pluto.set_hwgain(40.0, RX);
             }
+            Gain::Elements(_) => {
+                eprintln!(
+                    "Warning: PlutoSDR does not support element-based gain control, using auto gain"
+                );
+                let _ = pluto.set_hwgain(40.0, RX);
+            }
         }
 
         // Get RX channels
@@ -204,6 +210,12 @@ impl AsyncPlutoSdrReader {
                 // PlutoSDR auto gain mode - hardware dependent
                 // Some versions support AGC via setting gain to a special value
                 // Default to manual mode with a typical value if AGC not available
+                let _ = pluto.set_hwgain(40.0, RX);
+            }
+            Gain::Elements(_) => {
+                eprintln!(
+                    "Warning: PlutoSDR does not support element-based gain control, using auto gain"
+                );
                 let _ = pluto.set_hwgain(40.0, RX);
             }
         }

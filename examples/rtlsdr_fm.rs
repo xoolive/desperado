@@ -163,13 +163,16 @@ async fn main() -> desperado::Result<()> {
         SourceType::Soapy => {
             #[cfg(feature = "soapy")]
             {
+                let gain = match args.gain {
+                    Some(g) => desperado::Gain::Manual(g as f64),
+                    None => desperado::Gain::Auto,
+                };
                 IqAsyncSource::from_soapy(
                     &args.soapy_args,
                     args.soapy_channel,
                     tuning_freq,
                     args.sample_rate,
-                    args.gain.map(|g| g as f64),
-                    "TUNER",
+                    gain,
                 )
                 .await?
             }

@@ -8,7 +8,7 @@ use futures::Stream;
 use num_complex::Complex;
 use soapysdr::{Args, Device, Direction, Error as SoapyError};
 
-use crate::{Gain, error};
+use crate::{Gain, GainElementName, error};
 
 /**
  * SoapySDR Configuration
@@ -23,10 +23,8 @@ pub struct SoapyConfig {
     pub sample_rate: f64,
     /// Channel index (typically 0)
     pub channel: usize,
-    /// Tuner gain (Auto or Manual in dB)
+    /// Tuner gain (Auto, Manual, or Elements)
     pub gain: Gain,
-    /// Gain element name (e.g., "TUNER")
-    pub gain_element: String,
     /// Enable bias tee for powering external LNA (default: false)
     pub bias_tee: bool,
 }
@@ -40,7 +38,6 @@ impl SoapyConfig {
             sample_rate,
             channel: 0,
             gain: Gain::Auto,
-            gain_element: "TUNER".to_string(),
             bias_tee: false,
         }
     }
@@ -62,18 +59,41 @@ impl SoapySdrReader {
 
         device.set_frequency(Direction::Rx, config.channel, config.center_freq, ())?;
         device.set_sample_rate(Direction::Rx, config.channel, config.sample_rate)?;
+        let supported = device.list_gains(Direction::Rx, config.channel)?;
 
-        match config.gain {
-            Gain::Manual(gain_db) => {
-                device.set_gain_element(
-                    Direction::Rx,
-                    config.channel,
-                    config.gain_element.as_str(),
-                    gain_db,
-                )?;
-            }
+        match &config.gain {
             Gain::Auto => {
-                // SoapySDR uses automatic gain when no manual gain is set
+                device.set_gain_mode(Direction::Rx, config.channel, true)?;
+            }
+            Gain::Manual(value) => {
+                device.set_gain_mode(Direction::Rx, config.channel, false)?;
+                device.set_gain(Direction::Rx, config.channel, *value)?;
+            }
+            Gain::Elements(elements) => {
+                device.set_gain_mode(Direction::Rx, config.channel, false)?;
+                for elem in elements.iter() {
+                    let gain_name = match &elem.name {
+                        GainElementName::Tuner => "TUNER",
+                        GainElementName::Lna => "LNA",
+                        GainElementName::Mix => "MIX",
+                        GainElementName::Vga => "VGA",
+                        GainElementName::Pga => "PGA",
+                        GainElementName::Custom(name) => name.as_str(),
+                    };
+                    if !supported.contains(&gain_name.to_string()) {
+                        eprintln!(
+                            "Warning: Gain element '{}' not supported by device (supported: {:?}), skipping...",
+                            gain_name, supported
+                        );
+                    } else {
+                        device.set_gain_element(
+                            Direction::Rx,
+                            config.channel,
+                            gain_name,
+                            elem.value_db,
+                        )?;
+                    }
+                }
             }
         }
 
@@ -150,17 +170,41 @@ impl AsyncSoapySdrReader {
                 device.set_frequency(Direction::Rx, cfg.channel, cfg.center_freq, ())?;
                 device.set_sample_rate(Direction::Rx, cfg.channel, cfg.sample_rate)?;
 
-                match cfg.gain {
-                    Gain::Manual(gain_db) => {
-                        device.set_gain_element(
-                            Direction::Rx,
-                            cfg.channel,
-                            cfg.gain_element.as_str(),
-                            gain_db,
-                        )?;
-                    }
+                let supported = device.list_gains(Direction::Rx, cfg.channel)?;
+
+                match &cfg.gain {
                     Gain::Auto => {
-                        // SoapySDR uses automatic gain when no manual gain is set
+                        device.set_gain_mode(Direction::Rx, cfg.channel, true)?;
+                    }
+                    Gain::Manual(value) => {
+                        device.set_gain_mode(Direction::Rx, cfg.channel, false)?;
+                        device.set_gain(Direction::Rx, cfg.channel, *value)?;
+                    }
+                    Gain::Elements(elements) => {
+                        device.set_gain_mode(Direction::Rx, cfg.channel, false)?;
+                        for elem in elements.iter() {
+                            let gain_name = match &elem.name {
+                                GainElementName::Tuner => "TUNER",
+                                GainElementName::Lna => "LNA",
+                                GainElementName::Mix => "MIX",
+                                GainElementName::Vga => "VGA",
+                                GainElementName::Pga => "PGA",
+                                GainElementName::Custom(name) => name.as_str(),
+                            };
+                            if !supported.contains(&gain_name.to_string()) {
+                                eprintln!(
+                                    "Warning: Gain element '{}' not supported by device (supported: {:?}), skipping...",
+                                    gain_name, supported
+                                );
+                            } else {
+                                device.set_gain_element(
+                                    Direction::Rx,
+                                    cfg.channel,
+                                    gain_name,
+                                    elem.value_db,
+                                )?;
+                            }
+                        }
                     }
                 }
 
