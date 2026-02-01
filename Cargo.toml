@@ -22,7 +22,7 @@ rtl-sdr-rs = { version = "0.3", optional = true }
 rusb = { version = "0.9", optional = true }
 soapysdr = { version = "0.4.5", optional = true }
 # For examples
-clap = { version = "4.5.53", features = ["color", "derive", "wrap_help", "env"], optional = true }
+clap = { version = "4.5.56", features = ["color", "derive", "wrap_help", "env"], optional = true }
 # For waterfall example
 plotters = { version = "0.3.7", optional = true }
 rustfft = { version = "6.4.1", optional = true }
