@@ -14,7 +14,7 @@ keywords = ["radio", "decoder", "sdr", "dsp"]
 dirs = "6.0.0"
 futures = "0.3.31"
 num-complex = "0.4.6"
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { version = "1.49.0", features = ["full"] }
 # Various SDR support
 industrial-io = { version = "0.5.2", optional = true } # together with pluto-sdr
 pluto-sdr = { version = "0.1.1", optional = true }
