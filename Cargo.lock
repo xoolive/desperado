@@ -1405,9 +1405,9 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "rtl-sdr-rs"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595a48d5cb78bbc4775fe4c09fb502038be9f062eb374de14f391a61a3c0eac4"
+checksum = "a53b37b61d9955c6a362c7929c88d8d7f3653c45c50e4f03fbb79ce0414e9c59"
 dependencies = [
  "byteorder",
  "log",
