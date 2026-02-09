@@ -9,11 +9,53 @@ use std::time::Duration;
 /// Matches libairspy's LIBUSB_CTRL_TIMEOUT_MS constant.
 const USB_TIMEOUT: Duration = Duration::from_millis(500);
 
-// Airspy command codes from libairspy
+// Airspy command codes from libairspy (airspy_commands enum in airspy.h)
+// Phase 1: Device info commands
 const AIRSPY_BOARD_ID_READ: u8 = 9;
 const AIRSPY_VERSION_STRING_READ: u8 = 10;
 const AIRSPY_BOARD_PARTID_SERIALNO_READ: u8 = 11;
 const AIRSPY_GET_SAMPLERATES: u8 = 25;
+
+// Phase 2: Configuration commands
+const AIRSPY_SET_FREQ: u8 = 13;
+const AIRSPY_SET_LNA_GAIN: u8 = 14;
+const AIRSPY_SET_MIXER_GAIN: u8 = 15;
+const AIRSPY_SET_VGA_GAIN: u8 = 16;
+const AIRSPY_SET_LNA_AGC: u8 = 17;
+const AIRSPY_SET_MIXER_AGC: u8 = 18;
+const AIRSPY_SET_SAMPLERATE: u8 = 19;
+const AIRSPY_SET_PACKING: u8 = 26;
+
+// GPIO commands for Bias-T control
+const AIRSPY_GPIO_WRITE: u8 = 4;
+
+// GPIO port/pin for Bias-T (RF bias) - GPIO_PORT1, GPIO_PIN13
+const GPIO_PORT1: u8 = 1;
+const GPIO_PIN13: u8 = 13;
+
+// Gain lookup tables from libairspy for linearity and sensitivity presets
+// Index 0 = gain level 21 (max), Index 21 = gain level 0 (min)
+const GAIN_COUNT: usize = 22;
+
+static LINEARITY_VGA_GAINS: [u8; GAIN_COUNT] = [
+    13, 12, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 8, 7, 6, 5, 4,
+];
+static LINEARITY_MIXER_GAINS: [u8; GAIN_COUNT] = [
+    12, 12, 11, 9, 8, 7, 6, 6, 5, 0, 0, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0,
+];
+static LINEARITY_LNA_GAINS: [u8; GAIN_COUNT] = [
+    14, 14, 14, 13, 12, 10, 9, 9, 8, 9, 8, 6, 5, 3, 1, 0, 0, 0, 0, 0, 0, 0,
+];
+
+static SENSITIVITY_VGA_GAINS: [u8; GAIN_COUNT] = [
+    13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+];
+static SENSITIVITY_MIXER_GAINS: [u8; GAIN_COUNT] = [
+    12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0,
+];
+static SENSITIVITY_LNA_GAINS: [u8; GAIN_COUNT] = [
+    14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1, 0,
+];
 
 /// Airspy device handle.
 pub struct Airspy {
@@ -295,6 +337,319 @@ impl Airspy {
 
         Ok(rates_buffer)
     }
+
+    // ========================================================================
+    // Phase 2: Configuration API
+    // ========================================================================
+
+    /// Set the tuner frequency in Hz.
+    ///
+    /// # Arguments
+    ///
+    /// * `freq_hz` - Frequency in Hz (e.g., 100_000_000 for 100 MHz)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` on success
+    /// * `Err(Error::ControlTransferFailed)` if the command fails
+    ///
+    /// # Notes
+    ///
+    /// The Airspy Mini supports 24 MHz to 1.8 GHz.
+    /// The frequency is sent as a little-endian u32 in the data payload.
+    pub fn set_freq(&self, freq_hz: u32) -> Result<()> {
+        // libairspy sends freq_hz as a 4-byte little-endian payload
+        let freq_bytes = freq_hz.to_le_bytes();
+
+        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
+        let n = self.control_out(0x40, AIRSPY_SET_FREQ, 0, 0, &freq_bytes)?;
+
+        if n < 4 {
+            return Err(Error::ControlTransferFailed(format!(
+                "SET_FREQ: expected to write 4 bytes, wrote {}",
+                n
+            )));
+        }
+
+        tracing::debug!("Set frequency to {} Hz", freq_hz);
+        Ok(())
+    }
+
+    /// Set the sample rate by index.
+    ///
+    /// # Arguments
+    ///
+    /// * `rate_index` - Index into the supported sample rates list (0 = first rate)
+    ///
+    /// Use `supported_sample_rates()` to get the list of available rates.
+    ///
+    /// # Notes
+    ///
+    /// libairspy also supports setting sample rate by value (if >= 1_000_000),
+    /// but this implementation uses index-based selection for simplicity.
+    ///
+    /// **Important:** This command may fail with "Pipe error" if called before
+    /// streaming is started. In libairspy, sample rate is typically set as part
+    /// of the streaming initialization sequence. For Phase 2, this is provided
+    /// for API completeness but may not work reliably until Phase 3 streaming
+    /// is implemented.
+    pub fn set_sample_rate(&self, rate_index: u8) -> Result<()> {
+        // libairspy calls libusb_clear_halt before setting sample rate.
+        // This requires the endpoint to be valid, which may not be the case
+        // before streaming is started. We attempt the command anyway.
+
+        let mut retval = [0u8; 1];
+
+        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | IN = 0xC0
+        // wIndex contains the sample rate index
+        let n = self.control_in(
+            0xC0,
+            AIRSPY_SET_SAMPLERATE,
+            0,
+            rate_index as u16,
+            &mut retval,
+        )?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_SAMPLERATE: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set sample rate index to {}", rate_index);
+        Ok(())
+    }
+
+    /// Set the LNA (Low Noise Amplifier) gain.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - Gain value 0-14 (clamped if out of range)
+    ///
+    /// Higher values = more gain. The LNA is the first amplifier in the signal chain.
+    pub fn set_lna_gain(&self, gain: u8) -> Result<()> {
+        let gain = gain.min(14); // Clamp to valid range
+        let mut retval = [0u8; 1];
+
+        // wIndex contains the gain value
+        let n = self.control_in(0xC0, AIRSPY_SET_LNA_GAIN, 0, gain as u16, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_LNA_GAIN: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set LNA gain to {}", gain);
+        Ok(())
+    }
+
+    /// Set the mixer gain.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    ///
+    /// The mixer amplifies the signal after downconversion.
+    pub fn set_mixer_gain(&self, gain: u8) -> Result<()> {
+        let gain = gain.min(15); // Clamp to valid range
+        let mut retval = [0u8; 1];
+
+        let n = self.control_in(0xC0, AIRSPY_SET_MIXER_GAIN, 0, gain as u16, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_MIXER_GAIN: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set mixer gain to {}", gain);
+        Ok(())
+    }
+
+    /// Set the VGA (Variable Gain Amplifier) gain.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    ///
+    /// The VGA is the final amplifier before the ADC.
+    pub fn set_vga_gain(&self, gain: u8) -> Result<()> {
+        let gain = gain.min(15); // Clamp to valid range
+        let mut retval = [0u8; 1];
+
+        let n = self.control_in(0xC0, AIRSPY_SET_VGA_GAIN, 0, gain as u16, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_VGA_GAIN: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set VGA gain to {}", gain);
+        Ok(())
+    }
+
+    /// Enable or disable LNA AGC (Automatic Gain Control).
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - true to enable AGC, false to disable
+    ///
+    /// When AGC is enabled, the hardware automatically adjusts LNA gain.
+    /// Disable AGC when using manual gain control.
+    pub fn set_lna_agc(&self, enabled: bool) -> Result<()> {
+        let mut retval = [0u8; 1];
+        let value = if enabled { 1u16 } else { 0u16 };
+
+        let n = self.control_in(0xC0, AIRSPY_SET_LNA_AGC, 0, value, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_LNA_AGC: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set LNA AGC to {}", enabled);
+        Ok(())
+    }
+
+    /// Enable or disable mixer AGC (Automatic Gain Control).
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - true to enable AGC, false to disable
+    pub fn set_mixer_agc(&self, enabled: bool) -> Result<()> {
+        let mut retval = [0u8; 1];
+        let value = if enabled { 1u16 } else { 0u16 };
+
+        let n = self.control_in(0xC0, AIRSPY_SET_MIXER_AGC, 0, value, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_MIXER_AGC: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set mixer AGC to {}", enabled);
+        Ok(())
+    }
+
+    /// Set linearity-optimized gain using a preset value.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - Gain level 0-21 (0 = minimum, 21 = maximum)
+    ///
+    /// This sets LNA, mixer, and VGA gains using lookup tables optimized
+    /// for linear response (low distortion). Good for strong signals.
+    pub fn set_linearity_gain(&self, gain: u8) -> Result<()> {
+        let gain = gain.min((GAIN_COUNT - 1) as u8);
+        // libairspy inverts the index: GAIN_COUNT - 1 - value
+        let index = GAIN_COUNT - 1 - gain as usize;
+
+        // Disable AGC first
+        self.set_mixer_agc(false)?;
+        self.set_lna_agc(false)?;
+
+        // Set individual gains from lookup table
+        self.set_vga_gain(LINEARITY_VGA_GAINS[index])?;
+        self.set_mixer_gain(LINEARITY_MIXER_GAINS[index])?;
+        self.set_lna_gain(LINEARITY_LNA_GAINS[index])?;
+
+        tracing::debug!("Set linearity gain to {} (index {})", gain, index);
+        Ok(())
+    }
+
+    /// Set sensitivity-optimized gain using a preset value.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - Gain level 0-21 (0 = minimum, 21 = maximum)
+    ///
+    /// This sets LNA, mixer, and VGA gains using lookup tables optimized
+    /// for sensitivity (low noise). Good for weak signals.
+    pub fn set_sensitivity_gain(&self, gain: u8) -> Result<()> {
+        let gain = gain.min((GAIN_COUNT - 1) as u8);
+        let index = GAIN_COUNT - 1 - gain as usize;
+
+        // Disable AGC first
+        self.set_mixer_agc(false)?;
+        self.set_lna_agc(false)?;
+
+        // Set individual gains from lookup table
+        self.set_vga_gain(SENSITIVITY_VGA_GAINS[index])?;
+        self.set_mixer_gain(SENSITIVITY_MIXER_GAINS[index])?;
+        self.set_lna_gain(SENSITIVITY_LNA_GAINS[index])?;
+
+        tracing::debug!("Set sensitivity gain to {} (index {})", gain, index);
+        Ok(())
+    }
+
+    /// Enable or disable RF bias (Bias-T).
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - true to enable Bias-T (DC on antenna port), false to disable
+    ///
+    /// # Warning
+    ///
+    /// Enabling Bias-T puts DC voltage on the antenna connector.
+    /// Only use with devices that require DC power (like some LNAs or active antennas).
+    /// **Do not enable with passive antennas or devices that don't expect DC!**
+    pub fn set_rf_bias(&self, enabled: bool) -> Result<()> {
+        // RF bias is controlled via GPIO: PORT1, PIN13
+        let value = if enabled { 1u8 } else { 0u8 };
+
+        // GPIO port/pin encoding: (port << 5) | pin
+        let port_pin = ((GPIO_PORT1 as u16) << 5) | (GPIO_PIN13 as u16);
+
+        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
+        // wValue = GPIO value (0 or 1)
+        // wIndex = port_pin encoding
+        let n = self.control_out(0x40, AIRSPY_GPIO_WRITE, value as u16, port_pin, &[])?;
+
+        // GPIO write returns 0 bytes on success
+        if n != 0 {
+            tracing::warn!("GPIO_WRITE returned {} bytes (expected 0)", n);
+        }
+
+        tracing::debug!("Set RF bias (Bias-T) to {}", enabled);
+        Ok(())
+    }
+
+    /// Enable or disable sample packing.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - true to enable 12-bit packing, false for 16-bit samples
+    ///
+    /// When packing is enabled, samples are packed as 12-bit values to
+    /// reduce USB bandwidth. This increases maximum sample rate but requires
+    /// unpacking on the host side.
+    ///
+    /// # Notes
+    ///
+    /// Should not be called while streaming is active.
+    pub fn set_packing(&self, enabled: bool) -> Result<()> {
+        let mut retval = [0u8; 1];
+        let value = if enabled { 1u16 } else { 0u16 };
+
+        let n = self.control_in(0xC0, AIRSPY_SET_PACKING, 0, value, &mut retval)?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_PACKING: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!("Set packing to {}", enabled);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Private helper methods
+    // ========================================================================
 
     /// Perform a control IN transfer.
     fn control_in(
