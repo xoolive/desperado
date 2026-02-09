@@ -451,6 +451,7 @@ dependencies = [
  "num-complex",
  "plotters",
  "pluto-sdr",
+ "rs-spy",
  "rtl-sdr-rs",
  "rubato",
  "rusb",
@@ -459,6 +460,8 @@ dependencies = [
  "soapysdr",
  "tinyaudio",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1425,6 +1428,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 name = "rs-spy"
 version = "0.2.1"
 dependencies = [
+ "num-complex",
  "rusb",
  "thiserror 1.0.69",
  "tracing",

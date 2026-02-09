@@ -9,25 +9,48 @@ use std::time::Duration;
 /// Matches libairspy's LIBUSB_CTRL_TIMEOUT_MS constant.
 const USB_TIMEOUT: Duration = Duration::from_millis(500);
 
-// Airspy command codes from libairspy (airspy_commands enum in airspy.h)
-// Device info commands
-const AIRSPY_BOARD_ID_READ: u8 = 9;
-const AIRSPY_VERSION_STRING_READ: u8 = 10;
-const AIRSPY_BOARD_PARTID_SERIALNO_READ: u8 = 11;
-const AIRSPY_GET_SAMPLERATES: u8 = 25;
+/// Airspy vendor request/command codes.
+///
+/// These values come directly from libairspy's airspy_commands.h.
+/// See: https://github.com/airspy/airspyone_host/blob/master/libairspy/src/airspy_commands.h
+#[allow(dead_code)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+enum AirspyCommand {
+    ReceiverMode = 1,
+    Si5351cWrite = 2,
+    Si5351cRead = 3,
+    R820tWrite = 4,
+    R820tRead = 5,
+    SpiflashErase = 6,
+    SpiflashWrite = 7,
+    SpiflashRead = 8,
+    BoardIdRead = 9,
+    VersionStringRead = 10,
+    BoardPartidSerialnrRead = 11,
+    SetSamplerate = 12,
+    SetFreq = 13,
+    SetLnaGain = 14,
+    SetMixerGain = 15,
+    SetVgaGain = 16,
+    SetLnaAgc = 17,
+    SetMixerAgc = 18,
+    MsVendorCmd = 19,
+    SetRfBias = 20,
+    GpioWrite = 21,
+    GpioRead = 22,
+    GpiodirWrite = 23,
+    GpiodirRead = 24,
+    GetSamplerates = 25,
+    SetPacking = 26,
+    SpiflashEraseSector = 27,
+}
 
-// Configuration commands
-const AIRSPY_SET_FREQ: u8 = 13;
-const AIRSPY_SET_LNA_GAIN: u8 = 14;
-const AIRSPY_SET_MIXER_GAIN: u8 = 15;
-const AIRSPY_SET_VGA_GAIN: u8 = 16;
-const AIRSPY_SET_LNA_AGC: u8 = 17;
-const AIRSPY_SET_MIXER_AGC: u8 = 18;
-const AIRSPY_SET_SAMPLERATE: u8 = 19;
-const AIRSPY_SET_PACKING: u8 = 26;
-
-// Streaming commands
-const AIRSPY_RECEIVER_MODE: u8 = 1;
+impl AirspyCommand {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 // Receiver modes
 const RECEIVER_MODE_OFF: u16 = 0;
@@ -43,9 +66,6 @@ pub const RECOMMENDED_BUFFER_SIZE: usize = 262144;
 /// Number of samples per buffer at 16-bit sample size.
 /// For 256 KB buffer: 262144 / 2 = 131072 samples.
 pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
-
-// GPIO commands for Bias-T control
-const AIRSPY_GPIO_WRITE: u8 = 4;
 
 // GPIO port/pin for Bias-T (RF bias) - GPIO_PORT1, GPIO_PIN13
 const GPIO_PORT1: u8 = 1;
@@ -190,7 +210,13 @@ impl Airspy {
         let mut buffer = vec![0u8; 128];
 
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
-        let n = self.control_in(0xC0, AIRSPY_VERSION_STRING_READ, 0, 0, &mut buffer)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::VersionStringRead.as_u8(),
+            0,
+            0,
+            &mut buffer,
+        )?;
 
         if n == 0 {
             return Err(Error::InvalidResponse("Version response empty".to_string()));
@@ -214,7 +240,7 @@ impl Airspy {
         let mut buffer = [0u8; 4];
 
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
-        let n = self.control_in(0xC0, AIRSPY_BOARD_ID_READ, 0, 0, &mut buffer)?;
+        let n = self.control_in(0xC0, AirspyCommand::BoardIdRead.as_u8(), 0, 0, &mut buffer)?;
 
         tracing::debug!("board_id response length: {}", n);
         tracing::debug!("board_id buffer: {:02X?}", &buffer[..n.min(buffer.len())]);
@@ -254,7 +280,13 @@ impl Airspy {
 
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
         // This is command AIRSPY_BOARD_PARTID_SERIALNO_READ = 11
-        match self.control_in(0xC0, AIRSPY_BOARD_PARTID_SERIALNO_READ, 0, 0, &mut buffer) {
+        match self.control_in(
+            0xC0,
+            AirspyCommand::BoardPartidSerialnrRead.as_u8(),
+            0,
+            0,
+            &mut buffer,
+        ) {
             Ok(n) => {
                 tracing::debug!("board_partid_serialno response length: {}", n);
                 tracing::debug!(
@@ -312,7 +344,13 @@ impl Airspy {
 
         // Step 1: Get the count
         let mut count_buffer = [0u32; 1];
-        let n = self.control_in_u32(0xC0, AIRSPY_GET_SAMPLERATES, 0, 0, &mut count_buffer)?;
+        let n = self.control_in_u32(
+            0xC0,
+            AirspyCommand::GetSamplerates.as_u8(),
+            0,
+            0,
+            &mut count_buffer,
+        )?;
 
         if n < 1 {
             return Err(Error::InvalidResponse(
@@ -338,7 +376,7 @@ impl Airspy {
         let mut rates_buffer = vec![0u32; count];
         let n = self.control_in_u32_slice(
             0xC0,
-            AIRSPY_GET_SAMPLERATES,
+            AirspyCommand::GetSamplerates.as_u8(),
             0,
             count as u16,
             &mut rates_buffer,
@@ -380,7 +418,7 @@ impl Airspy {
         let freq_bytes = freq_hz.to_le_bytes();
 
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
-        let n = self.control_out(0x40, AIRSPY_SET_FREQ, 0, 0, &freq_bytes)?;
+        let n = self.control_out(0x40, AirspyCommand::SetFreq.as_u8(), 0, 0, &freq_bytes)?;
 
         if n < 4 {
             return Err(Error::ControlTransferFailed(format!(
@@ -411,17 +449,22 @@ impl Airspy {
     /// of the streaming initialization sequence. Use `start_rx()` to begin
     /// streaming, which properly initializes the USB endpoints.
     pub fn set_sample_rate(&self, rate_index: u8) -> Result<()> {
-        // libairspy calls libusb_clear_halt before setting sample rate.
-        // This requires the endpoint to be valid, which may not be the case
-        // before streaming is started. We attempt the command anyway.
+        tracing::debug!("set_sample_rate: rate_index={}", rate_index);
+
+        // libairspy calls libusb_clear_halt(device->usb_device, LIBUSB_ENDPOINT_IN | 1)
+        // before the control transfer. LIBUSB_ENDPOINT_IN | 1 = 0x81
+        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+            tracing::trace!(
+                "clear_halt before set_sample_rate: {:?} (may be expected)",
+                e
+            );
+        }
 
         let mut retval = [0u8; 1];
 
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | IN = 0xC0
-        // wIndex contains the sample rate index
         let n = self.control_in(
             0xC0,
-            AIRSPY_SET_SAMPLERATE,
+            AirspyCommand::SetSamplerate.as_u8(),
             0,
             rate_index as u16,
             &mut retval,
@@ -433,7 +476,11 @@ impl Airspy {
             ));
         }
 
-        tracing::debug!("Set sample rate index to {}", rate_index);
+        tracing::debug!(
+            "set_sample_rate: Successfully set to index {}, response: {:02x}",
+            rate_index,
+            retval[0]
+        );
         Ok(())
     }
 
@@ -449,7 +496,13 @@ impl Airspy {
         let mut retval = [0u8; 1];
 
         // wIndex contains the gain value
-        let n = self.control_in(0xC0, AIRSPY_SET_LNA_GAIN, 0, gain as u16, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetLnaGain.as_u8(),
+            0,
+            gain as u16,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -472,7 +525,13 @@ impl Airspy {
         let gain = gain.min(15); // Clamp to valid range
         let mut retval = [0u8; 1];
 
-        let n = self.control_in(0xC0, AIRSPY_SET_MIXER_GAIN, 0, gain as u16, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetMixerGain.as_u8(),
+            0,
+            gain as u16,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -495,7 +554,13 @@ impl Airspy {
         let gain = gain.min(15); // Clamp to valid range
         let mut retval = [0u8; 1];
 
-        let n = self.control_in(0xC0, AIRSPY_SET_VGA_GAIN, 0, gain as u16, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetVgaGain.as_u8(),
+            0,
+            gain as u16,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -519,7 +584,13 @@ impl Airspy {
         let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
 
-        let n = self.control_in(0xC0, AIRSPY_SET_LNA_AGC, 0, value, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetLnaAgc.as_u8(),
+            0,
+            value,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -540,7 +611,13 @@ impl Airspy {
         let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
 
-        let n = self.control_in(0xC0, AIRSPY_SET_MIXER_AGC, 0, value, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetMixerAgc.as_u8(),
+            0,
+            value,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -624,7 +701,13 @@ impl Airspy {
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
         // wValue = GPIO value (0 or 1)
         // wIndex = port_pin encoding
-        let n = self.control_out(0x40, AIRSPY_GPIO_WRITE, value as u16, port_pin, &[])?;
+        let n = self.control_out(
+            0x40,
+            AirspyCommand::GpioWrite.as_u8(),
+            value as u16,
+            port_pin,
+            &[],
+        )?;
 
         // GPIO write returns 0 bytes on success
         if n != 0 {
@@ -652,7 +735,13 @@ impl Airspy {
         let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
 
-        let n = self.control_in(0xC0, AIRSPY_SET_PACKING, 0, value, &mut retval)?;
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetPacking.as_u8(),
+            0,
+            value,
+            &mut retval,
+        )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
@@ -799,9 +888,14 @@ impl Airspy {
     fn set_receiver_mode(&self, mode: u16) -> Result<()> {
         // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
         // wValue = mode, wIndex = 0, no data payload
-        let result =
-            self.device
-                .write_control(0x40, AIRSPY_RECEIVER_MODE, mode, 0, &[], USB_TIMEOUT);
+        let result = self.device.write_control(
+            0x40,
+            AirspyCommand::ReceiverMode.as_u8(),
+            mode,
+            0,
+            &[],
+            USB_TIMEOUT,
+        );
 
         match result {
             Ok(_) => Ok(()),

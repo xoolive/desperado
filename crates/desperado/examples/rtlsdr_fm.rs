@@ -2,6 +2,7 @@
 //!
 //! This example demonstrates FM demodulation with support for:
 //! - RTL-SDR devices
+//! - Airspy devices
 //! - SoapySDR-compatible devices
 //! - IQ file playback
 //! - Mono or stereo decoding
@@ -13,6 +14,12 @@
 //! ```bash
 //! cargo run --example rtlsdr_fm --features "rtlsdr audio clap" -- \
 //!     -c 105.1M --source rtlsdr
+//! ```
+//!
+//! ## Airspy (mono)
+//! ```bash
+//! cargo run --example rtlsdr_fm --features "airspy audio clap" -- \
+//!     -c 105.1M --source airspy
 //! ```
 //!
 //! ## RTL-SDR (stereo with RDS)
@@ -64,6 +71,7 @@ enum SourceType {
     Rtlsdr,
     Soapy,
     File,
+    Airspy,
 }
 
 #[derive(Parser, Debug)]
@@ -124,6 +132,22 @@ struct Args {
     /// RTL-SDR device index
     #[arg(long, default_value_t = 0)]
     device_index: usize,
+
+     /// Airspy device index (None for first device)
+     #[arg(long)]
+     airspy_device_index: Option<usize>,
+
+     /// Airspy LNA gain (0-14, None for default)
+     #[arg(long)]
+     airspy_lna: Option<u8>,
+
+     /// Airspy mixer gain (0-15, None for default)
+     #[arg(long)]
+     airspy_mixer: Option<u8>,
+
+     /// Airspy VGA gain (0-15, None for default)
+     #[arg(long)]
+     airspy_vga: Option<u8>,
 }
 
 const FM_BANDWIDTH: f32 = 240_000.0;
@@ -132,6 +156,12 @@ const AUDIO_RATE: usize = 48_000;
 
 #[tokio::main]
 async fn main() -> desperado::Result<()> {
+    // Initialize tracing
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let args = Args::parse();
 
     // Create IQ source based on selected type
@@ -157,6 +187,30 @@ async fn main() -> desperado::Result<()> {
             #[cfg(not(feature = "rtlsdr"))]
             {
                 eprintln!("Error: rtlsdr feature not enabled. Rebuild with --features rtlsdr");
+                std::process::exit(1);
+            }
+        }
+        SourceType::Airspy => {
+            #[cfg(feature = "airspy")]
+            {
+                let gain = match args.gain {
+                    Some(g) => desperado::Gain::Manual(g as f64),
+                    None => desperado::Gain::Auto,
+                };
+                IqAsyncSource::from_airspy(
+                    args.airspy_device_index,
+                    tuning_freq,
+                    args.sample_rate,
+                    gain,
+                    args.airspy_lna,
+                    args.airspy_mixer,
+                    args.airspy_vga,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "airspy"))]
+            {
+                eprintln!("Error: airspy feature not enabled. Rebuild with --features airspy");
                 std::process::exit(1);
             }
         }

@@ -8,6 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+num-complex = "0.4"
 rusb = "0.9"
 thiserror = "1.0"
 tracing = "0.1"
