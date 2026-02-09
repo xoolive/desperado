@@ -1,4 +1,4 @@
-/target
+target/
 waterfall.png
 
 # I/Q sample files
@@ -9,3 +9,7 @@ waterfall.png
 # macOS metadata
 Icon\r
 .DS_Store
+
+analysis/
+lessons_learned.md
+plan.md
