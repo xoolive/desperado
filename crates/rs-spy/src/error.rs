@@ -82,6 +82,10 @@ pub enum Error {
     #[error("Invalid device response: {0}")]
     InvalidResponse(String),
 
+    /// Streaming/bulk transfer error.
+    #[error("Streaming error: {0}")]
+    StreamingError(String),
+
     /// Timeout waiting for device response.
     #[error("Device timeout")]
     Timeout,

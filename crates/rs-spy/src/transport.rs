@@ -10,13 +10,13 @@ use std::time::Duration;
 const USB_TIMEOUT: Duration = Duration::from_millis(500);
 
 // Airspy command codes from libairspy (airspy_commands enum in airspy.h)
-// Phase 1: Device info commands
+// Device info commands
 const AIRSPY_BOARD_ID_READ: u8 = 9;
 const AIRSPY_VERSION_STRING_READ: u8 = 10;
 const AIRSPY_BOARD_PARTID_SERIALNO_READ: u8 = 11;
 const AIRSPY_GET_SAMPLERATES: u8 = 25;
 
-// Phase 2: Configuration commands
+// Configuration commands
 const AIRSPY_SET_FREQ: u8 = 13;
 const AIRSPY_SET_LNA_GAIN: u8 = 14;
 const AIRSPY_SET_MIXER_GAIN: u8 = 15;
@@ -25,6 +25,24 @@ const AIRSPY_SET_LNA_AGC: u8 = 17;
 const AIRSPY_SET_MIXER_AGC: u8 = 18;
 const AIRSPY_SET_SAMPLERATE: u8 = 19;
 const AIRSPY_SET_PACKING: u8 = 26;
+
+// Streaming commands
+const AIRSPY_RECEIVER_MODE: u8 = 1;
+
+// Receiver modes
+const RECEIVER_MODE_OFF: u16 = 0;
+const RECEIVER_MODE_RX: u16 = 1;
+
+// Bulk transfer endpoint (IN endpoint 1)
+const BULK_ENDPOINT_IN: u8 = 0x81; // LIBUSB_ENDPOINT_IN | 1
+
+/// Recommended buffer size for bulk transfers (256 KB).
+/// This matches libairspy's default and provides good throughput.
+pub const RECOMMENDED_BUFFER_SIZE: usize = 262144;
+
+/// Number of samples per buffer at 16-bit sample size.
+/// For 256 KB buffer: 262144 / 2 = 131072 samples.
+pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
 
 // GPIO commands for Bias-T control
 const AIRSPY_GPIO_WRITE: u8 = 4;
@@ -339,7 +357,7 @@ impl Airspy {
     }
 
     // ========================================================================
-    // Phase 2: Configuration API
+    // Configuration API
     // ========================================================================
 
     /// Set the tuner frequency in Hz.
@@ -390,9 +408,8 @@ impl Airspy {
     ///
     /// **Important:** This command may fail with "Pipe error" if called before
     /// streaming is started. In libairspy, sample rate is typically set as part
-    /// of the streaming initialization sequence. For Phase 2, this is provided
-    /// for API completeness but may not work reliably until Phase 3 streaming
-    /// is implemented.
+    /// of the streaming initialization sequence. Use `start_rx()` to begin
+    /// streaming, which properly initializes the USB endpoints.
     pub fn set_sample_rate(&self, rate_index: u8) -> Result<()> {
         // libairspy calls libusb_clear_halt before setting sample rate.
         // This requires the endpoint to be valid, which may not be the case
@@ -645,6 +662,157 @@ impl Airspy {
 
         tracing::debug!("Set packing to {}", enabled);
         Ok(())
+    }
+
+    // ========================================================================
+    // Streaming API
+    // ========================================================================
+
+    /// Start receiving samples from the device.
+    ///
+    /// This enables the receiver and prepares the device for bulk transfers.
+    /// After calling this, use `read_sync()` to read samples.
+    ///
+    /// # Notes
+    ///
+    /// The streaming sequence follows libairspy:
+    /// 1. Set receiver mode to OFF (reset state)
+    /// 2. Clear any stale data on the bulk endpoint
+    /// 3. Set receiver mode to RX (start streaming)
+    pub fn start_rx(&self) -> Result<()> {
+        // First, ensure receiver is off
+        self.set_receiver_mode(RECEIVER_MODE_OFF)?;
+
+        // Clear the bulk endpoint to remove any stale data
+        // This is important for sample rate changes to take effect
+        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+            tracing::debug!("Failed to clear halt on bulk endpoint: {}", e);
+            // Continue anyway - the endpoint might not have been halted
+        }
+
+        // Enable the receiver
+        self.set_receiver_mode(RECEIVER_MODE_RX)?;
+
+        tracing::debug!("Started RX streaming");
+        Ok(())
+    }
+
+    /// Stop receiving samples from the device.
+    ///
+    /// This disables the receiver. Any in-progress bulk transfers may be aborted.
+    pub fn stop_rx(&self) -> Result<()> {
+        self.set_receiver_mode(RECEIVER_MODE_OFF)?;
+        tracing::debug!("Stopped RX streaming");
+        Ok(())
+    }
+
+    /// Check if the device is currently streaming.
+    ///
+    /// Note: This only checks the receiver mode, not whether data is actively
+    /// being transferred. For true streaming status, track this in your application.
+    pub fn is_streaming(&self) -> bool {
+        // We don't have a way to query the device state directly,
+        // so this would need to be tracked by the caller.
+        // For now, this is a placeholder that always returns false.
+        false
+    }
+
+    /// Read samples synchronously from the device.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer to fill with raw sample data (16-bit samples unless packing is enabled)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(n)` - Number of bytes actually read
+    /// * `Err(Error::StreamingError)` - If the bulk transfer fails
+    ///
+    /// # Notes
+    ///
+    /// - Call `start_rx()` before reading samples
+    /// - The buffer should be at least 16KB for efficient transfers
+    /// - Samples are 16-bit unsigned integers (0-4095 in upper 12 bits)
+    /// - For best performance, use a buffer size that is a multiple of 512 bytes
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rs_spy::Airspy;
+    ///
+    /// let airspy = Airspy::open_first().unwrap();
+    /// airspy.set_freq(100_000_000).unwrap();
+    /// airspy.set_sensitivity_gain(15).unwrap();
+    /// airspy.start_rx().unwrap();
+    ///
+    /// let mut buf = vec![0u8; 262144]; // 256 KB buffer
+    /// loop {
+    ///     let n = airspy.read_sync(&mut buf).unwrap();
+    ///     // Process n bytes of sample data...
+    /// }
+    /// ```
+    pub fn read_sync(&self, buf: &mut [u8]) -> Result<usize> {
+        // Bulk read timeout - longer than control transfers for large data
+        let timeout = Duration::from_millis(1000);
+
+        match self.device.read_bulk(BULK_ENDPOINT_IN, buf, timeout) {
+            Ok(n) => {
+                tracing::trace!("Bulk read: {} bytes", n);
+                Ok(n)
+            }
+            Err(e) => {
+                tracing::debug!("Bulk read failed: {}", e);
+                Err(Error::StreamingError(e.to_string()))
+            }
+        }
+    }
+
+    /// Read samples synchronously with a custom timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer to fill with raw sample data
+    /// * `timeout` - Maximum time to wait for data
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(n)` - Number of bytes actually read
+    /// * `Err(Error::StreamingError)` - If the bulk transfer fails or times out
+    pub fn read_sync_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        match self.device.read_bulk(BULK_ENDPOINT_IN, buf, timeout) {
+            Ok(n) => {
+                tracing::trace!("Bulk read: {} bytes", n);
+                Ok(n)
+            }
+            Err(e) => {
+                tracing::debug!("Bulk read failed: {}", e);
+                Err(Error::StreamingError(e.to_string()))
+            }
+        }
+    }
+
+    /// Set the receiver mode (internal command).
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - RECEIVER_MODE_OFF (0) or RECEIVER_MODE_RX (1)
+    fn set_receiver_mode(&self, mode: u16) -> Result<()> {
+        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
+        // wValue = mode, wIndex = 0, no data payload
+        let result =
+            self.device
+                .write_control(0x40, AIRSPY_RECEIVER_MODE, mode, 0, &[], USB_TIMEOUT);
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::debug!("Set receiver mode failed: {}", e);
+                Err(Error::ControlTransferFailed(format!(
+                    "RECEIVER_MODE({}): {}",
+                    mode, e
+                )))
+            }
+        }
     }
 
     // ========================================================================

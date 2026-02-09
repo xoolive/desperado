@@ -20,7 +20,7 @@ pub mod error;
 pub mod transport;
 
 pub use error::{AirspyErrorCode, Error, Result};
-pub use transport::Airspy;
+pub use transport::{Airspy, RECOMMENDED_BUFFER_SIZE, SAMPLES_PER_BUFFER};
 
 // Airspy device identifiers (USB VID/PID)
 pub const AIRSPY_VID: u16 = 0x1d50;
