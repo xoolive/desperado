@@ -1,0 +1,32 @@
+[package]
+name = "fmradio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fmradio"
+path = "src/main.rs"
+
+[lib]
+name = "fmradio"
+path = "src/lib.rs"
+
+[dependencies]
+num-complex = "0.4"
+rubato = "0.16.2"
+crossbeam-channel = "0.5"
+tinyaudio = "0.1"
+tracing = "0.1"
+approx = "0.5"
+
+# For the binary
+desperado = { path = "../desperado", features = ["rtlsdr", "airspy", "soapy"] }
+clap = { version = "4.5", features = ["derive"] }
+tracing-subscriber = "0.3"
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+crossbeam = "0.8"

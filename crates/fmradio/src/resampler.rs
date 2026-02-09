@@ -4,14 +4,10 @@
 //! designed for real-time audio streaming where the sample rate needs to dynamically
 //! adjust to maintain buffer levels.
 //!
-//! # Feature Flag
-//!
-//! This module is only available when the `adaptive` feature is enabled.
-//!
 //! # Example
 //!
 //! ```no_run
-//! use desperado::dsp::resampler::AdaptiveResampler;
+//! use fmradio::resampler::AdaptiveResampler;
 //!
 //! // Resample from 240kHz to 48kHz (mono)
 //! let mut resampler = AdaptiveResampler::new(
@@ -39,7 +35,7 @@ use rubato::{
 /// # Example
 ///
 /// ```no_run
-/// use desperado::dsp::resampler::AdaptiveResampler;
+/// use fmradio::resampler::AdaptiveResampler;
 ///
 /// // Create mono resampler from FM bandwidth to audio rate
 /// let mut resampler = AdaptiveResampler::new(
@@ -88,7 +84,7 @@ impl AdaptiveResampler {
     /// # Example
     ///
     /// ```no_run
-    /// use desperado::dsp::resampler::AdaptiveResampler;
+    /// use fmradio::resampler::AdaptiveResampler;
     ///
     /// // Mono resampler
     /// let mono = AdaptiveResampler::new(0.2, 1, 1).unwrap();
@@ -152,7 +148,7 @@ impl AdaptiveResampler {
     /// # Example
     ///
     /// ```no_run
-    /// use desperado::dsp::resampler::AdaptiveResampler;
+    /// use fmradio::resampler::AdaptiveResampler;
     ///
     /// // More aggressive adaptation
     /// let resampler = AdaptiveResampler::with_params(
@@ -193,7 +189,7 @@ impl AdaptiveResampler {
     /// # Example
     ///
     /// ```no_run
-    /// use desperado::dsp::resampler::AdaptiveResampler;
+    /// use fmradio::resampler::AdaptiveResampler;
     ///
     /// let mut resampler = AdaptiveResampler::new(0.2, 1, 1).unwrap();
     /// let input = vec![0.1, 0.2, 0.3, 0.4, 0.5];
@@ -255,7 +251,7 @@ impl AdaptiveResampler {
     /// # Example
     ///
     /// ```ignore
-    /// use desperado::dsp::resampler::AdaptiveResampler;
+    /// use fmradio::resampler::AdaptiveResampler;
     ///
     /// let mut resampler = AdaptiveResampler::new(0.2, 5, 1).unwrap();
     ///

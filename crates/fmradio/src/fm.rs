@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use desperado::dsp::fm::{PhaseExtractor, DeemphasisFilter};
+//! use radio::fm::{PhaseExtractor, DeemphasisFilter};
 //! use num_complex::Complex;
 //!
 //! let mut phase_extractor = PhaseExtractor::new();
@@ -33,7 +33,7 @@ use num_complex::Complex;
 /// # Example
 ///
 /// ```
-/// use desperado::dsp::fm::PhaseExtractor;
+/// use radio::fm::PhaseExtractor;
 /// use num_complex::Complex;
 ///
 /// let mut extractor = PhaseExtractor::new();
@@ -122,7 +122,7 @@ impl Default for PhaseExtractor {
 /// # Example
 ///
 /// ```
-/// use desperado::dsp::fm::DeemphasisFilter;
+/// use radio::fm::DeemphasisFilter;
 ///
 /// // European FM broadcast (50 μs time constant)
 /// let mut filter = DeemphasisFilter::new(240_000.0, 50e-6);
@@ -151,7 +151,7 @@ impl DeemphasisFilter {
     /// # Example
     ///
     /// ```
-    /// use desperado::dsp::fm::DeemphasisFilter;
+    /// use radio::fm::DeemphasisFilter;
     ///
     /// // North American FM broadcast
     /// let filter_na = DeemphasisFilter::new(240_000.0, 75e-6);

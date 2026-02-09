@@ -28,13 +28,11 @@
 /// - [`decimator`]: Sample rate reduction with anti-aliasing filtering
 /// - [`filters`]: Digital filter implementations (FIR low-pass, etc.)
 ///
-/// ## FM Demodulation
-/// - [`fm`]: FM demodulation blocks (phase extraction, de-emphasis filtering)
-/// - [`rds`]: Radio Data System (RDS) decoding for FM broadcast
-///
 /// ## Advanced Features
 /// - [`afc`]: Automatic Frequency Control for frequency offset correction
-/// - [`resampler`]: Adaptive audio resampling (requires `adaptive` feature)
+///
+/// Note: FM demodulation (phase extraction, de-emphasis), RDS decoding,
+/// and adaptive resampling have been moved to the `fmradio` crate for better modularity.
 ///
 /// # Traits
 ///
@@ -43,38 +41,11 @@
 ///
 /// # Feature Flags
 ///
-/// Some DSP modules require feature flags to be enabled:
-///
-/// - `adaptive`: Enables the [`resampler`] module for adaptive audio resampling
+/// None currently. Adaptive resampling has been moved to the `fmradio` crate.
 ///
 /// # Examples
 ///
-/// ## Basic FM Demodulation
-///
-/// ```no_run
-/// use desperado::dsp::{
-///     DspBlock,
-///     decimator::Decimator,
-///     fm::{PhaseExtractor, DeemphasisFilter},
-///     filters::LowPassFir,
-/// };
-/// use num_complex::Complex;
-///
-/// // Set up DSP pipeline
-/// let mut decimator = Decimator::new(8);  // Downsample by 8x
-/// let mut phase_extractor = PhaseExtractor::new();
-/// let mut lowpass = LowPassFir::new(15_000.0, 240_000.0, 256);
-/// let mut deemphasis = DeemphasisFilter::new(240_000.0, 50e-6);
-///
-/// // Process I/Q samples
-/// let iq_samples = vec![Complex::new(0.5, 0.5); 1024];
-/// let decimated = decimator.process(&iq_samples);
-/// let phase = phase_extractor.process(&decimated);
-/// let filtered = lowpass.process(&phase);
-/// let audio = deemphasis.process(&filtered);
-/// ```
-///
-/// ## Frequency Shifting
+/// ## Basic Frequency Shifting
 ///
 /// ```
 /// use desperado::dsp::{DspBlock, rotate::Rotate};
@@ -108,10 +79,6 @@ use num_complex::Complex;
 pub mod afc;
 pub mod decimator;
 pub mod filters;
-pub mod fm;
-pub mod rds;
-#[cfg(feature = "adaptive")]
-pub mod resampler;
 pub mod rotate;
 
 /// Trait for DSP blocks that process complex-valued signals.

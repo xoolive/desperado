@@ -1,6 +1,6 @@
 //! FM Demodulator for various IQ sources (mono or stereo with RDS)
 //!
-//! This example demonstrates FM demodulation with support for:
+//! This application demonstrates FM demodulation with support for:
 //! - RTL-SDR devices
 //! - Airspy devices
 //! - SoapySDR-compatible devices
@@ -12,32 +12,27 @@
 //!
 //! ## RTL-SDR (mono)
 //! ```bash
-//! cargo run --example rtlsdr_fm --features "rtlsdr audio clap" -- \
-//!     -c 105.1M --source rtlsdr
+//! fmradio -c 105.1M --source rtlsdr
 //! ```
 //!
 //! ## Airspy (mono)
 //! ```bash
-//! cargo run --example rtlsdr_fm --features "airspy audio clap" -- \
-//!     -c 105.1M --source airspy
+//! fmradio -c 105.1M --source airspy
 //! ```
 //!
 //! ## RTL-SDR (stereo with RDS)
 //! ```bash
-//! cargo run --example rtlsdr_fm --features "rtlsdr audio clap" -- \
-//!     -c 105.1M --source rtlsdr --stereo -v
+//! fmradio -c 105.1M --source rtlsdr --stereo -v
 //! ```
 //!
 //! ## SoapySDR
 //! ```bash
-//! cargo run --example rtlsdr_fm --features "soapy audio clap" -- \
-//!     -c 105.1M --source soapy --soapy-args "driver=hackrf"
+//! fmradio -c 105.1M --source soapy --soapy-args "driver=hackrf"
 //! ```
 //!
 //! ## IQ File Playback
 //! ```bash
-//! cargo run --example rtlsdr_fm --features "audio clap" -- \
-//!     -c 105.1M --source file --file samples.iq --format cu8
+//! fmradio -c 105.1M --source file --file samples.iq --format cu8
 //! ```
 
 use crossbeam::channel;
@@ -46,10 +41,10 @@ use desperado::dsp::{
     afc::SquareFreqOffsetCorrection,
     decimator::Decimator,
     filters::LowPassFir,
-    fm::{DeemphasisFilter, PhaseExtractor},
-    rds::RdsParser,
     rotate::Rotate,
 };
+use fmradio::fm::{DeemphasisFilter, PhaseExtractor};
+use fmradio::rds::RdsParser;
 use futures::StreamExt;
 use std::f32::consts::PI;
 use std::io::{Write, stdout};
@@ -892,17 +887,17 @@ impl RdsDecoder {
         if self.bits.len() >= 104 {
             self.rds_parser.push_bits(&self.bits);
 
-            if let Some(station) = self.rds_parser.station_name()
-                && self.last_station.as_ref() != Some(&station)
-            {
-                println!("[RDS] Station: {}", station);
-                self.last_station = Some(station);
+            if let Some(station) = self.rds_parser.station_name() {
+                if self.last_station.as_ref() != Some(&station) {
+                    println!("[RDS] Station: {}", station);
+                    self.last_station = Some(station);
+                }
             }
-            if let Some(text) = self.rds_parser.radio_text()
-                && self.last_radiotext.as_ref() != Some(&text)
-            {
-                println!("[RDS] Radio Text: {}", text);
-                self.last_radiotext = Some(text);
+            if let Some(text) = self.rds_parser.radio_text() {
+                if self.last_radiotext.as_ref() != Some(&text) {
+                    println!("[RDS] Radio Text: {}", text);
+                    self.last_radiotext = Some(text);
+                }
             }
 
             self.bits.clear();
