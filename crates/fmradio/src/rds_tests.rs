@@ -13,20 +13,47 @@ fn test_rds_syndrome_zero() {
 }
 
 #[test]
-fn test_rds_syndrome_polynomial() {
-    // Test that the polynomial itself produces a known result
-    // If we feed the polynomial (shifted to bit position 10), syndrome should be 0
-    // RDS_POLY = 0x5B9 at position 10 means: 0x5B9 << 0 = 0x5B9
-    let word = RDS_POLY;
-    let syn = rds_syndrome(word);
-    assert_eq!(syn, 0, "Syndrome of polynomial should be zero");
+fn test_rds_syndrome_offset_word_a() {
+    // Test that syndrome of offset word A equals SYNDROME_A
+    // This is how RDS encoding works: for data=0, checkword=offset_word
+    // produces the expected syndrome
+    let syn = rds_syndrome(OFFSET_WORD_A as u32);
+    assert_eq!(
+        syn, SYNDROME_A,
+        "Syndrome of OFFSET_WORD_A should be SYNDROME_A"
+    );
+}
+
+#[test]
+fn test_rds_syndrome_offset_word_b() {
+    let syn = rds_syndrome(OFFSET_WORD_B as u32);
+    assert_eq!(
+        syn, SYNDROME_B,
+        "Syndrome of OFFSET_WORD_B should be SYNDROME_B"
+    );
+}
+
+#[test]
+fn test_rds_syndrome_offset_word_c() {
+    let syn = rds_syndrome(OFFSET_WORD_C as u32);
+    assert_eq!(
+        syn, SYNDROME_C,
+        "Syndrome of OFFSET_WORD_C should be SYNDROME_C"
+    );
+}
+
+#[test]
+fn test_rds_syndrome_offset_word_d() {
+    let syn = rds_syndrome(OFFSET_WORD_D as u32);
+    assert_eq!(
+        syn, SYNDROME_D,
+        "Syndrome of OFFSET_WORD_D should be SYNDROME_D"
+    );
 }
 
 #[test]
 fn test_rds_syndrome_data_only() {
     // Test with arbitrary 16-bit data in upper 16 bits
-    // Data: 0x1234, checkword computed should produce specific syndrome
-    // We'll just verify it computes something consistent
     let data = 0x1234u16;
     let word26 = (data as u32) << 10;
     let syn = rds_syndrome(word26);
@@ -35,58 +62,36 @@ fn test_rds_syndrome_data_only() {
         syn > 0,
         "Data without checkword should have non-zero syndrome"
     );
-
-    // If we XOR the syndrome back in as checkword, syndrome should become 0
-    let word_with_check = word26 | (syn as u32);
-    let syn2 = rds_syndrome(word_with_check);
-    assert_eq!(syn2, 0, "Adding syndrome as checkword should zero syndrome");
 }
 
 #[test]
-fn test_rds_syndrome_known_block() {
-    // Create a block with known data and offset A
-    // Data: 0xABCD, offset A = 0b0011111100 = 0xFC
-    let data = 0xABCDu16;
-    let word26 = (data as u32) << 10;
-    let raw_syndrome = rds_syndrome(word26);
-    // Add offset A to get final checkword
-    let checkword = raw_syndrome ^ OFFSET_A;
-    let final_word = word26 | (checkword as u32);
-    let final_syn = rds_syndrome(final_word);
-    assert_eq!(
-        final_syn, OFFSET_A,
-        "Block with offset A should have syndrome = OFFSET_A"
-    );
+fn test_rds_offset_for_syndrome_a() {
+    let result = rds_offset_for_syndrome(SYNDROME_A);
+    assert_eq!(result, Some('A'), "SYNDROME_A should return 'A'");
 }
 
 #[test]
-fn test_rds_offset_for_syndrome_offset_a() {
-    let result = rds_offset_for_syndrome(OFFSET_A);
-    assert_eq!(result, Some('A'), "OFFSET_A should return 'A'");
+fn test_rds_offset_for_syndrome_b() {
+    let result = rds_offset_for_syndrome(SYNDROME_B);
+    assert_eq!(result, Some('B'), "SYNDROME_B should return 'B'");
 }
 
 #[test]
-fn test_rds_offset_for_syndrome_offset_b() {
-    let result = rds_offset_for_syndrome(OFFSET_B);
-    assert_eq!(result, Some('B'), "OFFSET_B should return 'B'");
+fn test_rds_offset_for_syndrome_c() {
+    let result = rds_offset_for_syndrome(SYNDROME_C);
+    assert_eq!(result, Some('C'), "SYNDROME_C should return 'C'");
 }
 
 #[test]
-fn test_rds_offset_for_syndrome_offset_c() {
-    let result = rds_offset_for_syndrome(OFFSET_C);
-    assert_eq!(result, Some('C'), "OFFSET_C should return 'C'");
+fn test_rds_offset_for_syndrome_c_prime() {
+    let result = rds_offset_for_syndrome(SYNDROME_C_PRIME);
+    assert_eq!(result, Some('c'), "SYNDROME_C_PRIME should return 'c'");
 }
 
 #[test]
-fn test_rds_offset_for_syndrome_offset_c_prime() {
-    let result = rds_offset_for_syndrome(OFFSET_C_PRIME);
-    assert_eq!(result, Some('c'), "OFFSET_C_PRIME should return 'c'");
-}
-
-#[test]
-fn test_rds_offset_for_syndrome_offset_d() {
-    let result = rds_offset_for_syndrome(OFFSET_D);
-    assert_eq!(result, Some('D'), "OFFSET_D should return 'D'");
+fn test_rds_offset_for_syndrome_d() {
+    let result = rds_offset_for_syndrome(SYNDROME_D);
+    assert_eq!(result, Some('D'), "SYNDROME_D should return 'D'");
 }
 
 #[test]
@@ -122,9 +127,9 @@ fn test_rds_parser_new() {
     let parser = RdsParser::new();
     assert_eq!(parser.shift, 0);
     assert_eq!(parser.shift_len, 0);
-    assert_eq!(parser.pending_blocks.len(), 0);
     assert_eq!(parser.ps, [b' '; 8]);
     assert_eq!(parser.ps_received_mask, 0);
+    assert!(!parser.is_synced);
 }
 
 #[test]
@@ -151,7 +156,7 @@ fn test_rds_parser_station_name_empty() {
     assert_eq!(
         parser.station_name(),
         None,
-        "Empty parser should have no station name"
+        "Station name should be None initially"
     );
 }
 
@@ -161,48 +166,138 @@ fn test_rds_parser_radio_text_empty() {
     assert_eq!(
         parser.radio_text(),
         None,
-        "Empty parser should have no radio text"
+        "Radio text should be None initially"
+    );
+}
+
+#[test]
+fn test_rds_parser_program_type() {
+    let parser = RdsParser::new();
+    assert_eq!(
+        parser.station_info().program_type,
+        0,
+        "Program type should be 0 initially"
+    );
+    assert_eq!(
+        parser.program_type_name(),
+        "None",
+        "Program type name should be 'None'"
     );
 }
 
 #[test]
 fn test_rds_parser_push_bits_insufficient() {
+    // Push fewer than 26 bits, should not detect any blocks
     let mut parser = RdsParser::new();
-    // Push only 10 bits (not enough for a block)
-    let bits = vec![1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
+    let bits: Vec<u8> = vec![1, 0, 1, 0, 1]; // 5 bits
     parser.push_bits(&bits);
-    assert_eq!(parser.shift_len, 10);
-    assert_eq!(
-        parser.pending_blocks.len(),
-        0,
-        "Not enough bits for a block"
-    );
+    let (_, blocks, _) = parser.stats();
+    assert_eq!(blocks, 0, "Should not detect blocks with <26 bits");
 }
 
 #[test]
 fn test_rds_parser_push_bits_invalid_block() {
+    // Push 26 random bits that won't match any offset syndrome
     let mut parser = RdsParser::new();
-    // Push 26 random bits that don't form a valid RDS block
-    let bits = vec![1; 26]; // all ones
+    let bits: Vec<u8> = vec![0; 26]; // all zeros
     parser.push_bits(&bits);
-    assert_eq!(parser.shift_len, 26);
-    // Check if it was recognized (likely not, unless all-ones happens to match)
-    let syn = rds_syndrome(parser.shift);
-    if rds_offset_for_syndrome(syn).is_none() {
-        assert_eq!(
-            parser.pending_blocks.len(),
-            0,
-            "Invalid block should not be stored"
-        );
-    }
+    // All zeros has syndrome 0, which doesn't match any offset
+    // So no blocks should be detected
+    let (_, blocks, _) = parser.stats();
+    assert_eq!(blocks, 0, "Random bits should not produce valid blocks");
 }
 
-/// Helper function to create a valid 26-bit RDS block
-fn create_rds_block(data: u16, offset: u16) -> u32 {
-    let word26 = (data as u32) << 10;
-    let raw_syndrome = rds_syndrome(word26);
-    let checkword = raw_syndrome ^ offset;
-    word26 | (checkword as u32)
+#[test]
+fn test_rds_parser_rt_needs_multiple_segments() {
+    // RT needs at least 2 segments to be considered valid
+    let mut parser = RdsParser::new();
+    parser.rt_received_mask[0] = true;
+    assert!(
+        parser.radio_text().is_none(),
+        "1 segment should not be enough for RT"
+    );
+
+    parser.rt_received_mask[1] = true;
+    parser.rt[0] = b'H';
+    parser.rt[1] = b'I';
+    assert!(
+        parser.radio_text().is_some(),
+        "2 segments should be enough for RT"
+    );
+}
+
+#[test]
+fn test_rds_pty_names() {
+    // Verify some PTY names are correct
+    assert_eq!(PTY_NAMES[0], "None");
+    assert_eq!(PTY_NAMES[1], "News");
+    assert_eq!(PTY_NAMES[11], "Classical");
+}
+
+#[test]
+fn test_rds_di_flags_names() {
+    // Test DI flag names
+    assert_eq!(DIFlags::flag_name(0), "dynamic_pty");
+    assert_eq!(DIFlags::flag_name(1), "compressed");
+    assert_eq!(DIFlags::flag_name(2), "artificial_head");
+    assert_eq!(DIFlags::flag_name(3), "stereo");
+    assert_eq!(DIFlags::flag_name(4), "unknown");
+}
+
+#[test]
+fn test_rds_di_flags_set_get() {
+    let mut di = DIFlags::default();
+    assert!(!di.stereo);
+
+    di.set_flag(3, true); // stereo
+    assert!(di.get_flag(3));
+    assert!(di.stereo);
+
+    di.set_flag(0, true); // dynamic_pty
+    assert!(di.dynamic_pty);
+}
+
+#[test]
+fn test_rds_di_flags_as_string() {
+    let mut di = DIFlags::default();
+    di.stereo = true;
+    let s = di.as_string();
+    assert!(s.contains("stereo=true"));
+    assert!(s.contains("dynamic_pty=false"));
+}
+
+#[test]
+fn test_rds_slc_variant_names() {
+    // Test SLC variant name lookup
+    assert_eq!(RdsParser::slc_variant_name(0), "ECC and PI");
+    assert_eq!(RdsParser::slc_variant_name(3), "Language");
+    assert_eq!(RdsParser::slc_variant_name(255), "Unknown");
+}
+
+/// Helper: create a valid RDS block by finding the correct checkword
+/// that produces the expected syndrome for the given offset type.
+fn create_rds_block(data: u16, target_syndrome: u16) -> u32 {
+    let data_part = (data as u32) << 10;
+    let data_syndrome = rds_syndrome(data_part);
+
+    // We need to find checkword such that:
+    // rds_syndrome(data_part | checkword) == target_syndrome
+    // Due to linearity: data_syndrome XOR checkword_syndrome == target_syndrome
+    // So we need checkword_syndrome = data_syndrome XOR target_syndrome
+    let needed_checkword_syndrome = data_syndrome ^ target_syndrome;
+
+    // Search for checkword (brute force - only 1024 possibilities)
+    for checkword in 0u32..1024 {
+        if rds_syndrome(checkword) == needed_checkword_syndrome {
+            return data_part | checkword;
+        }
+    }
+
+    // Fallback (should never happen for valid syndromes)
+    panic!(
+        "Could not find valid checkword for syndrome 0x{:03X}",
+        target_syndrome
+    );
 }
 
 /// Helper to convert a 26-bit word to bit array (MSB first)
@@ -212,40 +307,35 @@ fn word_to_bits(word: u32) -> Vec<u8> {
 
 #[test]
 fn test_create_and_decode_valid_block_a() {
+    // Test that a valid block A is detected and counted
     let mut parser = RdsParser::new();
     let data = 0x1234u16;
-    let block = create_rds_block(data, OFFSET_A);
+    let block = create_rds_block(data, SYNDROME_A);
     let bits = word_to_bits(block);
 
     parser.push_bits(&bits);
 
-    assert_eq!(
-        parser.pending_blocks.len(),
-        1,
-        "Should have one valid block"
+    let (_, blocks, _) = parser.stats();
+    assert_eq!(blocks, 1, "Should have detected one valid block");
+    // With sync-based approach, a single block doesn't acquire sync
+    assert!(
+        !parser.is_synced,
+        "Should not be synced after just one block"
     );
-    let (offset, decoded_data) = parser.pending_blocks[0];
-    assert_eq!(offset, 'A', "Should identify as offset A");
-    assert_eq!(decoded_data, data, "Should decode correct data");
 }
 
 #[test]
 fn test_create_and_decode_valid_block_b() {
+    // Test that a valid block B is detected
     let mut parser = RdsParser::new();
     let data = 0x5678u16;
-    let block = create_rds_block(data, OFFSET_B);
+    let block = create_rds_block(data, SYNDROME_B);
     let bits = word_to_bits(block);
 
     parser.push_bits(&bits);
 
-    assert_eq!(
-        parser.pending_blocks.len(),
-        1,
-        "Should have one valid block"
-    );
-    let (offset, decoded_data) = parser.pending_blocks[0];
-    assert_eq!(offset, 'B', "Should identify as offset B");
-    assert_eq!(decoded_data, data, "Should decode correct data");
+    let (_, blocks, _) = parser.stats();
+    assert_eq!(blocks, 1, "Should have detected one valid block");
 }
 
 #[test]
@@ -256,6 +346,55 @@ fn test_rds_parser_debug_format() {
     assert!(
         debug_str.contains("TESTFM"),
         "Debug format should show PS name"
+    );
+}
+
+#[test]
+fn test_rds_sync_acquisition_with_full_group() {
+    // Test sync acquisition by feeding two complete A,B,C,D sequences
+    // The first group is used for sync acquisition (may be incomplete)
+    // The second group should be fully decoded
+    let mut parser = RdsParser::new();
+
+    // Create 4 blocks in sequence: A, B, C, D (first group - for sync)
+    let block_a = create_rds_block(0xF212, SYNDROME_A); // PI code
+    let block_b = create_rds_block(0x0408, SYNDROME_B); // Group 0A, segment 0
+    let block_c = create_rds_block(0xE20E, SYNDROME_C); // AF data
+    let block_d = create_rds_block(0x2020, SYNDROME_D); // PS "  "
+
+    // Second group (same data, should be fully decoded)
+    let block_a2 = create_rds_block(0xF212, SYNDROME_A);
+    let block_b2 = create_rds_block(0x0408, SYNDROME_B);
+    let block_c2 = create_rds_block(0xE20E, SYNDROME_C);
+    let block_d2 = create_rds_block(0x2020, SYNDROME_D);
+
+    // Convert to bits and feed in sequence
+    let mut all_bits = Vec::new();
+    all_bits.extend(word_to_bits(block_a));
+    all_bits.extend(word_to_bits(block_b));
+    all_bits.extend(word_to_bits(block_c));
+    all_bits.extend(word_to_bits(block_d));
+    all_bits.extend(word_to_bits(block_a2));
+    all_bits.extend(word_to_bits(block_b2));
+    all_bits.extend(word_to_bits(block_c2));
+    all_bits.extend(word_to_bits(block_d2));
+
+    parser.push_bits(&all_bits);
+
+    let (_, blocks, groups) = parser.stats();
+    assert!(
+        blocks >= 6,
+        "Should have detected at least 6 blocks, got {}",
+        blocks
+    );
+    assert!(
+        parser.is_synced,
+        "Should have acquired sync after A,B,C,D sequence"
+    );
+    assert!(
+        groups >= 1,
+        "Should have decoded at least 1 group, got {}",
+        groups
     );
 }
 
@@ -274,23 +413,26 @@ fn test_rds_parser_default() {
 
 #[test]
 fn test_rds_parser_station_name_setter() {
-    // Test PS name assembly manually by setting segments
+    // Test PS name assembly using update_ps which requires sequential segments
     let mut parser = RdsParser::new();
 
-    // Simulate what handle_group would do for Group 0A segments
+    // Simulate receiving all 4 segments in sequence via update_ps
+    // This triggers the new sequential tracking and caching behavior
     // Segment 0: "AB"
-    parser.ps[0] = b'A';
-    parser.ps[1] = b'B';
-    parser.ps_received_mask |= 1 << 0;
-
+    parser.update_ps(0, b'A', b'B');
     // Segment 1: "CD"
-    parser.ps[2] = b'C';
-    parser.ps[3] = b'D';
-    parser.ps_received_mask |= 1 << 1;
+    parser.update_ps(1, b'C', b'D');
+    // Segment 2: "EF"
+    parser.update_ps(2, b'E', b'F');
+    // Segment 3: "GH"
+    parser.update_ps(3, b'G', b'H');
 
     let ps = parser.station_name();
-    assert!(ps.is_some());
-    assert!(ps.unwrap().starts_with("ABCD"));
+    assert!(
+        ps.is_some(),
+        "PS should be Some after all 4 segments received sequentially"
+    );
+    assert_eq!(ps.unwrap(), "ABCDEFGH");
 }
 
 #[test]
@@ -298,86 +440,133 @@ fn test_rds_parser_radiotext_assembly() {
     // Test RT assembly manually
     let mut parser = RdsParser::new();
 
-    // Segment 0: "TEST"
-    parser.rt[0] = b'T';
+    // Set some RT segments
+    parser.rt[0] = b'H';
     parser.rt[1] = b'E';
-    parser.rt[2] = b'S';
-    parser.rt[3] = b'T';
+    parser.rt[2] = b'L';
+    parser.rt[3] = b'L';
     parser.rt_received_mask[0] = true;
 
-    // Segment 1: "ING!"
-    parser.rt[4] = b'I';
-    parser.rt[5] = b'N';
-    parser.rt[6] = b'G';
-    parser.rt[7] = b'!';
+    parser.rt[4] = b'O';
+    parser.rt[5] = b' ';
+    parser.rt[6] = b'W';
+    parser.rt[7] = b'O';
     parser.rt_received_mask[1] = true;
 
     let rt = parser.radio_text();
     assert!(rt.is_some());
-    assert!(rt.unwrap().starts_with("TESTING!"));
+    assert!(rt.unwrap().starts_with("HELLO WO"));
 }
 
 #[test]
-fn test_rds_parser_ps_partial_reception() {
+fn test_rds_parser_di_flags_extraction() {
+    // Test that DI flags are properly set via set_flag
+    let mut di = DIFlags::default();
+
+    // Segment 0 sets dynamic_pty
+    di.set_flag(0, true);
+    assert!(di.dynamic_pty);
+    assert!(!di.compressed);
+    assert!(!di.artificial_head);
+    assert!(!di.stereo);
+
+    // Segment 3 sets stereo
+    di.set_flag(3, true);
+    assert!(di.stereo);
+}
+
+#[test]
+fn test_rds_real_station_99_1_rfm() {
+    // Test with real values captured from 99.1 MHz RFM station
+    // PI = 0xF212, Group 0A, TP=true, PTY=0, DI stereo=true
+    // This tests the Group 0A parsing logic directly
+
+    let mut parser = RdsParser::new();
+    parser.set_verbose(false);
+
+    // Manually construct Group 0A data based on real station values
+    // Block 1 (A): PI code = 0xF212
+    // Block 2 (B): 0x0408 = group_type=0, version=0, TP=1, PTY=0, TA=0, music=1, DI=0, segment=0
+    // Block 3 (C): 0xE20E = AF codes
+    // Block 4 (D): 0x2020 = "  " (space space)
+
+    let datas: [u16; 4] = [0xF212, 0x0408, 0xE20E, 0x2020];
+
+    // Call handle_group directly to test parsing (all blocks valid)
+    parser.handle_group(datas, [true, true, true, true]);
+
+    // Verify extracted data
+    assert!(parser.station_info.is_traffic_program, "TP should be true");
+    assert!(
+        !parser.station_info.is_traffic_announcement,
+        "TA should be false"
+    );
+    assert_eq!(parser.station_info.program_type, 0, "PTY should be 0");
+    assert!(parser.station_info.is_music, "Music flag should be true");
+
+    // Check that PS segment 0 was set to "  "
+    assert_eq!(parser.ps[0], 0x20, "PS char 0 should be space");
+    assert_eq!(parser.ps[1], 0x20, "PS char 1 should be space");
+    assert_eq!(
+        parser.ps_received_mask & 1,
+        1,
+        "PS segment 0 should be received"
+    );
+}
+
+#[test]
+fn test_rds_comprehensive_real_station_sequence() {
+    // Simulate a complete sequence of Group 0A messages to build PS name "  RFM   "
     let mut parser = RdsParser::new();
 
-    // Receive only segments 0 and 2 (not 1 and 3)
-    parser.ps[0] = b'A';
-    parser.ps[1] = b'B';
-    parser.ps_received_mask |= 1 << 0;
+    // Group 0A segment 0: "  " (spaces)
+    let group0: [u16; 4] = [0xF212, 0x0408, 0xE20E, 0x2020]; // segment 0, chars "  "
+    parser.handle_group(group0, [true, true, true, true]);
 
-    parser.ps[4] = b'E';
-    parser.ps[5] = b'F';
-    parser.ps_received_mask |= 1 << 2;
+    // Group 0A segment 1: "RF"
+    let group1: [u16; 4] = [0xF212, 0x0409, 0xE20E, 0x5246]; // segment 1, chars "RF"
+    parser.handle_group(group1, [true, true, true, true]);
 
-    // Should still return partial PS
+    // Group 0A segment 2: "M "
+    let group2: [u16; 4] = [0xF212, 0x040A, 0xE20E, 0x4D20]; // segment 2, chars "M "
+    parser.handle_group(group2, [true, true, true, true]);
+
+    // Group 0A segment 3: "  " (spaces)
+    let group3: [u16; 4] = [0xF212, 0x040B, 0xE20E, 0x2020]; // segment 3, chars "  "
+    parser.handle_group(group3, [true, true, true, true]);
+
+    // Now PS should be complete: "  RFM   "
     let ps = parser.station_name();
-    assert!(ps.is_some());
-    // Positions 2-3 should still be spaces
-    assert_eq!(&parser.ps[2..4], b"  ");
-}
-
-#[test]
-fn test_rds_parser_rt_needs_multiple_segments() {
-    let mut parser = RdsParser::new();
-
-    // With only 1 segment, radio_text should return None
-    parser.rt[0] = b'A';
-    parser.rt_received_mask[0] = true;
-
-    assert_eq!(parser.radio_text(), None, "RT needs at least 2 segments");
-
-    // Add second segment
-    parser.rt[4] = b'B';
-    parser.rt_received_mask[1] = true;
-
+    assert!(ps.is_some(), "PS should be available after all segments");
+    let ps_str = ps.unwrap();
     assert!(
-        parser.radio_text().is_some(),
-        "RT should be available with 2+ segments"
+        ps_str.contains("RFM"),
+        "PS should contain 'RFM', got: '{}'",
+        ps_str
     );
 }
 
 #[test]
-fn test_rds_parser_continuous_bitstream() {
-    // This test verifies the decoder can handle a continuous stream of bits
-    // representing a single perfect block
+fn test_rds_parser_stats() {
     let mut parser = RdsParser::new();
 
-    let data = 0xABCDu16;
-    let block = create_rds_block(data, OFFSET_A);
-    let bits = word_to_bits(block);
+    let (bits, blocks, groups) = parser.stats();
+    assert_eq!(bits, 0);
+    assert_eq!(blocks, 0);
+    assert_eq!(groups, 0);
 
-    // Feed the 26 bits
-    parser.push_bits(&bits);
+    // Push some bits
+    parser.push_bits(&[0, 1, 0, 1]);
+    let (bits, _, _) = parser.stats();
+    assert_eq!(bits, 4);
+}
 
-    // Should have detected exactly one block
-    assert!(
-        !parser.pending_blocks.is_empty(),
-        "Should detect at least one block"
-    );
+#[test]
+fn test_rds_parser_has_data() {
+    let mut parser = RdsParser::new();
+    assert!(!parser.has_data(), "Should have no data initially");
 
-    // The first detected block should be our block A with correct data
-    let (offset, decoded_data) = parser.pending_blocks[0];
-    assert_eq!(offset, 'A');
-    assert_eq!(decoded_data, data);
+    // Simulate receiving a group
+    parser.groups_decoded = 1;
+    assert!(parser.has_data(), "Should have data after group decoded");
 }

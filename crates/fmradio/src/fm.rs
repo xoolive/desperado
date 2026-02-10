@@ -82,13 +82,10 @@ impl PhaseExtractor {
             self.last = sample;
         }
 
-        // Normalize to [-1, 1] to prevent clipping
-        let max_val = phases.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
-        if max_val > 0.0 {
-            for p in phases.iter_mut() {
-                *p /= max_val;
-            }
-        }
+        // Return raw phase values (no normalization)
+        // FM deviation is typically ±75 kHz for broadcast FM
+        // At 240 kHz sample rate, phase change per sample = 2π × 75k/240k ≈ 1.96 radians max
+        // The RDS subcarrier needs the actual phase values, not normalized
         phases
     }
 
