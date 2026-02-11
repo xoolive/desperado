@@ -26,7 +26,8 @@
 //! let mut agc = Agc::new(0.01);
 //!
 //! // Process samples
-//! for sample in input_samples.iter_mut() {
+//! let mut samples = vec![(1.0, 0.5), (0.8, 0.6), (1.2, 0.4)];
+//! for sample in samples.iter_mut() {
 //!     let (out_i, out_q) = agc.execute(sample.0, sample.1);
 //!     *sample = (out_i, out_q);
 //! }

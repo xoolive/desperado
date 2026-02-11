@@ -32,6 +32,7 @@
 //! );
 //!
 //! // Process samples
+//! let input_samples = vec![(0.5, 0.3), (0.6, 0.2), (0.7, 0.4)];
 //! let mut output = Vec::new();
 //! for sample in input_samples {
 //!     if let Some((i, q)) = symsync.push(sample.0, sample.1) {
@@ -414,6 +415,7 @@ impl SymSync {
     /// let mut symbols = Vec::new();
     ///
     /// // Process input samples
+    /// let input_samples = vec![(0.5, 0.3), (0.6, 0.2), (0.7, 0.4)];
     /// for (i, q) in input_samples {
     ///     if let Some(sym) = symsync.push(i, q) {
     ///         symbols.push(sym);
