@@ -40,7 +40,7 @@ use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
 
-use crate::{error, Gain, GainElementName};
+use crate::{Gain, GainElementName, error};
 
 /// Device selector for Airspy devices
 #[derive(Debug, Clone, PartialEq)]
@@ -365,7 +365,7 @@ fn configure_gain(
 /// Synchronous Airspy I/Q Reader
 ///
 /// Provides an iterator-based interface for reading I/Q samples from Airspy devices.
-/// Each call to `next()` returns a chunk of Complex<f32> samples.
+/// Each call to `next()` returns a chunk of `Complex<f32>` samples.
 ///
 /// # Example
 ///

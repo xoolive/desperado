@@ -39,7 +39,7 @@
 //! # Reference
 //!
 //! This implementation is based on liquid-dsp's `nco_crcf` object.
-//! See: https://github.com/jgaeddert/liquid-dsp
+//! See: <https://github.com/jgaeddert/liquid-dsp>
 
 use std::f64::consts::PI;
 

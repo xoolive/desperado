@@ -44,12 +44,12 @@
 //! # Reference
 //!
 //! This implementation is based on liquid-dsp's `symsync_crcf` object.
-//! See: https://github.com/jgaeddert/liquid-dsp
+//! See: <https://github.com/jgaeddert/liquid-dsp>
 //!
 //! References:
-//! - [Mengali:1997] Umberto Mengali and Aldo N. D'Andrea,
+//! - \[Mengali:1997\] Umberto Mengali and Aldo N. D'Andrea,
 //!   "Synchronization Techniques for Digital Receivers"
-//! - [harris:2001] frederic j. harris and Michael Rice,
+//! - \[harris:2001\] frederic j. harris and Michael Rice,
 //!   "Multirate Digital Filters for Symbol Timing Synchronization
 //!   in Software Defined Radios"
 

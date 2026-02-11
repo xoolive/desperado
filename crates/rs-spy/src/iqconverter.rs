@@ -163,7 +163,7 @@ impl IqConverter {
         self.translate_fs_4(samples);
     }
 
-    /// Process REAL samples and output Complex<f32> I/Q pairs.
+    /// Process REAL samples and output `Complex<f32>` I/Q pairs.
     ///
     /// This is a convenience method that processes the samples and returns
     /// a vector of Complex samples. The output length is half the input length.
@@ -174,7 +174,7 @@ impl IqConverter {
     ///
     /// # Returns
     ///
-    /// Vector of Complex<f32> I/Q samples (length = input_length / 2)
+    /// Vector of `Complex<f32>` I/Q samples (length = input_length / 2)
     pub fn process_to_complex(&mut self, real_samples: &mut [f32]) -> Vec<Complex<f32>> {
         self.process(real_samples);
 

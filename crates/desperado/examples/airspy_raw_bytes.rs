@@ -5,8 +5,8 @@
 //!
 //! Usage: cargo run --example airspy_raw_bytes --features airspy
 
-use desperado::airspy::{list_devices, AirspyConfig};
 use desperado::Gain;
+use desperado::airspy::{AirspyConfig, list_devices};
 use rs_spy::{Airspy, RECOMMENDED_BUFFER_SIZE};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

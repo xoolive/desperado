@@ -36,7 +36,7 @@
 //! # Reference
 //!
 //! This implementation is based on liquid-dsp's `agc_crcf` object.
-//! See: https://github.com/jgaeddert/liquid-dsp
+//! See: <https://github.com/jgaeddert/liquid-dsp>
 
 /// Automatic Gain Control for complex signals.
 ///

@@ -16,11 +16,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "airspy")]
+pub mod airspy;
 pub mod dsp;
 pub mod error;
 pub mod iqread;
-#[cfg(feature = "airspy")]
-pub mod airspy;
 #[cfg(feature = "pluto")]
 pub mod pluto;
 #[cfg(feature = "rtlsdr")]
@@ -1022,40 +1022,40 @@ impl IqAsyncSource {
             gain,
             bias_tee: false,
         };
-         let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
-         Ok(IqAsyncSource::SoapySdr(async_reader))
-     }
- 
-     #[cfg(feature = "airspy")]
-     /// Create a new Airspy-based asynchronous I/Q source
-     pub async fn from_airspy(
-         device_index: Option<usize>,
-         center_freq: u32,
-         sample_rate: u32,
-         gain: Gain,
-         lna_gain: Option<u8>,
-         mixer_gain: Option<u8>,
-         vga_gain: Option<u8>,
-     ) -> error::Result<Self> {
-         let config = airspy::AirspyConfig {
-             device: match device_index {
-                 Some(idx) => airspy::DeviceSelector::Index(idx),
-                 None => airspy::DeviceSelector::Index(0),
-             },
-             center_freq,
-             sample_rate,
-             gain,
-             bias_tee: false,
-             packing: false,
-             lna_gain,
-             mixer_gain,
-             vga_gain,
-         };
-         let async_reader = airspy::AsyncAirspySdrReader::new(&config)?;
-         Ok(IqAsyncSource::Airspy(async_reader))
-     }
- 
-     /// Create a new asynchronous I/Q source from a DeviceConfig
+        let async_reader = soapy::AsyncSoapySdrReader::new(&config)?;
+        Ok(IqAsyncSource::SoapySdr(async_reader))
+    }
+
+    #[cfg(feature = "airspy")]
+    /// Create a new Airspy-based asynchronous I/Q source
+    pub async fn from_airspy(
+        device_index: Option<usize>,
+        center_freq: u32,
+        sample_rate: u32,
+        gain: Gain,
+        lna_gain: Option<u8>,
+        mixer_gain: Option<u8>,
+        vga_gain: Option<u8>,
+    ) -> error::Result<Self> {
+        let config = airspy::AirspyConfig {
+            device: match device_index {
+                Some(idx) => airspy::DeviceSelector::Index(idx),
+                None => airspy::DeviceSelector::Index(0),
+            },
+            center_freq,
+            sample_rate,
+            gain,
+            bias_tee: false,
+            packing: false,
+            lna_gain,
+            mixer_gain,
+            vga_gain,
+        };
+        let async_reader = airspy::AsyncAirspySdrReader::new(&config)?;
+        Ok(IqAsyncSource::Airspy(async_reader))
+    }
+
+    /// Create a new asynchronous I/Q source from a DeviceConfig
     ///
     /// This is a convenience method that dispatches to the appropriate device-specific
     /// constructor based on the DeviceConfig variant.
@@ -1084,21 +1084,21 @@ impl IqAsyncSource {
 impl Stream for IqAsyncSource {
     type Item = error::Result<Vec<Complex<f32>>>;
 
-     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-         match self.get_mut() {
-             IqAsyncSource::IqAsyncFile(source) => Pin::new(source).poll_next(cx),
-             IqAsyncSource::IqAsyncStdin(source) => Pin::new(source).poll_next(cx),
-             IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
-             #[cfg(feature = "pluto")]
-             IqAsyncSource::PlutoSdr(source) => Pin::new(source).poll_next(cx),
-             #[cfg(feature = "rtlsdr")]
-             IqAsyncSource::RtlSdr(source) => Pin::new(source).poll_next(cx),
-             #[cfg(feature = "soapy")]
-             IqAsyncSource::SoapySdr(source) => Pin::new(source).poll_next(cx),
-             #[cfg(feature = "airspy")]
-             IqAsyncSource::Airspy(source) => Pin::new(source).poll_next(cx),
-         }
-     }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            IqAsyncSource::IqAsyncFile(source) => Pin::new(source).poll_next(cx),
+            IqAsyncSource::IqAsyncStdin(source) => Pin::new(source).poll_next(cx),
+            IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "pluto")]
+            IqAsyncSource::PlutoSdr(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "rtlsdr")]
+            IqAsyncSource::RtlSdr(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "soapy")]
+            IqAsyncSource::SoapySdr(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "airspy")]
+            IqAsyncSource::Airspy(source) => Pin::new(source).poll_next(cx),
+        }
+    }
 }
 
 fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>> {

@@ -141,7 +141,7 @@ impl FecTable {
             for &error_bits in &[0b1u32, 0b11u32] {
                 for shift in 0..26u32 {
                     let error_vector = (error_bits << shift) & 0x03FF_FFFF; // 26-bit mask
-                                                                            // XOR error with offset to get syndrome for this error pattern
+                    // XOR error with offset to get syndrome for this error pattern
                     let syndrome = rds_syndrome(error_vector ^ offset_word);
                     tables[offset_idx].push((syndrome, error_vector));
                 }
@@ -979,11 +979,7 @@ impl RdsParser {
         self.station_info.language_code.and_then(|code| {
             if (code as usize) < LANGUAGE_NAMES.len() {
                 let name = LANGUAGE_NAMES[code as usize];
-                if !name.is_empty() {
-                    Some(name)
-                } else {
-                    None
-                }
+                if !name.is_empty() { Some(name) } else { None }
             } else {
                 None
             }
@@ -1158,24 +1154,25 @@ impl RdsParser {
         } else if self.use_fec {
             // Try FEC error correction (1-2 bit burst errors)
             if let Some(expected_type) = OffsetType::from_char(self.expected_offset)
-                && let Some(corrected) = get_fec_table().try_correct(self.shift, expected_type) {
-                    // Verify correction: recalculate syndrome should match expected offset
-                    let corrected_synd = rds_syndrome(corrected);
-                    let corrected_offset = rds_offset_for_syndrome(corrected_synd);
-                    if corrected_offset == Some(self.expected_offset)
-                        || (self.expected_offset == 'C' && corrected_offset == Some('c'))
-                    {
-                        block_data = Some(rds_data_from_word(corrected));
-                        block_is_valid = true;
-                        self.blocks_received += 1;
-                        trace!(
-                            block = %self.expected_offset,
-                            original = format!("0x{:06X}", self.shift),
-                            corrected = format!("0x{:06X}", corrected),
-                            "RDS FEC corrected block"
-                        );
-                    }
+                && let Some(corrected) = get_fec_table().try_correct(self.shift, expected_type)
+            {
+                // Verify correction: recalculate syndrome should match expected offset
+                let corrected_synd = rds_syndrome(corrected);
+                let corrected_offset = rds_offset_for_syndrome(corrected_synd);
+                if corrected_offset == Some(self.expected_offset)
+                    || (self.expected_offset == 'C' && corrected_offset == Some('c'))
+                {
+                    block_data = Some(rds_data_from_word(corrected));
+                    block_is_valid = true;
+                    self.blocks_received += 1;
+                    trace!(
+                        block = %self.expected_offset,
+                        original = format!("0x{:06X}", self.shift),
+                        corrected = format!("0x{:06X}", corrected),
+                        "RDS FEC corrected block"
+                    );
                 }
+            }
         }
 
         // Store block in current group (or mark as not received)
@@ -1316,11 +1313,7 @@ impl RdsParser {
                 .iter()
                 .map(|&b| {
                     // Replace control chars (except 0x0D terminator) with space
-                    if b >= 0x20 || b == 0x0D {
-                        b
-                    } else {
-                        b' '
-                    }
+                    if b >= 0x20 || b == 0x0D { b } else { b' ' }
                 })
                 .collect();
             let ps_str = String::from_utf8_lossy(&ps_filtered).to_string();
@@ -1457,7 +1450,10 @@ impl RdsParser {
                 let af2 = (block3 & 0xFF) as u8;
 
                 if self.verbose {
-                    debug!("  [AF] Raw codes: AF1=0x{:02X} ({}), AF2=0x{:02X} ({})", af1, af1, af2, af2);
+                    debug!(
+                        "  [AF] Raw codes: AF1=0x{:02X} ({}), AF2=0x{:02X} ({})",
+                        af1, af1, af2, af2
+                    );
                 }
 
                 // AF code to frequency conversion: 87.5 + code*0.1 MHz (code 1-204)
@@ -1467,7 +1463,11 @@ impl RdsParser {
                     if !self.station_info.af_list.contains(&freq_10khz) {
                         self.station_info.af_list.push(freq_10khz);
                         if self.verbose {
-                            debug!("  [AF] Added AF1: {:.1} MHz (code {})", (freq_10khz as f32) / 100.0, af1);
+                            debug!(
+                                "  [AF] Added AF1: {:.1} MHz (code {})",
+                                (freq_10khz as f32) / 100.0,
+                                af1
+                            );
                         }
                     }
                 }
@@ -1476,7 +1476,11 @@ impl RdsParser {
                     if !self.station_info.af_list.contains(&freq_10khz) {
                         self.station_info.af_list.push(freq_10khz);
                         if self.verbose {
-                            debug!("  [AF] Added AF2: {:.1} MHz (code {})", (freq_10khz as f32) / 100.0, af2);
+                            debug!(
+                                "  [AF] Added AF2: {:.1} MHz (code {})",
+                                (freq_10khz as f32) / 100.0,
+                                af2
+                            );
                         }
                     }
                 }
@@ -1528,34 +1532,34 @@ impl RdsParser {
                             let received_count =
                                 self.rt_received_mask.iter().filter(|&&x| x).count();
                             debug!(
-                            "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X} = '{}{}{}{}' ({}/16 segments)",
-                            seg,
-                            a,
-                            b,
-                            c,
-                            d,
-                            if a.is_ascii_graphic() || a == b' ' {
-                                a as char
-                            } else {
-                                '?'
-                            },
-                            if b.is_ascii_graphic() || b == b' ' {
-                                b as char
-                            } else {
-                                '?'
-                            },
-                            if c.is_ascii_graphic() || c == b' ' {
-                                c as char
-                            } else {
-                                '?'
-                            },
-                            if d.is_ascii_graphic() || d == b' ' {
-                                d as char
-                            } else {
-                                '?'
-                            },
-                            received_count
-                        );
+                                "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X} = '{}{}{}{}' ({}/16 segments)",
+                                seg,
+                                a,
+                                b,
+                                c,
+                                d,
+                                if a.is_ascii_graphic() || a == b' ' {
+                                    a as char
+                                } else {
+                                    '?'
+                                },
+                                if b.is_ascii_graphic() || b == b' ' {
+                                    b as char
+                                } else {
+                                    '?'
+                                },
+                                if c.is_ascii_graphic() || c == b' ' {
+                                    c as char
+                                } else {
+                                    '?'
+                                },
+                                if d.is_ascii_graphic() || d == b' ' {
+                                    d as char
+                                } else {
+                                    '?'
+                                },
+                                received_count
+                            );
                         }
                     }
                 }
@@ -1801,7 +1805,10 @@ impl RdsParser {
                 let mjd = (concat >> 1) & ((1u32 << 17) - 1);
 
                 if self.verbose {
-                    debug!("  [Time] Block2: 0x{:04X}, Block3: 0x{:04X}", block2, block3);
+                    debug!(
+                        "  [Time] Block2: 0x{:04X}, Block3: 0x{:04X}",
+                        block2, block3
+                    );
                     debug!("  [Time] MJD extracted: {} (0x{:05X})", mjd, mjd);
                 }
 
@@ -1822,12 +1829,16 @@ impl RdsParser {
                 let mut year_utc = ((mjd_f - 15078.2) / 365.25) as i32;
                 let mut month_utc =
                     ((mjd_f - 14956.1 - (year_utc as f64 * 365.25).trunc()) / 30.6001) as i32;
-                let day_utc =
-                    (mjd_f - 14956.0 - (year_utc as f64 * 365.25).trunc() - (month_utc as f64 * 30.6001).trunc())
-                        as u8;
+                let day_utc = (mjd_f
+                    - 14956.0
+                    - (year_utc as f64 * 365.25).trunc()
+                    - (month_utc as f64 * 30.6001).trunc()) as u8;
 
                 if self.verbose {
-                    debug!("  [Time] Conversion: year_pre={}, month_pre={}, day={}", year_utc, month_utc, day_utc);
+                    debug!(
+                        "  [Time] Conversion: year_pre={}, month_pre={}, day={}",
+                        year_utc, month_utc, day_utc
+                    );
                 }
 
                 if month_utc == 14 || month_utc == 15 {
@@ -1838,7 +1849,10 @@ impl RdsParser {
                 month_utc -= 1;
 
                 if self.verbose {
-                    debug!("  [Time] After adjustment: year_post={}, month_post={}", year_utc, month_utc);
+                    debug!(
+                        "  [Time] After adjustment: year_post={}, month_post={}",
+                        year_utc, month_utc
+                    );
                 }
 
                 // Extract hour and minute from Block 3-4

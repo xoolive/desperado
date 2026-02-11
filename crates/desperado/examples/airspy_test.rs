@@ -2,8 +2,8 @@
 //!
 //! Usage: cargo run --example airspy_test --features airspy
 
-use desperado::airspy::{list_devices, AirspyConfig, AirspySdrReader};
 use desperado::Gain;
+use desperado::airspy::{AirspyConfig, AirspySdrReader, list_devices};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Airspy Integration Test ===\n");
