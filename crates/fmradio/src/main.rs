@@ -199,45 +199,29 @@ async fn main() -> desperado::Result<()> {
 
     let mut iq_source = match args.source {
         SourceType::Rtlsdr => {
-            #[cfg(feature = "rtlsdr")]
-            {
-                IqAsyncSource::from_rtlsdr(
-                    args.device_index,
-                    tuning_freq,
-                    args.sample_rate,
-                    args.gain,
-                )
-                .await?
-            }
-            #[cfg(not(feature = "rtlsdr"))]
-            {
-                eprintln!("Error: rtlsdr feature not enabled. Rebuild with --features rtlsdr");
-                std::process::exit(1);
-            }
+            IqAsyncSource::from_rtlsdr(
+                args.device_index,
+                tuning_freq,
+                args.sample_rate,
+                args.gain,
+            )
+            .await?
         }
         SourceType::Airspy => {
-            #[cfg(feature = "airspy")]
-            {
-                let gain = match args.gain {
-                    Some(g) => desperado::Gain::Manual(g as f64),
-                    None => desperado::Gain::Auto,
-                };
-                IqAsyncSource::from_airspy(
-                    args.airspy_device_index,
-                    tuning_freq,
-                    args.sample_rate,
-                    gain,
-                    args.airspy_lna,
-                    args.airspy_mixer,
-                    args.airspy_vga,
-                )
-                .await?
-            }
-            #[cfg(not(feature = "airspy"))]
-            {
-                eprintln!("Error: airspy feature not enabled. Rebuild with --features airspy");
-                std::process::exit(1);
-            }
+            let gain = match args.gain {
+                Some(g) => desperado::Gain::Manual(g as f64),
+                None => desperado::Gain::Auto,
+            };
+            IqAsyncSource::from_airspy(
+                args.airspy_device_index,
+                tuning_freq,
+                args.sample_rate,
+                gain,
+                args.airspy_lna,
+                args.airspy_mixer,
+                args.airspy_vga,
+            )
+            .await?
         }
         SourceType::Soapy => {
             #[cfg(feature = "soapy")]
