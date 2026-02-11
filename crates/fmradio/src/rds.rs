@@ -1057,6 +1057,13 @@ impl RdsParser {
             self.sync_buffer.push(offset, self.bitcount);
             self.blocks_received += 1;
 
+            // Debug: show detected blocks
+            debug!(
+                offset = %offset,
+                bitcount = self.bitcount,
+                "RDS block detected (acquiring sync)"
+            );
+
             // Check if we have a valid sequence of 3 blocks
             if self.sync_buffer.is_sequence_found() {
                 // Sync acquired!
@@ -1084,6 +1091,8 @@ impl RdsParser {
 
                 debug!(
                     offset = %offset,
+                    next_expected = %self.expected_offset,
+                    bitcount = self.bitcount,
                     "RDS sync acquired (SyncPulseBuffer)"
                 );
 
@@ -1106,6 +1115,15 @@ impl RdsParser {
             Some(off) => off == self.expected_offset || (self.expected_offset == 'C' && off == 'c'),
             None => false,
         };
+
+        debug!(
+            expected = %self.expected_offset,
+            detected = ?detected_offset,
+            matches = matches_expected,
+            bitcount = self.bitcount,
+            shift = format!("0x{:06X}", self.shift),
+            "RDS block at boundary"
+        );
 
         // Track if block had errors (for sliding window)
         let had_errors = !matches_expected;
@@ -1201,6 +1219,16 @@ impl RdsParser {
     fn process_current_group(&mut self) {
         // Count how many blocks we received
         let received_count = self.current_group.iter().filter(|(r, _)| *r).count();
+
+        // Debug: show group completion status
+        debug!(
+            blocks_valid = received_count,
+            a_valid = self.current_group[0].0,
+            b_valid = self.current_group[1].0,
+            c_valid = self.current_group[2].0,
+            d_valid = self.current_group[3].0,
+            "RDS group boundary"
+        );
 
         // Require at least blocks A and B (PI and group type info) to process
         if self.current_group[0].0 && self.current_group[1].0 {
@@ -1415,7 +1443,7 @@ impl RdsParser {
                 self.station_info.di_flags.set_flag(seg, di_flag);
 
                 // Verbose debug output (converted to tracing)
-        if self.verbose {
+                if self.verbose {
                     debug!(
                         "  [DI] Segment {}: {} = {}",
                         seg,
@@ -1486,7 +1514,7 @@ impl RdsParser {
                         self.rt_received_mask[seg] = true;
 
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             let received_count =
                                 self.rt_received_mask.iter().filter(|&&x| x).count();
                             debug!(
@@ -1536,7 +1564,7 @@ impl RdsParser {
                     self.rt_received_mask[seg] = true;
 
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         let received_count = self.rt_received_mask.iter().filter(|&&x| x).count();
                         debug!(
                             "  [RT] Segment {}/16: 0x{:02X} 0x{:02X} = '{}{}' ({}/16 segments)",
@@ -1583,7 +1611,7 @@ impl RdsParser {
                         minute,
                     });
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!(
                             "  [PIN] Day {} {:02}:{:02} (0x{:04X})",
                             day, hour, minute, block4
@@ -1599,7 +1627,7 @@ impl RdsParser {
                         let cc = (pi >> 12) & 0x0F;
                         self.station_info.extended_country_code = Some(ecc);
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} - ECC=0x{:02X}, CC={} (country code from PI)",
                                 Self::slc_variant_name(slc_variant),
@@ -1613,7 +1641,7 @@ impl RdsParser {
                         let tmc_id = block3 & 0xFFF;
                         self.station_info.tmc_id = Some(tmc_id);
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} - TMC ID=0x{:03X}",
                                 Self::slc_variant_name(slc_variant),
@@ -1624,7 +1652,7 @@ impl RdsParser {
                     2 => {
                         // Pager (deprecated in RDS2)
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} - (Pager, deprecated)",
                                 Self::slc_variant_name(slc_variant)
@@ -1636,7 +1664,7 @@ impl RdsParser {
                         let lang_code = (block3 & 0xFF) as u8;
                         self.station_info.language_code = Some(lang_code);
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             let lang_name = if lang_code < LANGUAGE_NAMES.len() as u8 {
                                 LANGUAGE_NAMES[lang_code as usize]
                             } else {
@@ -1654,7 +1682,7 @@ impl RdsParser {
                         // Broadcaster bits
                         let bits = block3 & 0x7FF;
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} - Broadcaster bits=0x{:03X}",
                                 Self::slc_variant_name(slc_variant),
@@ -1666,7 +1694,7 @@ impl RdsParser {
                         // Emergency Warning System (EWS)
                         let ews = block3 & 0xFFF;
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} - EWS=0x{:03X}",
                                 Self::slc_variant_name(slc_variant),
@@ -1676,7 +1704,7 @@ impl RdsParser {
                     }
                     _ => {
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "  [SLC] {} (variant {})",
                                 Self::slc_variant_name(slc_variant),
@@ -1694,7 +1722,7 @@ impl RdsParser {
                 let oda_message = block3;
 
                 // Verbose debug output (converted to tracing)
-        if self.verbose {
+                if self.verbose {
                     debug!(
                         "  [ODA] Target Group: {}A, App ID: 0x{:04X} ({})",
                         target_group_type,
@@ -1715,7 +1743,7 @@ impl RdsParser {
                     0x4BD7 => {
                         // RadioText+ (RT+)
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             let cb = (oda_message >> 12) & 0x01 != 0;
                             let scb = (oda_message >> 8) & 0x0F;
                             let template_num = (oda_message & 0xFF) as u8;
@@ -1728,7 +1756,7 @@ impl RdsParser {
                     0x6552 => {
                         // Enhanced RadioText (eRT)
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             let encoding = if (oda_message & 0x01) != 0 {
                                 "UTF-8"
                             } else {
@@ -1745,7 +1773,7 @@ impl RdsParser {
                     0xCD46 | 0xCD47 => {
                         // RDS-TMC (Traffic Message Channel)
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!("    [TMC] ALERT-C message: 0x{:04X}", oda_message);
                         }
                     }
@@ -1769,7 +1797,7 @@ impl RdsParser {
                 // Check for invalid date
                 if mjd_f < 15079.0 {
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!("  [Time] Invalid MJD: {}", mjd);
                     }
                     return;
@@ -1824,7 +1852,7 @@ impl RdsParser {
                     });
 
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!(
                             "  [Time] {}-{:02}-{:02} {:02}:{:02} UTC, Offset: {:+.1}h",
                             year_utc, month_utc, day_utc, hour_utc, minute_utc, local_offset
@@ -1846,7 +1874,7 @@ impl RdsParser {
                 let c4 = ((block4_inv >> 8) & 0xFF) as u8;
 
                 // Verbose debug output (converted to tracing)
-        if self.verbose {
+                if self.verbose {
                     debug!(
                         "  [PTYN] Segment {}/4: chars at positions {} {}: '{}{}{}{}' (0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X})",
                         seg,
@@ -1896,7 +1924,7 @@ impl RdsParser {
                 };
 
                 // Verbose debug output (converted to tracing)
-        if self.verbose {
+                if self.verbose {
                     debug!(
                         "  [EON] PI=0x{:04X}, Variant {} (Other Network)",
                         on_pi, eon_variant
@@ -1908,7 +1936,7 @@ impl RdsParser {
                     let b3_h = ((block3 >> 8) & 0xFF) as u8;
                     let b3_l = (block3 & 0xFF) as u8;
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!(
                             "    [EON-PS] Segment {}: chars at {} {}: '{}{}' (0x{:02X} 0x{:02X})",
                             eon_variant,
@@ -1935,7 +1963,7 @@ impl RdsParser {
                     let af2 = (block3 & 0xFF) as u8;
                     eon_data.alt_frequency = Some(af1);
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!("    [EON-AF] AF1=0x{:02X}, AF2=0x{:02X}", af1, af2);
                     }
                 }
@@ -1946,7 +1974,7 @@ impl RdsParser {
                     if freq_code > 0 && freq_code < 205 {
                         let freq_mhz = 87.5 + (freq_code as f32) * 0.1;
                         // Verbose debug output (converted to tracing)
-        if self.verbose {
+                        if self.verbose {
                             debug!(
                                 "    [EON-Freq] Variant {} = {:.1} MHz",
                                 eon_variant, freq_mhz
@@ -1963,7 +1991,7 @@ impl RdsParser {
                         eon_data.linkage_set = Some(lsn);
                     }
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!(
                             "    [EON-Link] Has linkage: {}, LSN=0x{:03X}",
                             has_linkage, lsn
@@ -1976,7 +2004,7 @@ impl RdsParser {
                     let ta = (block3 & 0x0001) != 0;
                     eon_data.program_type = Some(pty);
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         debug!(
                             "    [EON-PTY] PTY={} ({}), TA={}",
                             pty,
@@ -1992,7 +2020,7 @@ impl RdsParser {
                 // Variant 14: PIN (Program Item Number)
                 else if eon_variant == 14 {
                     // Verbose debug output (converted to tracing)
-        if self.verbose {
+                    if self.verbose {
                         let day = ((block3 >> 11) & 0x1F) as u8;
                         let hour = ((block3 >> 6) & 0x1F) as u8;
                         let minute = (block3 & 0x3F) as u8;

@@ -39,14 +39,16 @@ use crossbeam::channel;
 use desperado::dsp::{
     DspBlock,
     afc::SquareFreqOffsetCorrection,
+    agc::Agc,
     decimator::Decimator,
     filters::LowPassFir,
+    nco::Nco,
     rotate::Rotate,
+    symsync::SymSync,
 };
 use fmradio::fm::{DeemphasisFilter, PhaseExtractor};
 use fmradio::rds::{RdsParser, DIFlags};
 use futures::StreamExt;
-use serde_json;
 use std::f32::consts::PI;
 use std::io::{Write, stdout};
 use std::str::FromStr;
@@ -151,11 +153,12 @@ struct Args {
      airspy_vga: Option<u8>,
 
     /// Output raw FM-demodulated MPX signal to stdout (for piping to redsea)
-    /// Format: signed 16-bit PCM at 240 kHz (or 171 kHz with --resample-out)
+    /// Format: signed 16-bit PCM at native MPX rate (use --resample-out for redsea)
     #[arg(long, default_value_t = false)]
     raw_out: bool,
 
-    /// Resample raw output to this rate (default: 240000, redsea prefers 171000)
+    /// Resample raw output to this rate. Recommended: 171000 (3×57kHz) or 228000 (4×57kHz)
+    /// for optimal RDS decoding with redsea
     #[arg(long)]
     resample_out: Option<u32>,
 
@@ -615,15 +618,15 @@ async fn run_stereo(
 
         // Stereo decoder needs raw phase signal (contains 19 kHz pilot and 38 kHz L-R subcarrier)
         // The stereo decoder has its own pilot bandpass filter (18.3-19.7 kHz)
-        let (left, right, _pilot_phases) = stereo.process(&phase);
+        let (left, right, pilot_phases) = stereo.process(&phase);
         let deem_l = deemphasis_l.process(&left);
         let deem_r = deemphasis_r.process(&right);
 
-        // RDS: Resample MPX to 171 kHz and use independent NCO for carrier recovery
-        // This matches redsea's architecture more closely
-        let rds_resampled = rds_resampler.process_real(&phase);
-        if !rds_resampled.is_empty() {
-            rds.process(&rds_resampled);
+        // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
+        // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
+        let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
+        if !rds_i.is_empty() {
+            rds.process_iq(&rds_i, &rds_q);
         }
 
         // Interleave stereo
@@ -1006,313 +1009,8 @@ impl StatefulFir {
     }
 }
 
-/// Root Raised Cosine (RRC) matched filter for RDS BPSK demodulation
-/// The RRC filter is used as a matched filter to maximize SNR at symbol centers
-/// and minimize inter-symbol interference (ISI).
-struct RrcFilter {
-    coeffs: Vec<f32>,
-    buffer: Vec<f32>,
-    write_pos: usize,
-}
-
-impl RrcFilter {
-    /// Create an RRC filter with specified parameters
-    /// - samples_per_symbol: Number of samples per symbol (3.0 for RDS at 7125 Hz)
-    /// - rolloff: Rolloff factor β (0.0 to 1.0, typically 0.8 for RDS per redsea)
-    /// - num_symbols: Number of symbol periods for the filter (determines length)
-    fn new(samples_per_symbol: f32, rolloff: f32, num_symbols: usize) -> Self {
-        let taps = num_symbols * (samples_per_symbol as usize) * 2 + 1; // Symmetric filter
-        let coeffs = Self::generate_coefficients(samples_per_symbol, rolloff, taps);
-        
-        debug!("[RRC] Created RRC filter: sps={:.1}, β={:.2}, taps={}", 
-            samples_per_symbol, rolloff, taps);
-        
-        Self {
-            coeffs,
-            buffer: vec![0.0; taps],
-            write_pos: 0,
-        }
-    }
-    
-    /// Generate RRC filter coefficients using the standard formula
-    /// Reference: https://en.wikipedia.org/wiki/Root-raised-cosine_filter
-    fn generate_coefficients(sps: f32, beta: f32, taps: usize) -> Vec<f32> {
-        let mut coeffs = vec![0.0_f32; taps];
-        let mid = (taps / 2) as f32;
-        let t_symbol = sps; // Symbol period in samples
-        
-        for i in 0..taps {
-            let t = (i as f32 - mid) / t_symbol; // Time in symbol periods
-            
-            let h = if t.abs() < 1e-6 {
-                // t = 0: limit case
-                1.0 - beta + 4.0 * beta / PI
-            } else if (t.abs() - 1.0 / (4.0 * beta)).abs() < 1e-6 && beta > 0.0 {
-                // t = ±1/(4β): limit case
-                (beta / (2.0_f32).sqrt()) * 
-                    ((1.0 + 2.0 / PI) * (PI / (4.0 * beta)).sin() + 
-                     (1.0 - 2.0 / PI) * (PI / (4.0 * beta)).cos())
-            } else {
-                // General case
-                let pi_t = PI * t;
-                let four_beta_t = 4.0 * beta * t;
-                let numerator = (pi_t * (1.0 - beta)).sin() + 
-                                four_beta_t * (pi_t * (1.0 + beta)).cos();
-                let denominator = pi_t * (1.0 - four_beta_t * four_beta_t);
-                
-                if denominator.abs() < 1e-6 {
-                    // Avoid division by zero
-                    0.0
-                } else {
-                    numerator / denominator
-                }
-            };
-            
-            coeffs[i] = h;
-        }
-        
-        // Normalize to unit energy (important for matched filter)
-        let energy: f32 = coeffs.iter().map(|x| x * x).sum();
-        let norm = energy.sqrt();
-        if norm > 1e-6 {
-            for c in coeffs.iter_mut() {
-                *c /= norm;
-            }
-        }
-        
-        // Debug: print first few and last few coefficients
-        if coeffs.len() >= 6 {
-            trace!("[RRC] Coeffs (first 3): [{:.4}, {:.4}, {:.4}]", 
-                coeffs[0], coeffs[1], coeffs[2]);
-            let n = coeffs.len();
-            trace!("[RRC] Coeffs (last 3): [{:.4}, {:.4}, {:.4}]", 
-                coeffs[n-3], coeffs[n-2], coeffs[n-1]);
-            trace!("[RRC] Center coeff: {:.4}", coeffs[taps/2]);
-        }
-        
-        coeffs
-    }
-    
-    /// Push a sample and get filtered output
-    fn push(&mut self, sample: f32) -> f32 {
-        // Add sample to ring buffer
-        self.buffer[self.write_pos] = sample;
-        self.write_pos = (self.write_pos + 1) % self.buffer.len();
-        
-        // Compute filtered output (convolution)
-        let mut acc = 0.0_f32;
-        let len = self.coeffs.len();
-        for i in 0..len {
-            let buf_idx = (self.write_pos + len - 1 - i) % len;
-            acc += self.buffer[buf_idx] * self.coeffs[i];
-        }
-        acc
-    }
-}
-
-/// Polyphase Symbol Synchronizer for BPSK demodulation
-/// Implements timing recovery with interpolating matched filter, similar to liquid-dsp's symsync_crcf
-/// 
-/// Key features:
-/// - Pre-computed polyphase filterbank for efficient sub-sample interpolation
-/// - Gardner timing error detector (robust for matched-filter systems)
-/// - Second-order loop filter for smooth timing tracking
-struct PolyphaseSymSync {
-    // Polyphase filterbank: num_filters phases, each with num_taps coefficients
-    filters: Vec<Vec<f32>>,       // filters[phase][tap]
-    diff_filters: Vec<Vec<f32>>,  // Derivative filters for TED
-    num_filters: usize,           // Number of filter phases (e.g., 32)
-    samples_per_symbol: usize,    // Samples per symbol (3 for RDS)
-    filter_delay: usize,          // Filter semi-length in symbols
-    
-    // Sample buffers (one for I, one for Q)
-    buffer_i: Vec<f32>,
-    buffer_q: Vec<f32>,
-    buf_idx: usize,
-    
-    // Timing NCO
-    tau: f32,                     // Fractional symbol timing estimate (0.0 to 1.0)
-    pub rate: f32,                // Timing rate (samples per output, nominal = samples_per_symbol)
-    rate_adj: f32,                // Rate adjustment from loop filter
-    
-    // Loop filter state
-    q: f32,                       // Integrator state
-    alpha: f32,                   // Proportional gain
-    beta: f32,                    // Integral gain
-    
-    // Previous symbol for TED
-    prev_symbol: (f32, f32),
-    
-    // Output buffer
-    output_ready: bool,
-    output_symbol: (f32, f32),
-}
-
-impl PolyphaseSymSync {
-    /// Create a new polyphase symbol synchronizer
-    /// - samples_per_symbol: Nominal samples per symbol (3 for RDS at 7125 Hz)
-    /// - num_filters: Number of polyphase filter phases (32 typical)
-    /// - filter_delay: Filter semi-length in symbols (3 typical)
-    /// - rolloff: RRC rolloff factor (0.8 for RDS)
-    /// - bandwidth: Loop bandwidth in Hz (normalized to symbol rate)
-    fn new(samples_per_symbol: usize, num_filters: usize, filter_delay: usize, rolloff: f32, bandwidth: f32) -> Self {
-        // Generate prototype RRC filter at num_filters * samples_per_symbol rate
-        let proto_sps = num_filters * samples_per_symbol;
-        let proto_len = 2 * filter_delay * proto_sps + 1;
-        let proto_filter = RrcFilter::generate_coefficients(proto_sps as f32, rolloff, proto_len);
-        
-        // Split prototype into polyphase components
-        let taps_per_phase = 2 * filter_delay * samples_per_symbol + 1;
-        let mut filters = vec![vec![0.0_f32; taps_per_phase]; num_filters];
-        let mut diff_filters = vec![vec![0.0_f32; taps_per_phase]; num_filters];
-        
-        for phase in 0..num_filters {
-            for tap in 0..taps_per_phase {
-                let proto_idx = tap * num_filters + phase;
-                if proto_idx < proto_filter.len() {
-                    filters[phase][tap] = proto_filter[proto_idx];
-                }
-            }
-        }
-        
-        // Normalize each filter phase for unity gain
-        // The sum of all phases at the optimal timing point should equal the prototype sum
-        // But each individual phase should also produce unity gain for matched filtering
-        // Scale each phase so its sum equals 1.0
-        for phase in 0..num_filters {
-            let phase_sum: f32 = filters[phase].iter().sum();
-            if phase_sum.abs() > 1e-6 {
-                for tap in filters[phase].iter_mut() {
-                    *tap /= phase_sum;
-                }
-            }
-        }
-        
-        // Compute derivative filters (for matched filter TED)
-        // d/dt of filter is approximated by (h[n+1] - h[n-1]) / 2
-        for phase in 0..num_filters {
-            for tap in 0..taps_per_phase {
-                let prev_phase = if phase == 0 { num_filters - 1 } else { phase - 1 };
-                let next_phase = if phase == num_filters - 1 { 0 } else { phase + 1 };
-                diff_filters[phase][tap] = (filters[next_phase][tap] - filters[prev_phase][tap]) / 2.0;
-            }
-        }
-        
-        // Buffer length = taps per filter phase
-        let buffer_len = taps_per_phase;
-        
-        // Debug: check filter gains
-        let proto_sum: f32 = proto_filter.iter().sum();
-        let phase0_sum: f32 = filters[0].iter().sum();
-        let phase16_sum: f32 = filters[16].iter().sum();
-        trace!("[SYMSYNC] Proto filter sum: {:.4}, phase0 sum: {:.4}, phase16 sum: {:.4}",
-            proto_sum, phase0_sum, phase16_sum);
-        
-        // Loop filter gains (second-order type II)
-        // bandwidth is normalized to symbol rate
-        let omega_n = 2.0 * std::f32::consts::PI * bandwidth;
-        let zeta = 1.0_f32;  // Critically damped
-        let alpha = 2.0 * zeta * omega_n;
-        let beta = omega_n * omega_n;
-        
-        debug!("[SYMSYNC] Created polyphase symbol sync: sps={}, filters={}, taps={}, alpha={:.4}, beta={:.6}",
-            samples_per_symbol, num_filters, taps_per_phase, alpha, beta);
-        
-        Self {
-            filters,
-            diff_filters,
-            num_filters,
-            samples_per_symbol,
-            filter_delay,
-            buffer_i: vec![0.0; buffer_len],
-            buffer_q: vec![0.0; buffer_len],
-            buf_idx: 0,
-            tau: 0.0,
-            rate: samples_per_symbol as f32,
-            rate_adj: 0.0,
-            q: 0.0,
-            alpha,
-            beta,
-            prev_symbol: (0.0, 0.0),
-            output_ready: false,
-            output_symbol: (0.0, 0.0),
-        }
-    }
-    
-    /// Push a sample and potentially get a symbol output
-    /// Returns Some((I, Q)) when a symbol is ready, None otherwise
-    fn push(&mut self, i: f32, q: f32) -> Option<(f32, f32)> {
-        // Store sample in buffer
-        self.buffer_i[self.buf_idx] = i;
-        self.buffer_q[self.buf_idx] = q;
-        self.buf_idx = (self.buf_idx + 1) % self.buffer_i.len();
-        
-        // Advance timing
-        self.tau += 1.0;
-        
-        // Check if we should output a symbol
-        if self.tau >= self.rate {
-            self.tau -= self.rate;
-            
-            // Compute fractional delay and select filter phase
-            let frac = self.tau / self.rate;  // 0.0 to 1.0
-            let phase_f = frac * self.num_filters as f32;
-            let phase = (phase_f as usize).min(self.num_filters - 1);
-            
-            // Apply polyphase filter
-            let filter = &self.filters[phase];
-            let diff_filter = &self.diff_filters[phase];
-            let buf_len = self.buffer_i.len();
-            
-            let mut yi = 0.0_f32;
-            let mut yq = 0.0_f32;
-            let mut dyi = 0.0_f32;
-            let mut dyq = 0.0_f32;
-            
-            for (tap, (h, dh)) in filter.iter().zip(diff_filter.iter()).enumerate() {
-                let idx = (self.buf_idx + buf_len - 1 - tap) % buf_len;
-                yi += self.buffer_i[idx] * h;
-                yq += self.buffer_q[idx] * h;
-                dyi += self.buffer_i[idx] * dh;
-                dyq += self.buffer_q[idx] * dh;
-            }
-            
-            // Gardner TED: error = Re{(y - y_prev) * conj(dy)}
-            // Simplified for real part: (yi - prev_yi) * dyi + (yq - prev_yq) * dyq
-            let ted_error = (yi - self.prev_symbol.0) * dyi + (yq - self.prev_symbol.1) * dyq;
-            
-            // Clamp error
-            let ted_error = ted_error.clamp(-1.0, 1.0);
-            
-            // Loop filter update - second order type II
-            self.q += self.beta * ted_error;  // Integrator
-            self.rate_adj = self.alpha * ted_error + self.q;  // Proportional + integral
-            
-            // Update rate with bounded adjustment
-            self.rate = self.samples_per_symbol as f32 - self.rate_adj;
-            self.rate = self.rate.clamp(2.5, 3.5);  // Allow ±16% timing adjustment
-            
-            // Store for next TED
-            self.prev_symbol = (yi, yq);
-            
-            return Some((yi, yq));
-        }
-        
-        None
-    }
-    
-    /// Reset the synchronizer state
-    fn reset(&mut self) {
-        self.buffer_i.fill(0.0);
-        self.buffer_q.fill(0.0);
-        self.buf_idx = 0;
-        self.tau = 0.0;
-        self.rate = self.samples_per_symbol as f32;
-        self.rate_adj = 0.0;
-        self.q = 0.0;
-        self.prev_symbol = (0.0, 0.0);
-    }
-}
+// Note: RrcFilter and PolyphaseSymSync structs have been removed.
+// Now using desperado::dsp::symsync::SymSync instead.
 
 /// RDS resampler: input rate → output rate
 /// Default: 250 kHz → 171 kHz (exactly 3 samples per RDS symbol after decimation by 24)
@@ -1500,53 +1198,22 @@ impl RdsResamplerCustom {
 pub struct RdsDecoder {
     sample_rate: f32,
     
-    // NCO phase and frequency (Costas loop PLL)
-    nco_phase: f64,
-    nco_freq: f64,           // Current NCO frequency (Hz), tracks around 57 kHz
-    pll_alpha: f64,          // PLL proportional gain
-    pll_beta: f64,           // PLL integral gain
+    // NCO with integrated PLL (from desperado::dsp::nco)
+    nco: Nco,
     
     // Lowpass filter for baseband (complex I/Q)
     lpf_i: StatefulFir,
     lpf_q: StatefulFir,
     
-    // Input delay buffer to compensate for stereo decoder's pilot filter group delay
-    // The stereo decoder uses 257-tap filters, so group delay is (257-1)/2 = 128 samples
-    input_delay: Vec<f32>,
-    delay_write_pos: usize,
-    delay_len: usize,
+    // AGC (from desperado::dsp::agc)
+    agc: Agc,
     
-    // AGC state
-    agc_gain: f32,
-    agc_alpha: f32,         // Attack/decay rate
-    
-    // RRC matched filter for pulse shaping (applied after decimation)
-    rrc_i: RrcFilter,
-    rrc_q: RrcFilter,
-    
-    // Polyphase symbol synchronizer (replaces manual timing recovery)
-    symsync: PolyphaseSymSync,
-    
-    // Fine carrier PLL (decision-directed, runs at decimated rate 7125 Hz)
-    fine_carrier_phase: f32,    // Phase accumulator for fine carrier tracking
-    fine_carrier_freq: f32,     // Frequency offset in radians per sample
-    fine_pll_alpha: f32,        // Proportional gain (very small for narrow bandwidth)
-    fine_pll_beta: f32,         // Integral gain
+    // Polyphase symbol synchronizer (from desperado::dsp::symsync)
+    symsync: SymSync,
     
     // Decimation
     decimate_ratio: usize,
     decimate_counter: usize,
-    
-    // Symbol timing with Gardner TED
-    timing_nco_phase: f32,        // Timing NCO phase (0.0 to 3.0, wraps at 3.0)
-    timing_nco_freq: f32,         // Timing NCO frequency (nominal 1.0)
-    timing_alpha: f32,            // Timing loop proportional gain
-    timing_beta: f32,             // Timing loop integral gain
-    timing_buffer: Vec<(f32, f32)>, // Ring buffer of recent samples for interpolation
-    timing_buf_idx: usize,        // Write index into timing buffer
-    prev_timing_symbol: (f32, f32), // Previous on-time symbol (for M&M TED)
-    mid_sample: (f32, f32),         // Mid-point sample between symbols (for M&M TED)
-    timing_offset: usize,         // Which sample to pick (0, 1, or 2) for testing
     
     // Biphase decoder state
     prev_psk_symbol: (f32, f32),
@@ -1572,10 +1239,6 @@ pub struct RdsDecoder {
     // PLL acquisition state
     pll_locked: bool,           // True when PLL has acquired lock
     pll_lock_counter: usize,    // Count consecutive low phase errors
-    pll_alpha_acquire: f64,     // Wider bandwidth for acquisition
-    pll_beta_acquire: f64,
-    pll_alpha_track: f64,       // Narrow bandwidth for tracking
-    pll_beta_track: f64,
     
     // JSON output mode
     json_mode: bool,
@@ -1608,87 +1271,42 @@ impl RdsDecoder {
         // Use 255 taps for good selectivity
         let lpf_taps = 255;
         
-        // No input delay needed - we handle resampling externally now
-        let delay_len = 0;
+        // NCO for fine phase tracking (IQ path: 57 kHz already removed by pilot-coherent mixing)
+        // In IQ mode, we only need to track residual phase, so frequency is 0
+        // The NCO runs at the DECIMATED rate (7125 Hz) for phase tracking at symbol rate
+        let decimated_rate = 7125.0_f64;
+        let mut nco = Nco::new(0.0, decimated_rate);  // Zero frequency for IQ path
+        // PLL bandwidth for phase tracking (at 7125 Hz rate, 2375 symbol rate)
+        // Use ~2 Hz effective bandwidth for stable tracking
+        // At symbol rate ~2375 Hz, we update every ~3 samples, so effective = nominal * (2375/7125) / 3 ≈ nominal * 0.11
+        nco.set_pll_bandwidth(20.0, decimated_rate);  // ~2.2 Hz effective at symbol rate
         
-        // PLL parameters (second-order loop)
-        // Run at symbol rate (2375 Hz)
-        // Use VERY narrow bandwidth like redsea (0.03 Hz) for stable tracking
-        let pll_bandwidth_track = 0.03;  // Hz - very narrow for phase tracking only
-        let omega_n_track = 2.0 * std::f64::consts::PI * pll_bandwidth_track / psk_symbol_rate as f64;
-        let zeta = 0.707;  // Critically damped
-        let pll_alpha_track = 2.0 * zeta * omega_n_track;  // Proportional gain
-        let pll_beta_track = 0.0;  // DISABLE frequency tracking entirely - our NCO is accurate enough
+        debug!("[RDS-DSP] NCO: freq=0 Hz (IQ path), PLL bandwidth=20Hz (~2Hz effective)");
         
-        // Wider bandwidth for acquisition (5 Hz) - phase only, no frequency
-        let pll_bandwidth_acquire = 5.0;  // Hz - wider for fast acquisition
-        let omega_n_acquire = 2.0 * std::f64::consts::PI * pll_bandwidth_acquire / psk_symbol_rate as f64;
-        let pll_alpha_acquire = 2.0 * zeta * omega_n_acquire;
-        let pll_beta_acquire = 0.0;  // No frequency tracking
+        // AGC with bandwidth matching redsea (~500 Hz at 171 kHz = 0.003)
+        // redsea: agc.init(kAGCBandwidth_Hz / kTargetSampleRate_Hz, kAGCInitialGain)
+        // kAGCBandwidth_Hz = 500.0, so 500/171000 ≈ 0.003
+        // kAGCInitialGain = 0.08
+        let mut agc = Agc::new(0.003);
+        agc.set_gain(0.08);  // Match redsea initial gain
+        debug!("[RDS-DSP] AGC: bandwidth=0.003, initial_gain=0.08");
         
-        // Start in acquisition mode
-        let pll_alpha = pll_alpha_acquire;
-        let pll_beta = pll_beta_acquire;
-        
-        debug!("[RDS-DSP] PLL bandwidth: acquire={} Hz, track={} Hz", 
-            pll_bandwidth_acquire, pll_bandwidth_track);
-        debug!("[RDS-DSP] PLL acquire: alpha: {:.6}, beta: {:.8} (phase-only)", pll_alpha_acquire, pll_beta_acquire);
-        debug!("[RDS-DSP] PLL track: alpha: {:.6}, beta: {:.8} (phase-only)", pll_alpha_track, pll_beta_track);
-
-        // Timing loop parameters (Mueller & Muller TED)
-        // Use very narrow bandwidth for stable operation
-        let timing_bandwidth = 1.0;  // Hz - narrow for stability
-        let timing_omega = 2.0 * std::f32::consts::PI * timing_bandwidth / psk_symbol_rate;
-        let timing_zeta = 1.0_f32;  // Overdamped for stability
-        let timing_alpha = 2.0 * timing_zeta * timing_omega;
-        let timing_beta = timing_omega * timing_omega;
-        
-        debug!("[RDS-DSP] Timing loop bandwidth: {} Hz, alpha: {:.4}, beta: {:.6}", 
-            timing_bandwidth, timing_alpha, timing_beta);
-        
-        // Timing offset for testing (change this to 0, 1, or 2 to find correct alignment)
-        // Try different values: 0, 1, 2 to find which gives cleanest constellation
-        let timing_offset = 2_usize;  // Try 2 (late)
-        debug!("[RDS-DSP] Symbol timing offset: {} (0=early, 1=mid, 2=late)", timing_offset);
+        // Polyphase symbol synchronizer (matching redsea's liquid-dsp symsync)
+        // redsea: symsync.init(LIQUID_FIRFILT_RRC, kSamplesPerSymbol, kSymsyncDelay, kSymsyncBeta, 32)
+        //         symsync.setBandwidth(kSymsyncBandwidth_Hz / kTargetSampleRate_Hz)
+        // kSymsyncBandwidth_Hz = 2200.0, so 2200/171000 ≈ 0.013
+        let symsync = SymSync::new_rnyquist(3, 32, 3, 0.8, 0.013);
+        debug!("[RDS-DSP] SymSync: k=3, npfb=32, m=3, beta=0.8, bandwidth=0.013");
         
         Self {
             sample_rate,
-            nco_phase: 0.25,  // Start at 90° to compensate for the 90° rotation we observe
-            nco_freq: 57000.0,  // Exact RDS subcarrier - PLL will track slowly
-            pll_alpha,
-            pll_beta,
+            nco,
             lpf_i: StatefulFir::new(lpf_cutoff, sample_rate, lpf_taps),
             lpf_q: StatefulFir::new(lpf_cutoff, sample_rate, lpf_taps),
-            input_delay: vec![0.0; delay_len.max(1)],  // At least 1 element
-            delay_write_pos: 0,
-            delay_len,
-            agc_gain: 0.08,  // Initial gain (redsea: kAGCInitialGain = 0.08)
-            agc_alpha: 500.0 / sample_rate, // AGC bandwidth ~500 Hz
-            // RRC matched filter at decimated rate (7125 Hz)
-            // 3 samples per symbol, rolloff β=0.8 (matching redsea symsync), 8 symbol span
-            rrc_i: RrcFilter::new(3.0, 0.8, 8),
-            rrc_q: RrcFilter::new(3.0, 0.8, 8),
-            // Polyphase symbol synchronizer
-            // 3 samples/symbol, 32 filter phases, 3 symbols filter delay, 0.8 rolloff
-            // Bandwidth 0.01 (normalized to symbol rate, ~24 Hz at 2375 Hz symbol rate)
-            symsync: PolyphaseSymSync::new(3, 32, 3, 0.8, 0.01),
-            // Fine carrier PLL - very narrow bandwidth like redsea (0.03 Hz)
-            // At 7125 Hz sample rate: omega = 2*pi*0.03/7125 = 2.65e-5
-            fine_carrier_phase: 0.0,
-            fine_carrier_freq: 0.0,
-            fine_pll_alpha: 0.001,   // Small for narrow bandwidth
-            fine_pll_beta: 0.00001,  // Very small for slow frequency tracking
+            agc,
+            symsync,
             decimate_ratio,
             decimate_counter: 0,
-            timing_nco_phase: 0.0,
-            timing_nco_freq: 1.0,   // Nominal: 1 symbol per 3 samples (freq = 1.0)
-            timing_alpha,
-            timing_beta,
-            timing_buffer: vec![(0.0, 0.0); 8],  // Ring buffer for interpolation
-            timing_buf_idx: 0,
-            prev_timing_symbol: (0.0, 0.0),
-            mid_sample: (0.0, 0.0),
-            timing_offset,  // 0, 1, or 2 - which sample of the 3 to pick
             prev_psk_symbol: (0.0, 0.0),
             biphase_clock: 0,
             biphase_polarity: 0,
@@ -1704,10 +1322,6 @@ impl RdsDecoder {
             debug_counter: 0,
             pll_locked: false,
             pll_lock_counter: 0,
-            pll_alpha_acquire,
-            pll_beta_acquire,
-            pll_alpha_track,
-            pll_beta_track,
             json_mode: json,
         }
     }
@@ -1722,28 +1336,15 @@ impl RdsDecoder {
         // Process each sample through the DSP chain with Costas loop PLL
         
         for &x in input {
-            // Step 1: Mix down to baseband using NCO (complex conjugate multiplication)
-            // Multiply by exp(-j*phase) = cos(phase) - j*sin(phase) for proper downconversion
-            // Signal: x * exp(-j*phase) = x*cos(phase) - j*x*sin(phase)
-            let phase_rad = 2.0 * std::f64::consts::PI * self.nco_phase;
-            let cos_val = phase_rad.cos() as f32;
-            let sin_val = phase_rad.sin() as f32;
-            
-            let i_mixed = x * cos_val;
-            let q_mixed = -x * sin_val;  // Negative for conjugate (exp(-j*phase))
+            // Step 1: Mix down to baseband using NCO
+            let (i_mixed, q_mixed) = self.nco.mix_down(x);
             
             // Step 2: Lowpass filter (applied at full rate, before decimation)
             let i_filt = self.lpf_i.push(i_mixed);
             let q_filt = self.lpf_q.push(q_mixed);
             
-            // Step 3: Advance NCO phase using current frequency
-            self.nco_phase += self.nco_freq / self.sample_rate as f64;
-            while self.nco_phase >= 1.0 {
-                self.nco_phase -= 1.0;
-            }
-            while self.nco_phase < 0.0 {
-                self.nco_phase += 1.0;
-            }
+            // Step 3: Advance NCO phase
+            self.nco.step();
             
             // Step 4: Decimation - only process every N samples
             self.decimate_counter += 1;
@@ -1752,26 +1353,25 @@ impl RdsDecoder {
             }
             self.decimate_counter = 0;
             
-            // Step 5: AGC
-            let magnitude = (i_filt * i_filt + q_filt * q_filt).sqrt();
-            let target_magnitude = 1.0_f32;
-            if magnitude > 0.0001 {
-                let error = target_magnitude - magnitude * self.agc_gain;
-                self.agc_gain += self.agc_alpha * error;
-                self.agc_gain = self.agc_gain.clamp(0.01, 100.0);
+            // Step 5: AGC (using new AGC module)
+            let (i_agc, q_agc) = self.agc.execute(i_filt, q_filt);
+            
+            // Count decimated samples for rate verification
+            static DECIMATED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dec_count = DECIMATED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if dec_count % 50000 == 0 && dec_count > 0 {
+                debug!("[RDS-DEC] {} decimated samples processed", dec_count);
             }
-            let i_agc = i_filt * self.agc_gain;
-            let q_agc = q_filt * self.agc_gain;
             
             // Debug: check signal level after AGC (once every ~1 second)
             if self.debug_counter % 7000 == 1 {
+                let pre_mag = (i_filt * i_filt + q_filt * q_filt).sqrt();
                 let agc_mag = (i_agc * i_agc + q_agc * q_agc).sqrt();
                 trace!("[RDS-SIG] pre-AGC mag: {:.4}, AGC gain: {:.2}, post-AGC mag: {:.4}",
-                    magnitude, self.agc_gain, agc_mag);
+                    pre_mag, self.agc.get_gain(), agc_mag);
             }
             
-            // Step 5.5: Polyphase symbol synchronizer (matching redsea's liquid-dsp symsync)
-            // Push AGC'd samples into the symsync to get properly timed symbols
+            // Step 6: Polyphase symbol synchronizer
             let symbol_opt = self.symsync.push(i_agc, q_agc);
             
             // Only process when we have a symbol output from symsync
@@ -1780,94 +1380,91 @@ impl RdsDecoder {
                 None => continue,
             };
             
-            // Carrier PLL: Use BPSK phase error detection like redsea
-            // Phase error for BPSK: atan2(Q, |I|) gives error from nearest decision point
-            // We use the proper form: atan2(Q, |I|) which gives error in radians
+            // Carrier PLL: Use liquid-dsp BPSK modem phase error calculation
+            // liquid-dsp formula: phase_error = imag(r * conj(x_hat))
+            // For BPSK: x_hat = +1 or -1, so phase_error = Q * sign(I)
             let (si, sq) = (psk_symbol.0 as f64, psk_symbol.1 as f64);
             let sym_mag = (si * si + sq * sq).sqrt();
             
-            if sym_mag > 0.1 {
-                // Normalize for phase error calculation
-                let norm_i = si / sym_mag;
-                let norm_q = sq / sym_mag;
-                
-                // BPSK phase error: atan2(Q, |I|) gives the angle from the I axis
-                // This is the exact phase error in radians, range -pi/2 to +pi/2
-                let phase_error_rad = norm_q.atan2(norm_i.abs());
-                
-                // Clamp to prevent instability (shouldn't be needed with atan2)
-                let phase_error_rad = phase_error_rad.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-                
-                // Second-order PLL like liquid-dsp
-                // Loop bandwidth and damping determine gains
-                // For a 2nd order loop: 
-                //   alpha = 2 * zeta * omega_n (proportional gain)
-                //   beta = omega_n^2 (integral gain for frequency tracking)
-                // omega_n = 2*pi*bandwidth/sample_rate (where sample_rate is symbol rate for us)
-                // 
-                // Redsea uses 0.03 Hz bandwidth at 2375 Hz symbol rate:
-                //   omega_n = 2*pi*0.03/2375 = 7.94e-5 rad/symbol
-                //   With zeta=0.707: alpha = 1.12e-4, beta = 6.3e-9
-                //
-                // But for acquisition, we need faster convergence. Use 5 Hz bandwidth:
-                //   omega_n = 2*pi*5/2375 = 0.0132 rad/symbol
-                //   With zeta=0.707: alpha = 0.0187, beta = 1.75e-4
-                //
-                // PLL multiplier: redsea uses 12.0 to scale phase error
-                let pll_multiplier = 12.0_f64;
-                let scaled_error = phase_error_rad * pll_multiplier;
-                
-                // Use different gains for acquisition vs tracking
-                let (alpha, beta) = if self.pll_locked {
-                    // Tracking: very narrow bandwidth (0.03 Hz)
-                    (0.0001, 0.0)  // No frequency tracking in lock, just phase
+            // Lower threshold to 0.001 - any signal is useful for phase tracking
+            if sym_mag > 0.001 {
+                // Compute phase error as angle from nearest BPSK constellation point (0° or 180°)
+                // For symbol at angle θ:
+                //   If I >= 0: it's a +1 symbol, error = θ - 0° = θ
+                //   If I < 0: it's a -1 symbol, error = θ - 180° (wrapped to ±π)
+                let symbol_phase = sq.atan2(si);  // Phase in radians
+                let phase_error_rad = if si >= 0.0 {
+                    // Should be at 0°
+                    symbol_phase
                 } else {
-                    // Acquisition: wider bandwidth (5 Hz) with frequency tracking
-                    (0.01, 0.0001)  // Both phase and frequency
+                    // Should be at 180° (π radians)
+                    // Wrap to [-π, π]
+                    let err = symbol_phase - std::f64::consts::PI;
+                    if err < -std::f64::consts::PI {
+                        err + 2.0 * std::f64::consts::PI
+                    } else if err > std::f64::consts::PI {
+                        err - 2.0 * std::f64::consts::PI
+                    } else {
+                        err
+                    }
                 };
                 
-                // Second-order loop: update frequency (integral) and phase (proportional)
-                // frequency offset in Hz = nco_freq - 57000
-                // We track frequency offset, not absolute frequency
-                let freq_offset = self.nco_freq - 57000.0;
-                let new_freq_offset = freq_offset + beta * scaled_error;
-                self.nco_freq = 57000.0 + new_freq_offset.clamp(-5.0, 5.0);  // Max ±5 Hz offset
+                // Phase error is already in [-π, π] from the calculation above
+                // Clamp just for safety
                 
-                // Phase update (in cycles, so divide by 2*pi)
-                let phase_update = alpha * scaled_error / (2.0 * std::f64::consts::PI);
-                self.nco_phase += phase_update;
+                // Debug: print phase error distribution
+                static PE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let pe_count = PE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if pe_count % 5000 == 0 && pe_count > 0 {
+                    let phase_deg = (sq as f64).atan2(si as f64).to_degrees();
+                    debug!("[RDS-PLL-DBG] mag: {:.3}, phase: {:+.1}°, phase_err: {:+.3} rad ({:+.1}°), I: {:+.3}, Q: {:+.3}",
+                        sym_mag, phase_deg, phase_error_rad, phase_error_rad.to_degrees(), si, sq);
+                }
                 
-                // Wrap phase
-                while self.nco_phase >= 1.0 { self.nco_phase -= 1.0; }
-                while self.nco_phase < 0.0 { self.nco_phase += 1.0; }
+                // PLL multiplier: Reduced gain since phase error is now accurate
+                let scaled_error = phase_error_rad * 0.5;
                 
-                // Lock detection: if phase error is consistently small, switch to tracking mode
+                // Use NCO's integrated PLL (now matches liquid-dsp exactly)
+                self.nco.pll_step(scaled_error);
+                
+                // Lock detection: if phase error is consistently small
                 let phase_error_deg = phase_error_rad.to_degrees();
-                if phase_error_deg.abs() < 20.0 {  // Within 20 degrees
+                if phase_error_deg.abs() < 20.0 {
                     self.pll_lock_counter += 1;
                     if self.pll_lock_counter > 500 && !self.pll_locked {
                         self.pll_locked = true;
-                        debug!("[RDS-PLL] Locked! Phase error: {:.1}°, freq offset: {:.2} Hz", 
-                            phase_error_deg, self.nco_freq - 57000.0);
+                        // Narrow bandwidth once locked for better tracking
+                        // 2.16 Hz nominal = 0.03 Hz effective at symbol rate
+                        self.nco.set_pll_bandwidth(2.16, self.sample_rate as f64);
+                        debug!("[RDS-PLL] Locked! Narrowing bandwidth to 2.16 Hz (~0.03 Hz effective). Phase error: {:.1}°, freq: {:.2} Hz", 
+                            phase_error_deg, self.nco.get_frequency_hz(self.sample_rate as f64));
                     }
                 } else {
-                    // Large error - might have lost lock
                     if self.pll_lock_counter > 0 {
                         self.pll_lock_counter -= 1;
                     }
                     if self.pll_lock_counter == 0 && self.pll_locked {
                         self.pll_locked = false;
-                        debug!("[RDS-PLL] Lost lock, phase error: {:.1}°", phase_error_deg);
+                        // Widen bandwidth for re-acquisition
+                        self.nco.set_pll_bandwidth(100.0, self.sample_rate as f64);
+                        debug!("[RDS-PLL] Lost lock, widening bandwidth to 100 Hz. Phase error: {:.1}°", phase_error_deg);
                     }
                 }
             }
             
             self.debug_counter += 1;
+            // Count symbols for rate verification
+            static SYMBOL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = SYMBOL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count % 10000 == 0 && count > 0 {
+                debug!("[RDS-RATE] {} symbols processed", count);
+            }
             if self.debug_counter % 5000 == 0 {
                 let mag = (psk_symbol.0 * psk_symbol.0 + psk_symbol.1 * psk_symbol.1).sqrt();
                 let phase_deg = (psk_symbol.1 as f64).atan2(psk_symbol.0 as f64).to_degrees();
-                trace!("[RDS-DSP] AGC: {:.2}, NCO: {:.2} Hz, I: {:.3}, Q: {:.3}, mag: {:.3}, phase: {:.1}°, locked: {}, symsync: {:.4}",
-                    self.agc_gain, self.nco_freq, psk_symbol.0, psk_symbol.1, mag, phase_deg, self.pll_locked, self.symsync.rate);
+                debug!("[RDS-DSP] AGC: {:.2}, NCO: {:.2} Hz, I: {:.3}, Q: {:.3}, mag: {:.3}, phase: {:.1}°, locked: {}, symsync: {:.4}",
+                    self.agc.get_gain(), self.nco.get_frequency_hz(self.sample_rate as f64), 
+                    psk_symbol.0, psk_symbol.1, mag, phase_deg, self.pll_locked, self.symsync.get_rate());
             }
             
             // Debug: Print constellation points for phase analysis (30 consecutive symbols)
@@ -1884,26 +1481,28 @@ impl RdsDecoder {
                     phase_diff);
             }
             
-            // Biphase decoding using subtraction (matching redsea exactly)
+            // Biphase decoding using subtraction (matching redsea)
             // biphase_symbol = (current - prev) * 0.5
-            // A biphase symbol consists of two PSK symbols with opposite phase.
+            // For correct biphase decoding, we need the PLL to lock absolute phase.
             let (pi, pq) = self.prev_psk_symbol;
             let (ci, cq) = psk_symbol;
             let biphase_i = (ci - pi) * 0.5;
             let biphase_q = (cq - pq) * 0.5;
             
-            // Bit value is determined by sign of real part
-            let biphase_bit = biphase_i >= 0.0;
+            // Bit value is determined by sign of real part (works when PLL locks phase)
+            // When phase not locked, we also compute differential product as fallback
+            let diff_product = ci * pi + cq * pq;  // cos(Δphase) * mag²
             
-            // Also compute differential product for comparison
-            let diff_i = ci * pi + cq * pq;  // Real part of current × conj(prev)
-            let _diff_q = cq * pi - ci * pq;  // Imag part
-            let diff_bit = diff_i < 0.0;  // Negative = 180° phase change
+            // Use differential product sign for bit decision (more robust to phase rotation)
+            // diff_product > 0 means same phase (no flip), < 0 means opposite phase (flip)
+            let biphase_bit = diff_product >= 0.0;
             
-            // Store magnitude in history for clock polarity detection
-            // Use absolute value of real part (the "signal strength" of this biphase symbol)
+            // For clock polarity detection, use the biphase subtraction magnitude
+            // This works because even when phase rotates, the magnitude of transitions
+            // should still show the biphase pattern
+            let biphase_mag = (biphase_i * biphase_i + biphase_q * biphase_q).sqrt();
             let history_idx = self.biphase_clock % 128;
-            self.biphase_history[history_idx] = biphase_i.abs();
+            self.biphase_history[history_idx] = biphase_mag;
             
             self.biphase_clock += 1;
             
@@ -1936,11 +1535,15 @@ impl RdsDecoder {
                 self.bits.push(if decoded_bit { 1 } else { 0 });
             }
             
-            // Debug: print biphase and differential comparison occasionally
+            // Debug: print differential product occasionally
             if self.debug_counter % 10000 == 1 {
-                let biphase_mag = (biphase_i * biphase_i + biphase_q * biphase_q).sqrt();
-                trace!("[RDS-BIPH] biphase_i: {:.3}, biphase_q: {:.3}, mag: {:.3}, biph_bit: {}, diff_bit: {}",
-                    biphase_i, biphase_q, biphase_mag, biphase_bit, diff_bit);
+                let prev_phase = (pq as f64).atan2(pi as f64).to_degrees();
+                let curr_phase = (cq as f64).atan2(ci as f64).to_degrees();
+                let mut phase_diff = curr_phase - prev_phase;
+                if phase_diff > 180.0 { phase_diff -= 360.0; }
+                if phase_diff < -180.0 { phase_diff += 360.0; }
+                trace!("[RDS-BIPH] diff_product: {:+.3}, biph_bit: {}, Δphase: {:+.1}°",
+                    diff_product, biphase_bit, phase_diff);
             }
             
             self.prev_psk_symbol = psk_symbol;
@@ -1958,9 +1561,14 @@ impl RdsDecoder {
         }
         
         // Debug: check input signal statistics
-        if self.debug_counter == 0 {
+        static IQ_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dbg_count = IQ_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_count % 50 == 0 {
             let input_rms: f32 = (input_i.iter().map(|x| x*x).sum::<f32>() / input_i.len() as f32).sqrt();
-            debug!("[RDS-DSP-IQ] Input RMS: {:.4}, Input len: {}", input_rms, input_i.len());
+            debug!("[RDS-DSP-IQ] Input RMS I: {:.6}, Q: {:.6}, len: {}", 
+                input_rms,
+                (input_q.iter().map(|x| x*x).sum::<f32>() / input_q.len() as f32).sqrt(),
+                input_i.len());
         }
         
         // Process each sample through the DSP chain
@@ -1980,46 +1588,76 @@ impl RdsDecoder {
             }
             self.decimate_counter = 0;
             
-            // Step 3: AGC
-            let magnitude = (i_filt * i_filt + q_filt * q_filt).sqrt();
-            let target_magnitude = 1.0_f32;
-            if magnitude > 0.0001 {
-                let error = target_magnitude - magnitude * self.agc_gain;
-                self.agc_gain += self.agc_alpha * error;
-                self.agc_gain = self.agc_gain.clamp(0.01, 100.0);
-            }
-            let i_agc = i_filt * self.agc_gain;
-            let q_agc = q_filt * self.agc_gain;
+            // Step 3: AGC (using new AGC module)
+            let (i_agc, q_agc) = self.agc.execute(i_filt, q_filt);
             
-            // Step 4: Skip fine carrier rotation - we have coherent carrier from pilot
-            // The pilot-derived 57 kHz is already phase-locked, no additional PLL needed
-            let i_rot = i_agc;
-            let q_rot = q_agc;
+            // Debug: check signal levels at decimated rate
+            static DEC_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dec_count = DEC_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if dec_count % 5000 == 0 {
+                let filt_mag = (i_filt * i_filt + q_filt * q_filt).sqrt();
+                let agc_mag = (i_agc * i_agc + q_agc * q_agc).sqrt();
+                debug!("[RDS-DSP-IQ-LEVELS] Filt mag: {:.6}, AGC gain: {:.2}, AGC out mag: {:.6}",
+                    filt_mag, self.agc.get_gain(), agc_mag);
+            }
+            
+            // Step 4: Fine carrier phase tracking
+            // The pilot-derived 57 kHz gives us frequency lock, but we need to track the phase
+            // Use a simple PLL to rotate symbols to the real axis
+            // Complex rotation: (I + jQ) * e^(-j*theta) = (I + jQ) * (cos - j*sin)
+            //   = I*cos + Q*sin + j*(Q*cos - I*sin)
+            let (sin_rot, cos_rot) = self.nco.sincos();
+            let i_rot = i_agc * cos_rot + q_agc * sin_rot;
+            let q_rot = q_agc * cos_rot - i_agc * sin_rot;
+            
+            // Step carrier NCO (at decimated rate, 7125 Hz)
+            self.nco.step();
             
             // Step 5: Polyphase symbol synchronizer (replaces old timing buffer + M&M TED)
+            // Debug: check signal going into symsync
+            static SYMSYNC_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let ss_count = SYMSYNC_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if ss_count % 5000 == 0 {
+                let rot_mag = (i_rot * i_rot + q_rot * q_rot).sqrt();
+                debug!("[RDS-PRE-SYMSYNC] Input to symsync: I={:.4}, Q={:.4}, mag={:.4}", i_rot, q_rot, rot_mag);
+            }
             let symbol_opt = self.symsync.push(i_rot, q_rot);
             
             // Only process when we have a symbol
             if let Some(psk_symbol) = symbol_opt {
                 let psk_symbol = (psk_symbol.0, psk_symbol.1);
                 
-                // No carrier PLL update needed - we have coherent carrier from pilot
+                // Update carrier PLL based on symbol phase error
+                // For BPSK, we want symbols at ±1 on the real axis
+                // Phase error = Q * sign(I) gives us direction to rotate
+                // Normalize by magnitude for more stable tracking
+                let mag_sq = psk_symbol.0 * psk_symbol.0 + psk_symbol.1 * psk_symbol.1;
+                if mag_sq > 0.01 {
+                    // Phase error: Q component indicates how far off from real axis
+                    // For BPSK: phase_error = atan2(Q, |I|) ≈ Q/|I| for small angles
+                    let phase_error = psk_symbol.1 * psk_symbol.0.signum();
+                    // Normalize by magnitude for stable operation
+                    let phase_error_normalized = (phase_error / mag_sq.sqrt()) as f64;
+                    // PLL update at symbol rate
+                    self.nco.pll_step(phase_error_normalized);
+                }
                 
                 // Debug output
                 self.debug_counter += 1;
                 if self.debug_counter % 5000 == 0 {
                     let mag = (psk_symbol.0 * psk_symbol.0 + psk_symbol.1 * psk_symbol.1).sqrt();
                     let sym_phase = psk_symbol.1.atan2(psk_symbol.0).to_degrees();
-                    trace!("[RDS-DSP-IQ] AGC: {:.2}, I: {:.3}, Q: {:.3}, mag: {:.3}, sym_ph: {:.1}°, symsync_rate: {:.4}",
-                        self.agc_gain, psk_symbol.0, psk_symbol.1, mag, sym_phase, self.symsync.rate);
+                    debug!("[RDS-DSP-IQ] AGC: {:.2}, I: {:.3}, Q: {:.3}, mag: {:.3}, sym_ph: {:.1}°",
+                        self.agc.get_gain(), psk_symbol.0, psk_symbol.1, mag, sym_phase);
                 }
                 
                 // Print constellation occasionally for phase analysis
-                if self.debug_counter % 50000 == 1 {
-                    trace!("[RDS-CONST-IQ] Symbol I: {:.3}, Q: {:.3}", psk_symbol.0, psk_symbol.1);
+                if self.debug_counter % 10000 == 1 {
+                    debug!("[RDS-CONST-IQ] Symbol I: {:.3}, Q: {:.3}", psk_symbol.0, psk_symbol.1);
                 }
                 
                 // Biphase decoding using subtraction (matching redsea exactly)
+                // With PLL tracking, symbols are at ±1 on the real axis
                 let (pi, pq) = self.prev_psk_symbol;
                 let (ci, cq) = psk_symbol;
                 let biphase_i = (ci - pi) * 0.5;
@@ -2035,17 +1673,27 @@ impl RdsDecoder {
                 self.biphase_clock += 1;
                 
                 // Every 128 symbols, check which clock phase has better signal
-                if self.biphase_clock % 128 == 0 {
+                if self.biphase_clock >= 128 {
                     let mut even_sum = 0.0_f32;
                     let mut odd_sum = 0.0_f32;
                     for i in 0..64 {
                         even_sum += self.biphase_history[i * 2];
                         odd_sum += self.biphase_history[i * 2 + 1];
                     }
+                    debug!("[RDS-CLOCK-IQ] Even: {:.3}, Odd: {:.3}, Ratio: {:.2}, Current polarity: {}",
+                        even_sum, odd_sum, even_sum.max(odd_sum) / (even_sum.min(odd_sum) + 0.001), self.biphase_polarity);
+                    // Note: Due to clock increment happening before output check,
+                    // if even history indices have larger values, we need polarity=1
+                    // to output at odd clock-after-increment values (which read from even history)
                     if even_sum > odd_sum {
-                        self.biphase_polarity = 0;
+                        self.biphase_polarity = 1;  // Output at odd clock (reads from even history)
                     } else if odd_sum > even_sum {
-                        self.biphase_polarity = 1;
+                        self.biphase_polarity = 0;  // Output at even clock (reads from odd history)
+                    }
+                    // Reset clock and history (matching redsea)
+                    self.biphase_clock = 0;
+                    for i in 0..128 {
+                        self.biphase_history[i] = 0.0;
                     }
                 }
                 
@@ -2053,10 +1701,19 @@ impl RdsDecoder {
                 if self.biphase_clock % 2 == self.biphase_polarity {
                     let decoded_bit = biphase_bit != self.prev_biphase_bit;
                     self.prev_biphase_bit = biphase_bit;
+                    // Delta decoded bit (standard RDS differential decoding)
                     self.bits.push(if decoded_bit { 1 } else { 0 });
                 }
                 
                 // Debug: print biphase symbol magnitude occasionally
+                // Also print detailed sequence for first 200 symbols
+                static BIPHASE_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let biphase_dbg = BIPHASE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if biphase_dbg >= 1000 && biphase_dbg < 1100 {
+                    debug!("[RDS-BIPH-SEQ] sym={}, clock={}, pol={}, biphase_i={:.3}, bit={}, output={}",
+                        biphase_dbg, self.biphase_clock, self.biphase_polarity, biphase_i, biphase_bit,
+                        if self.biphase_clock % 2 == self.biphase_polarity { "Y" } else { "N" });
+                }
                 if self.debug_counter % 10000 == 1 {
                     let biphase_mag = (biphase_i * biphase_i + biphase_q * biphase_q).sqrt();
                     trace!("[RDS-BIPH-IQ] biphase_i: {:.3}, biphase_q: {:.3}, mag: {:.3}, bit: {}",
@@ -2074,6 +1731,18 @@ impl RdsDecoder {
     /// Process accumulated bits through the RDS parser and display results
     fn process_bits(&mut self) {
         if self.bits.len() >= 104 {
+            // Debug: print bit statistics and pattern periodically
+            static BIT_BATCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let batch_count = BIT_BATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if batch_count.is_multiple_of(100) && batch_count > 0 {
+                let ones: usize = self.bits.iter().map(|&b| b as usize).sum();
+                let zeros = self.bits.len() - ones;
+                // Show first 52 bits (2 blocks worth) as string
+                let first_bits: String = self.bits.iter().take(52).map(|&b| if b == 1 { '1' } else { '0' }).collect();
+                debug!("[RDS-BITS] Batch {}: {} bits, {} ones, {} zeros, ratio: {:.2}, first 52: {}",
+                    batch_count, self.bits.len(), ones, zeros, ones as f32 / self.bits.len() as f32, first_bits);
+            }
+            
             self.rds_parser.push_bits(&self.bits);
 
             // In JSON mode, output JSON objects and skip human-readable output
@@ -2088,20 +1757,18 @@ impl RdsDecoder {
             }
 
             // Display station name
-            if let Some(station) = self.rds_parser.station_name() {
-                if self.last_station.as_ref() != Some(&station) {
+            if let Some(station) = self.rds_parser.station_name()
+                && self.last_station.as_ref() != Some(&station) {
                     println!("[RDS] Station: {}", station);
                     self.last_station = Some(station);
                 }
-            }
             
             // Display radio text
-            if let Some(text) = self.rds_parser.radio_text() {
-                if self.last_radiotext.as_ref() != Some(&text) {
+            if let Some(text) = self.rds_parser.radio_text()
+                && self.last_radiotext.as_ref() != Some(&text) {
                     println!("[RDS] Radio Text: {}", text);
                     self.last_radiotext = Some(text);
                 }
-            }
 
             // Display metadata from Group 0A/0B (only on change, and only if we've received data)
             let info = self.rds_parser.station_info();

@@ -28,6 +28,11 @@
 /// - [`decimator`]: Sample rate reduction with anti-aliasing filtering
 /// - [`filters`]: Digital filter implementations (FIR low-pass, etc.)
 ///
+/// ## Carrier and Timing Recovery
+/// - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
+/// - [`symsync`]: Polyphase Symbol Synchronizer for timing recovery
+/// - [`agc`]: Automatic Gain Control for amplitude normalization
+///
 /// ## Advanced Features
 /// - [`afc`]: Automatic Frequency Control for frequency offset correction
 ///
@@ -77,9 +82,12 @@
 use num_complex::Complex;
 
 pub mod afc;
+pub mod agc;
 pub mod decimator;
 pub mod filters;
+pub mod nco;
 pub mod rotate;
+pub mod symsync;
 
 /// Trait for DSP blocks that process complex-valued signals.
 ///
