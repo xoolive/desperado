@@ -198,7 +198,7 @@ impl SyncPulse {
         let sync_distance = self.bit_position.wrapping_sub(other.bit_position);
 
         // Distance must be a multiple of block length
-        if sync_distance % BLOCK_LENGTH != 0 {
+        if !sync_distance.is_multiple_of(BLOCK_LENGTH) {
             return false;
         }
 
@@ -1157,8 +1157,8 @@ impl RdsParser {
             self.blocks_received += 1;
         } else if self.use_fec {
             // Try FEC error correction (1-2 bit burst errors)
-            if let Some(expected_type) = OffsetType::from_char(self.expected_offset) {
-                if let Some(corrected) = get_fec_table().try_correct(self.shift, expected_type) {
+            if let Some(expected_type) = OffsetType::from_char(self.expected_offset)
+                && let Some(corrected) = get_fec_table().try_correct(self.shift, expected_type) {
                     // Verify correction: recalculate syndrome should match expected offset
                     let corrected_synd = rds_syndrome(corrected);
                     let corrected_offset = rds_offset_for_syndrome(corrected_synd);
@@ -1176,7 +1176,6 @@ impl RdsParser {
                         );
                     }
                 }
-            }
         }
 
         // Store block in current group (or mark as not received)
@@ -1268,6 +1267,7 @@ impl RdsParser {
 
     /// Check if a byte is a valid RDS PS/RT character (printable ASCII or space)
     #[inline]
+    #[allow(dead_code)]
     fn is_valid_rds_char(b: u8) -> bool {
         // Accept printable ASCII (0x20-0x7E) and common RDS extended chars (0x80-0xFF)
         // Reject control characters (0x00-0x1F except 0x0D which is string terminator)
@@ -1293,7 +1293,7 @@ impl RdsParser {
         // First character of segment (position pos)
         // Condition: pos == 0 || (pos == prev_pos + 1 && sequential_length == pos)
         if pos == 0
-            || (self.ps_prev_pos.map_or(false, |p| pos == p + 1) && self.ps_sequential_len == pos)
+            || (self.ps_prev_pos.is_some_and(|p| pos == p + 1) && self.ps_sequential_len == pos)
         {
             self.ps_sequential_len = pos + 1;
         }
@@ -1302,7 +1302,7 @@ impl RdsParser {
         // Second character of segment (position pos + 1)
         let pos2 = pos + 1;
         if pos2 == 0
-            || (self.ps_prev_pos.map_or(false, |p| pos2 == p + 1) && self.ps_sequential_len == pos2)
+            || (self.ps_prev_pos.is_some_and(|p| pos2 == p + 1) && self.ps_sequential_len == pos2)
         {
             self.ps_sequential_len = pos2 + 1;
         }

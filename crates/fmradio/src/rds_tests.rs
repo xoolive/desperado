@@ -259,8 +259,10 @@ fn test_rds_di_flags_set_get() {
 
 #[test]
 fn test_rds_di_flags_as_string() {
-    let mut di = DIFlags::default();
-    di.stereo = true;
+    let di = DIFlags {
+        stereo: true,
+        ..Default::default()
+    };
     let s = di.as_string();
     assert!(s.contains("stereo=true"));
     assert!(s.contains("dynamic_pty=false"));

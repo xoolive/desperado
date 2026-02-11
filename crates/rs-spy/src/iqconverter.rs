@@ -22,6 +22,7 @@ use num_complex::Complex;
 ///
 /// This filter is symmetric and has zeros at every other tap (half-band property).
 /// The center tap is 0.5, providing unity gain at DC.
+#[allow(clippy::excessive_precision)]
 const HB_KERNEL_FLOAT: [f32; 47] = [
     -0.000998606272947510,
     0.000000000000000000,
@@ -209,7 +210,7 @@ impl IqConverter {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * hbc;
             // chunk[2] unchanged (multiply by +1)
-            chunk[3] = chunk[3] * hbc;
+            chunk[3] *= hbc;
         }
 
         // Apply half-band FIR filter to even samples (I channel)
@@ -326,9 +327,7 @@ impl IqConverter {
         // Process only odd-indexed samples (Q channel)
         // The libairspy code passes samples+1 with full length, so we need to handle all samples
         for i in (1..samples.len()).step_by(2) {
-            let old_val = self.delay_line[self.delay_index];
-            self.delay_line[self.delay_index] = samples[i];
-            samples[i] = old_val;
+            std::mem::swap(&mut self.delay_line[self.delay_index], &mut samples[i]);
 
             self.delay_index += 1;
             if self.delay_index >= half_len {
@@ -425,7 +424,7 @@ mod tests {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * 0.5;
             // chunk[2] unchanged
-            chunk[3] = chunk[3] * 0.5;
+            chunk[3] *= 0.5;
         }
 
         // Apply FIR filter - track output magnitudes
@@ -547,10 +546,10 @@ mod tests {
         for group in sample_groups {
             let original_energy: f32 = group.iter().map(|x| x * x).sum();
 
-            let mut rotated = group.clone();
+            let mut rotated = group;
             rotated[0] = -rotated[0];
             rotated[1] = -rotated[1] * hbc;
-            rotated[3] = rotated[3] * hbc;
+            rotated[3] *= hbc;
 
             let rotated_energy: f32 = rotated.iter().map(|x| x * x).sum();
 
@@ -673,7 +672,7 @@ mod tests {
         let mut samples = vec![1.0f32; 100];
 
         // Make a copy to compare
-        let original = samples.clone();
+        // let original = samples.clone();
 
         converter.process(&mut samples);
 
@@ -739,7 +738,7 @@ mod tests {
         for chunk in samples.chunks_exact_mut(4) {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * 0.5;
-            chunk[3] = chunk[3] * 0.5;
+            chunk[3] *= 0.5;
         }
 
         let samples_after_rotation = samples.clone();

@@ -477,7 +477,7 @@ async fn run_stereo(
     phase_extractor: &mut PhaseExtractor,
     decimator: &mut Decimator,
     afc: &mut SquareFreqOffsetCorrection,
-    lowpass_fir: &LowPassFir,
+    _lowpass_fir: &LowPassFir,
     mpx_sample_rate: f32,
     tx: channel::Sender<f32>,
 ) -> desperado::Result<()> {
@@ -558,7 +558,6 @@ async fn run_stereo(
             decimated
         };
         let phase = phase_extractor.process(&afc_corrected);
-        let filtered = lowpass_fir.process(&phase);
 
         // Raw output mode: output MPX samples to stdout for piping to redsea
         if raw_out {
@@ -578,11 +577,10 @@ async fn run_stereo(
                     let input_chunk: Vec<Vec<f32>> = vec![raw_leftover[..needed].to_vec()];
                     raw_leftover.drain(0..needed);
                     
-                    if let Ok(resampled) = resampler.process(&input_chunk, None) {
-                        if !resampled.is_empty() {
+                    if let Ok(resampled) = resampler.process(&input_chunk, None)
+                        && !resampled.is_empty() {
                             output.extend_from_slice(&resampled[0]);
                         }
-                    }
                 }
                 output
             } else {
@@ -1161,6 +1159,7 @@ impl RdsResamplerCustom {
     }
     
     /// Simple real-only resampling (for use with independent NCO approach)
+    #[allow(dead_code)]
     fn process_real(&mut self, input: &[f32]) -> Vec<f32> {
         // Use I resampler for real signal
         self.leftover_i.extend_from_slice(input);
@@ -1359,7 +1358,7 @@ impl RdsDecoder {
             // Count decimated samples for rate verification
             static DECIMATED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dec_count = DECIMATED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if dec_count % 50000 == 0 && dec_count > 0 {
+            if dec_count.is_multiple_of(50000) && dec_count > 0 {
                 debug!("[RDS-DEC] {} decimated samples processed", dec_count);
             }
             
@@ -1415,8 +1414,8 @@ impl RdsDecoder {
                 // Debug: print phase error distribution
                 static PE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let pe_count = PE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if pe_count % 5000 == 0 && pe_count > 0 {
-                    let phase_deg = (sq as f64).atan2(si as f64).to_degrees();
+                if pe_count.is_multiple_of(5000) && pe_count > 0 {
+                    let phase_deg = sq.atan2(si).to_degrees();
                     debug!("[RDS-PLL-DBG] mag: {:.3}, phase: {:+.1}°, phase_err: {:+.3} rad ({:+.1}°), I: {:+.3}, Q: {:+.3}",
                         sym_mag, phase_deg, phase_error_rad, phase_error_rad.to_degrees(), si, sq);
                 }
@@ -1456,10 +1455,10 @@ impl RdsDecoder {
             // Count symbols for rate verification
             static SYMBOL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let count = SYMBOL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 10000 == 0 && count > 0 {
+            if count.is_multiple_of(10000) && count > 0 {
                 debug!("[RDS-RATE] {} symbols processed", count);
             }
-            if self.debug_counter % 5000 == 0 {
+            if self.debug_counter.is_multiple_of(5000) {
                 let mag = (psk_symbol.0 * psk_symbol.0 + psk_symbol.1 * psk_symbol.1).sqrt();
                 let phase_deg = (psk_symbol.1 as f64).atan2(psk_symbol.0 as f64).to_degrees();
                 debug!("[RDS-DSP] AGC: {:.2}, NCO: {:.2} Hz, I: {:.3}, Q: {:.3}, mag: {:.3}, phase: {:.1}°, locked: {}, symsync: {:.4}",
@@ -1507,7 +1506,7 @@ impl RdsDecoder {
             self.biphase_clock += 1;
             
             // Every 128 symbols, check which clock phase has better signal
-            if self.biphase_clock % 128 == 0 && self.biphase_clock > 0 {
+            if self.biphase_clock.is_multiple_of(128) && self.biphase_clock > 0 {
                 let mut even_sum = 0.0_f32;
                 let mut odd_sum = 0.0_f32;
                 for i in 0..64 {
@@ -1563,7 +1562,7 @@ impl RdsDecoder {
         // Debug: check input signal statistics
         static IQ_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dbg_count = IQ_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if dbg_count % 50 == 0 {
+        if dbg_count.is_multiple_of(50) {
             let input_rms: f32 = (input_i.iter().map(|x| x*x).sum::<f32>() / input_i.len() as f32).sqrt();
             debug!("[RDS-DSP-IQ] Input RMS I: {:.6}, Q: {:.6}, len: {}", 
                 input_rms,
@@ -1594,7 +1593,7 @@ impl RdsDecoder {
             // Debug: check signal levels at decimated rate
             static DEC_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dec_count = DEC_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if dec_count % 5000 == 0 {
+            if dec_count.is_multiple_of(5000) {
                 let filt_mag = (i_filt * i_filt + q_filt * q_filt).sqrt();
                 let agc_mag = (i_agc * i_agc + q_agc * q_agc).sqrt();
                 debug!("[RDS-DSP-IQ-LEVELS] Filt mag: {:.6}, AGC gain: {:.2}, AGC out mag: {:.6}",
@@ -1617,7 +1616,7 @@ impl RdsDecoder {
             // Debug: check signal going into symsync
             static SYMSYNC_DBG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let ss_count = SYMSYNC_DBG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if ss_count % 5000 == 0 {
+            if ss_count.is_multiple_of(5000) {
                 let rot_mag = (i_rot * i_rot + q_rot * q_rot).sqrt();
                 debug!("[RDS-PRE-SYMSYNC] Input to symsync: I={:.4}, Q={:.4}, mag={:.4}", i_rot, q_rot, rot_mag);
             }
@@ -1644,7 +1643,7 @@ impl RdsDecoder {
                 
                 // Debug output
                 self.debug_counter += 1;
-                if self.debug_counter % 5000 == 0 {
+                if self.debug_counter.is_multiple_of(5000) {
                     let mag = (psk_symbol.0 * psk_symbol.0 + psk_symbol.1 * psk_symbol.1).sqrt();
                     let sym_phase = psk_symbol.1.atan2(psk_symbol.0).to_degrees();
                     debug!("[RDS-DSP-IQ] AGC: {:.2}, I: {:.3}, Q: {:.3}, mag: {:.3}, sym_ph: {:.1}°",
@@ -1709,7 +1708,7 @@ impl RdsDecoder {
                 // Also print detailed sequence for first 200 symbols
                 static BIPHASE_DBG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let biphase_dbg = BIPHASE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if biphase_dbg >= 1000 && biphase_dbg < 1100 {
+                if (1000..1100).contains(&biphase_dbg) {
                     debug!("[RDS-BIPH-SEQ] sym={}, clock={}, pol={}, biphase_i={:.3}, bit={}, output={}",
                         biphase_dbg, self.biphase_clock, self.biphase_polarity, biphase_i, biphase_bit,
                         if self.biphase_clock % 2 == self.biphase_polarity { "Y" } else { "N" });
@@ -1818,11 +1817,10 @@ impl RdsDecoder {
             if let Some(pin) = &info.program_item {
                 println!("[RDS-1A] PIN: Day {}, {:02}:{:02}", pin.day, pin.hour, pin.minute);
             }
-            if let Some(lang) = info.language_code {
-                if let Some(lang_name) = self.rds_parser.language_name() {
+            if let Some(lang) = info.language_code
+                && let Some(lang_name) = self.rds_parser.language_name() {
                     println!("[RDS-1A] Language: {} (0x{:02X})", lang_name, lang);
                 }
-            }
             if let Some(ecc) = info.extended_country_code {
                 println!("[RDS-1A] ECC: 0x{:02X}", ecc);
             }
@@ -1852,13 +1850,11 @@ impl RdsDecoder {
                 if let Some(pty) = eon.program_type {
                     println!("[RDS-14A] EON PTY: {}", pty);
                 }
-                if let Some(has_link) = eon.has_linkage {
-                    if has_link {
-                        if let Some(lsn) = eon.linkage_set {
+                if let Some(has_link) = eon.has_linkage
+                    && has_link
+                        && let Some(lsn) = eon.linkage_set {
                             println!("[RDS-14A] Linkage Set: 0x{:03X}", lsn);
                         }
-                    }
-                }
             }
 
             self.bits.clear();

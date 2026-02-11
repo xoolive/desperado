@@ -66,14 +66,14 @@ fn design_rrc_filter(k: usize, m: usize, beta: f32) -> Vec<f32> {
     let kf = k as f32;
     let mf = m as f32;
 
-    for n in 0..h_len {
+    for (n, coef) in h.iter_mut().enumerate() {
         let nf = n as f32;
         // z is the normalized time in symbol periods, centered at m
         let z = nf / kf - mf;
 
         // Check for special condition where z equals zero
         if z.abs() < 1e-5 {
-            h[n] = 1.0 - beta + 4.0 * beta / PI;
+            *coef = 1.0 - beta + 4.0 * beta / PI;
         } else {
             let g = 1.0 - 16.0 * beta * beta * z * z;
             let g_squared = g * g;
@@ -84,13 +84,13 @@ fn design_rrc_filter(k: usize, m: usize, beta: f32) -> Vec<f32> {
                 let g2 = (0.25 * PI / beta).sin();
                 let g3 = 1.0 - 2.0 / PI;
                 let g4 = (0.25 * PI / beta).cos();
-                h[n] = beta / 2.0_f32.sqrt() * (g1 * g2 + g3 * g4);
+                *coef = beta / 2.0_f32.sqrt() * (g1 * g2 + g3 * g4);
             } else {
                 let t1 = ((1.0 + beta) * PI * z).cos();
                 let t2 = ((1.0 - beta) * PI * z).sin();
                 let t3 = 1.0 / (4.0 * beta * z);
                 let t4 = 4.0 * beta / (PI * (1.0 - 16.0 * beta * beta * z * z));
-                h[n] = t4 * (t1 + t2 * t3);
+                *coef = t4 * (t1 + t2 * t3);
             }
         }
     }
@@ -158,7 +158,7 @@ impl PolyphaseFilterBank {
     fn new(h: &[f32], npfb: usize) -> Self {
         let h_len = h.len();
         // Sub-filter length
-        let h_sub_len = (h_len + npfb - 1) / npfb;
+        let h_sub_len = h_len.div_ceil(npfb);
 
         // Decompose into polyphase components
         let mut filters = vec![vec![0.0f32; h_sub_len]; npfb];
