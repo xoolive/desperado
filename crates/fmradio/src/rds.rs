@@ -722,35 +722,35 @@ fn rds_data_from_word(word26: u32) -> u16 {
 /// JSON output for an RDS group (similar to redsea format)
 #[derive(Debug, Clone, Serialize)]
 pub struct RdsGroupJson {
-    /// PI code as hex string (e.g., "0xF212")
+    /// PI (Program Identification) code as hex string (e.g., "0xF212")
     pub pi: String,
-    /// Group type (e.g., "0A", "2A", "4A")
+    /// RDS Group type (e.g., "0A", "2A", "4A")
     pub group: String,
-    /// Traffic Program flag
+    /// TP (Traffic Program) flag
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tp: Option<bool>,
-    /// Program type name
+    /// PTY name (Program Type name, e.g., "News", "Music")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prog_type: Option<String>,
-    /// Program Service name (8 chars)
+    pub pty_name: Option<String>,
+    /// PS (Program Service) name (8 characters max)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ps: Option<String>,
-    /// RadioText (up to 64 chars)
+    /// RT (RadioText) scrolling message (up to 64 characters)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub radiotext: Option<String>,
-    /// Traffic Announcement flag
+    pub rt: Option<String>,
+    /// TA (Traffic Announcement) flag
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ta: Option<bool>,
     /// Music/Speech flag
     #[serde(skip_serializing_if = "Option::is_none")]
     pub music: Option<bool>,
-    /// Alternative frequencies list
+    /// AF (Alternative Frequencies) list in MHz
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub alt_freqs: Option<Vec<String>>,
-    /// Clock time info
+    pub af: Option<Vec<String>>,
+    /// CT (Clock Time) and date information
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub clock_time: Option<String>,
-    /// Partial group flag (some blocks missing)
+    pub ct: Option<String>,
+    /// Partial group flag (some blocks missing/invalid)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial: Option<bool>,
     /// Raw hex blocks for debugging
@@ -765,13 +765,13 @@ impl RdsGroupJson {
             pi: format!("0x{:04X}", pi),
             group: group_type.to_string(),
             tp: None,
-            prog_type: None,
+            pty_name: None,
             ps: None,
-            radiotext: None,
+            rt: None,
             ta: None,
             music: None,
-            alt_freqs: None,
-            clock_time: None,
+            af: None,
+            ct: None,
             partial: None,
             raw: None,
         }
@@ -1400,7 +1400,7 @@ impl RdsParser {
         // Create JSON output structure
         let mut json_out = RdsGroupJson::new(pi, &group_type_str);
         json_out.tp = Some(self.station_info.is_traffic_program);
-        json_out.prog_type = Some(self.program_type_name().to_string());
+        json_out.pty_name = Some(self.program_type_name().to_string());
         json_out.ta = Some(self.station_info.is_traffic_announcement);
         json_out.music = Some(self.station_info.is_music);
 
@@ -1456,18 +1456,28 @@ impl RdsParser {
                 let af1 = ((block3 >> 8) & 0xFF) as u8;
                 let af2 = (block3 & 0xFF) as u8;
 
+                if self.verbose {
+                    debug!("  [AF] Raw codes: AF1=0x{:02X} ({}), AF2=0x{:02X} ({})", af1, af1, af2, af2);
+                }
+
                 // AF code to frequency conversion: 87.5 + code*0.1 MHz (code 1-204)
                 // Stored in units of 10 kHz: 8750 + code*10
                 if af1 > 0 && af1 < 205 {
                     let freq_10khz = 8750u16 + (af1 as u16) * 10;
                     if !self.station_info.af_list.contains(&freq_10khz) {
                         self.station_info.af_list.push(freq_10khz);
+                        if self.verbose {
+                            debug!("  [AF] Added AF1: {:.1} MHz (code {})", (freq_10khz as f32) / 100.0, af1);
+                        }
                     }
                 }
                 if af2 > 0 && af2 < 205 {
                     let freq_10khz = 8750u16 + (af2 as u16) * 10;
                     if !self.station_info.af_list.contains(&freq_10khz) {
                         self.station_info.af_list.push(freq_10khz);
+                        if self.verbose {
+                            debug!("  [AF] Added AF2: {:.1} MHz (code {})", (freq_10khz as f32) / 100.0, af2);
+                        }
                     }
                 }
 
@@ -1784,11 +1794,16 @@ impl RdsParser {
                 // 4A - Clock/Time and Date
                 // Only version A is valid for time/date
 
-                // Extract Modified Julian Date from Block 2-3
-                // Block 2 bits 0-15, Block 3 bit 1 (17 bits total)
-                let mjd_high = block2 as u32; // 16 bits
-                let mjd_low = ((block3 >> 1) & 0x0001) as u32; // 1 bit from Block 3 bit 1
-                let mjd = (mjd_low << 16) | mjd_high;
+                // Extract Modified Julian Date from Block 2-3 (17 bits)
+                // Concatenate Block 2 and Block 3, then extract 17 bits starting at bit 1
+                // Format: [BLOCK2 (16 bits)] [BLOCK3 (16 bits)], extract bits 1-17
+                let concat = block3 as u32 | ((block2 as u32) << 16);
+                let mjd = (concat >> 1) & ((1u32 << 17) - 1);
+
+                if self.verbose {
+                    debug!("  [Time] Block2: 0x{:04X}, Block3: 0x{:04X}", block2, block3);
+                    debug!("  [Time] MJD extracted: {} (0x{:05X})", mjd, mjd);
+                }
 
                 // MJD to Gregorian calendar conversion
                 // Using standard algorithm from RDS spec
@@ -1806,10 +1821,14 @@ impl RdsParser {
                 // MJD to calendar date conversion
                 let mut year_utc = ((mjd_f - 15078.2) / 365.25) as i32;
                 let mut month_utc =
-                    ((mjd_f - 14956.1 - (year_utc as f64 * 365.25)) / 30.6001) as i32;
+                    ((mjd_f - 14956.1 - (year_utc as f64 * 365.25).trunc()) / 30.6001) as i32;
                 let day_utc =
-                    (mjd_f - 14956.0 - (year_utc as f64 * 365.25) - (month_utc as f64 * 30.6001))
+                    (mjd_f - 14956.0 - (year_utc as f64 * 365.25).trunc() - (month_utc as f64 * 30.6001).trunc())
                         as u8;
+
+                if self.verbose {
+                    debug!("  [Time] Conversion: year_pre={}, month_pre={}, day={}", year_utc, month_utc, day_utc);
+                }
 
                 if month_utc == 14 || month_utc == 15 {
                     year_utc += 1;
@@ -1817,6 +1836,10 @@ impl RdsParser {
                 }
                 year_utc += 1900;
                 month_utc -= 1;
+
+                if self.verbose {
+                    debug!("  [Time] After adjustment: year_post={}, month_post={}", year_utc, month_utc);
+                }
 
                 // Extract hour and minute from Block 3-4
                 // Hour: bits 12..8 of result spanning Block 3 bit 0 + Block 4 bits 15..12
@@ -2047,7 +2070,7 @@ impl RdsParser {
         }
         // Add radiotext if available
         if let Some(rt) = self.radio_text() {
-            json_out.radiotext = Some(rt);
+            json_out.rt = Some(rt);
         }
         // Add alternative frequencies if any
         if !self.station_info.af_list.is_empty() {
@@ -2057,7 +2080,14 @@ impl RdsParser {
                 .iter()
                 .map(|&f| format!("{:.1}", f as f64 / 100.0))
                 .collect();
-            json_out.alt_freqs = Some(af_strs);
+            json_out.af = Some(af_strs);
+        }
+        // Add clock time if available
+        if let Some(clock) = &self.station_info.clock_time {
+            json_out.ct = Some(format!(
+                "{}-{:02}-{:02} {:02}:{:02} UTC ({:+.1}h)",
+                clock.year, clock.month, clock.day, clock.hour, clock.minute, clock.local_offset
+            ));
         }
 
         // Queue JSON output
