@@ -22,7 +22,7 @@ tracing-subscriber = "0.3"
 industrial-io = { version = "0.5.2", optional = true } # together with pluto-sdr
 pluto-sdr = { version = "0.1.1", optional = true }
 rtl-sdr-rs = { version = "0.3", optional = true }
-rs-spy = { path = "../rs-spy", optional = true }
+rs-spy = { version = "0.2.1", path = "../rs-spy", optional = true }
 rusb = { version = "0.9", optional = true }
 soapysdr = { version = "0.4.5", optional = true }
 # For examples
