@@ -459,7 +459,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "desperado"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "approx",
  "clap 4.5.56",
@@ -592,7 +592,7 @@ checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
 
 [[package]]
 name = "fmradio"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "approx",
  "clap 4.5.56",
@@ -1386,7 +1386,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "rs-spy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "num-complex",
  "rusb",

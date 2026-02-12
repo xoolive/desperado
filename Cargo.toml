@@ -3,7 +3,7 @@ members = ["crates/desperado", "crates/fmradio", "crates/rs-spy"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Xavier Olive <git@xoolive.org>"]
 license = "MIT"
