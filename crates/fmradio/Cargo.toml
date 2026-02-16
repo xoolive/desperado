@@ -1,6 +1,8 @@
 [package]
 name = "fmradio"
 description = "An FM radio demodulator and RDS decoder in pure Rust"
+keywords = ["sdr", "radio", "fm", "stereo", "rds"]
+readme = "readme.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

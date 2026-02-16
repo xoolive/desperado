@@ -1,6 +1,8 @@
 [package]
 name = "rs-spy"
 description = "A pure Rust library for Airspy SDR devices"
+keywords = ["airspy", "sdr", "radio"]
+readme = "readme.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
