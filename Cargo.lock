@@ -1390,7 +1390,7 @@ version = "0.3.0"
 dependencies = [
  "num-complex",
  "rusb",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
 ]
