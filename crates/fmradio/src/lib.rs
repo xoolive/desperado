@@ -12,5 +12,5 @@ pub mod resampler;
 
 // Re-export main types for convenience
 pub use fm::{DeemphasisFilter, PhaseExtractor};
-pub use rds::RdsParser;
+pub use rds::{RdsDecoder, RdsParser, RdsResamplerCustom, StereoDecoderPLL};
 pub use resampler::AdaptiveResampler;

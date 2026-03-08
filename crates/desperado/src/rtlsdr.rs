@@ -322,6 +322,36 @@ impl RtlSdrReader {
             end: 0,
         })
     }
+
+    /// Retune the reader to a new center frequency.
+    pub fn tune(&mut self, center_freq: u32) -> error::Result<()> {
+        self.rtlsdr.set_center_freq(center_freq)?;
+        self.rtlsdr.reset_buffer()?;
+        self.pos = 0;
+        self.end = 0;
+        Ok(())
+    }
+
+    /// Change tuner gain mode/value.
+    pub fn set_gain(&mut self, gain: Gain) -> error::Result<()> {
+        match gain {
+            Gain::Manual(gain_db) => {
+                let gain_tenths = (gain_db * 10.0) as i32;
+                self.rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+            }
+            Gain::Auto => self.rtlsdr.set_tuner_gain(TunerGain::Auto)?,
+            Gain::Elements(_) => {
+                eprintln!(
+                    "Warning: RTL-SDR does not support element-based gain control, using auto gain"
+                );
+                self.rtlsdr.set_tuner_gain(TunerGain::Auto)?
+            }
+        };
+        self.rtlsdr.reset_buffer()?;
+        self.pos = 0;
+        self.end = 0;
+        Ok(())
+    }
 }
 
 impl Iterator for RtlSdrReader {

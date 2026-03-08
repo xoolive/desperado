@@ -10,6 +10,7 @@
 
 pub use error::{Error, Result};
 use futures::Stream;
+pub use metrics::{RfMetrics, RfMetricsCalculator};
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub mod airspy;
 pub mod dsp;
 pub mod error;
 pub mod iqread;
+pub mod metrics;
 #[cfg(feature = "pluto")]
 pub mod pluto;
 #[cfg(feature = "rtlsdr")]

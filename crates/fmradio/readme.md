@@ -69,6 +69,60 @@ Extract RDS data as JSON (newline-delimited, one group per line):
 cargo run --release -p fmradio -- -f 98.1M --json
 ```
 
+### Band Scan (Naive Signal Ranking)
+
+Quickly sweep a frequency range and rank channels by a fast RF score with optional RDS confirmation.
+
+Recommended default run (RTL-SDR):
+
+```bash
+cargo run --release -p fmradio --example fm_scan -- --source rtlsdr://
+```
+
+This default uses:
+- 87.5-108.0 MHz band
+- 100 kHz step
+- 90 ms dwell per step
+- startup gain calibration
+- PPM-aware peak search (`--ppm-estimate 0 --ppm-search 40 --ppm-steps 11`)
+- RDS confirmation enabled by default for candidates with `rf_score >= 2.0` (`--rds-verify-seconds 5` max per candidate)
+- RDS checks are only run on local RF peaks and spaced by `--rds-min-separation-khz` (default 250 kHz)
+- Smart frequency selection: picks highest channel power in ±100 kHz window, with fallback attempts if first verification fails
+
+Tune RDS confirmation workload:
+
+```bash
+cargo run --release -p fmradio --example fm_scan -- \
+  --source rtlsdr:// \
+  --rds-score-threshold 6.0 --rds-verify-seconds 4 --rds-min-separation-khz 300
+```
+
+`--rds-verify-seconds` is a maximum timeout per candidate: verification stops early as soon as the first non-empty RDS PS field is found.
+Use `--no-rds-verify` to disable RDS confirmation entirely.
+
+By default, `fm_scan` performs a short startup gain calibration (RTL-SDR) to reduce clipping.
+Use `--no-calibrate-gain` to disable it or `--gain <tenths_db>` to force a fixed gain.
+
+The scan reports per-frequency metrics (`chan dBFS`, `wide dBFS`, `peak kHz`, `clip %`, `kurtosis`) and a derived `rf_score`.
+Fast RF scoring is the primary ranking path; RDS acts as confirmation and prints `RDS: none` when no PS name is found within timeout.
+
+During sweep, rows with `rf_score` below threshold are shown as transient progress lines (overwritten by the next line).
+Rows with `rf_score >= --rds-score-threshold` are kept, RDS is checked immediately, and the line is printed with confirmation.
+If RDS verification happens at a different frequency than the triggering candidate (due to smart frequency selection), the output shows `verified @ X.X` to indicate which frequency was actually tuned.
+
+Channel power scoring evaluates multiple PPM-offset hypotheses in parallel for each frequency step to handle tuner drift.
+
+#### Scanner Performance
+
+Full FM band scan (87.5-108 MHz, 100 kHz steps, RDS enabled):
+- **Time:** ~4.5 minutes (266 seconds)
+- **Coverage:** 205 frequency steps
+- **RDS attempts:** Only on high-confidence candidates (typically 15-25 stations)
+- **CPU:** Single-threaded RF scoring + parallel PPM search
+- **Accuracy:** Correctly identifies station frequency within ±100 kHz window
+
+Use `--debug-rds-selection` to see detailed frequency selection and fallback logic during RDS verification.
+
 Example output:
 ```json
 {"group":"0A","ps":"KISS FM","af":[98.1,99.0,101.5]}

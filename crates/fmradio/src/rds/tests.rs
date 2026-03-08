@@ -1,5 +1,5 @@
 // Unit tests for RDS decoder
-// This file is included via #[cfg(test)] mod in rds.rs
+// This file is included via #[cfg(test)] mod in rds/mod.rs
 
 use super::*;
 
@@ -17,36 +17,40 @@ fn test_rds_syndrome_offset_word_a() {
     // Test that syndrome of offset word A equals SYNDROME_A
     // This is how RDS encoding works: for data=0, checkword=offset_word
     // produces the expected syndrome
-    let syn = rds_syndrome(OFFSET_WORD_A as u32);
+    let syn = rds_syndrome(constants::OFFSET_WORD_A as u32);
     assert_eq!(
-        syn, SYNDROME_A,
+        syn,
+        constants::SYNDROME_A,
         "Syndrome of OFFSET_WORD_A should be SYNDROME_A"
     );
 }
 
 #[test]
 fn test_rds_syndrome_offset_word_b() {
-    let syn = rds_syndrome(OFFSET_WORD_B as u32);
+    let syn = rds_syndrome(constants::OFFSET_WORD_B as u32);
     assert_eq!(
-        syn, SYNDROME_B,
+        syn,
+        constants::SYNDROME_B,
         "Syndrome of OFFSET_WORD_B should be SYNDROME_B"
     );
 }
 
 #[test]
 fn test_rds_syndrome_offset_word_c() {
-    let syn = rds_syndrome(OFFSET_WORD_C as u32);
+    let syn = rds_syndrome(constants::OFFSET_WORD_C as u32);
     assert_eq!(
-        syn, SYNDROME_C,
+        syn,
+        constants::SYNDROME_C,
         "Syndrome of OFFSET_WORD_C should be SYNDROME_C"
     );
 }
 
 #[test]
 fn test_rds_syndrome_offset_word_d() {
-    let syn = rds_syndrome(OFFSET_WORD_D as u32);
+    let syn = rds_syndrome(constants::OFFSET_WORD_D as u32);
     assert_eq!(
-        syn, SYNDROME_D,
+        syn,
+        constants::SYNDROME_D,
         "Syndrome of OFFSET_WORD_D should be SYNDROME_D"
     );
 }
@@ -66,31 +70,31 @@ fn test_rds_syndrome_data_only() {
 
 #[test]
 fn test_rds_offset_for_syndrome_a() {
-    let result = rds_offset_for_syndrome(SYNDROME_A);
+    let result = rds_offset_for_syndrome(constants::SYNDROME_A);
     assert_eq!(result, Some('A'), "SYNDROME_A should return 'A'");
 }
 
 #[test]
 fn test_rds_offset_for_syndrome_b() {
-    let result = rds_offset_for_syndrome(SYNDROME_B);
+    let result = rds_offset_for_syndrome(constants::SYNDROME_B);
     assert_eq!(result, Some('B'), "SYNDROME_B should return 'B'");
 }
 
 #[test]
 fn test_rds_offset_for_syndrome_c() {
-    let result = rds_offset_for_syndrome(SYNDROME_C);
+    let result = rds_offset_for_syndrome(constants::SYNDROME_C);
     assert_eq!(result, Some('C'), "SYNDROME_C should return 'C'");
 }
 
 #[test]
 fn test_rds_offset_for_syndrome_c_prime() {
-    let result = rds_offset_for_syndrome(SYNDROME_C_PRIME);
+    let result = rds_offset_for_syndrome(constants::SYNDROME_C_PRIME);
     assert_eq!(result, Some('c'), "SYNDROME_C_PRIME should return 'c'");
 }
 
 #[test]
 fn test_rds_offset_for_syndrome_d() {
-    let result = rds_offset_for_syndrome(SYNDROME_D);
+    let result = rds_offset_for_syndrome(constants::SYNDROME_D);
     assert_eq!(result, Some('D'), "SYNDROME_D should return 'D'");
 }
 
@@ -229,9 +233,9 @@ fn test_rds_parser_rt_needs_multiple_segments() {
 #[test]
 fn test_rds_pty_names() {
     // Verify some PTY names are correct
-    assert_eq!(PTY_NAMES[0], "None");
-    assert_eq!(PTY_NAMES[1], "News");
-    assert_eq!(PTY_NAMES[11], "Classical");
+    assert_eq!(constants::PTY_NAMES[0], "None");
+    assert_eq!(constants::PTY_NAMES[1], "News");
+    assert_eq!(constants::PTY_NAMES[11], "Classical");
 }
 
 #[test]
@@ -312,7 +316,7 @@ fn test_create_and_decode_valid_block_a() {
     // Test that a valid block A is detected and counted
     let mut parser = RdsParser::new();
     let data = 0x1234u16;
-    let block = create_rds_block(data, SYNDROME_A);
+    let block = create_rds_block(data, constants::SYNDROME_A);
     let bits = word_to_bits(block);
 
     parser.push_bits(&bits);
@@ -331,7 +335,7 @@ fn test_create_and_decode_valid_block_b() {
     // Test that a valid block B is detected
     let mut parser = RdsParser::new();
     let data = 0x5678u16;
-    let block = create_rds_block(data, SYNDROME_B);
+    let block = create_rds_block(data, constants::SYNDROME_B);
     let bits = word_to_bits(block);
 
     parser.push_bits(&bits);
@@ -359,16 +363,16 @@ fn test_rds_sync_acquisition_with_full_group() {
     let mut parser = RdsParser::new();
 
     // Create 4 blocks in sequence: A, B, C, D (first group - for sync)
-    let block_a = create_rds_block(0xF212, SYNDROME_A); // PI code
-    let block_b = create_rds_block(0x0408, SYNDROME_B); // Group 0A, segment 0
-    let block_c = create_rds_block(0xE20E, SYNDROME_C); // AF data
-    let block_d = create_rds_block(0x2020, SYNDROME_D); // PS "  "
+    let block_a = create_rds_block(0xF212, constants::SYNDROME_A); // PI code
+    let block_b = create_rds_block(0x0408, constants::SYNDROME_B); // Group 0A, segment 0
+    let block_c = create_rds_block(0xE20E, constants::SYNDROME_C); // AF data
+    let block_d = create_rds_block(0x2020, constants::SYNDROME_D); // PS "  "
 
     // Second group (same data, should be fully decoded)
-    let block_a2 = create_rds_block(0xF212, SYNDROME_A);
-    let block_b2 = create_rds_block(0x0408, SYNDROME_B);
-    let block_c2 = create_rds_block(0xE20E, SYNDROME_C);
-    let block_d2 = create_rds_block(0x2020, SYNDROME_D);
+    let block_a2 = create_rds_block(0xF212, constants::SYNDROME_A);
+    let block_b2 = create_rds_block(0x0408, constants::SYNDROME_B);
+    let block_c2 = create_rds_block(0xE20E, constants::SYNDROME_C);
+    let block_d2 = create_rds_block(0x2020, constants::SYNDROME_D);
 
     // Convert to bits and feed in sequence
     let mut all_bits = Vec::new();
