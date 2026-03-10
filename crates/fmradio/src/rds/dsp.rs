@@ -6,8 +6,8 @@
 //! - RDS decoder with carrier PLL, AGC, symbol sync, and biphase decoding
 //!
 //! References:
-//! - redsea (https://github.com/windytan/redsea)
-//! - liquid-dsp (https://github.com/jgaeddert/liquid-dsp)
+//! - redsea (<https://github.com/windytan/redsea>)
+//! - liquid-dsp (<https://github.com/jgaeddert/liquid-dsp>)
 
 use super::parser::{DIFlags, RdsGroupJson, RdsParser};
 use desperado::dsp::filters::LowPassFir;

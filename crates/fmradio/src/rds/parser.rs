@@ -9,7 +9,7 @@
 //! References:
 //! - IEC 62106:2015 (RDS Standard)
 //! - EN 50067:1998 (RDS Specification)
-//! - redsea (https://github.com/windytan/redsea)
+//! - redsea (<https://github.com/windytan/redsea>)
 
 use serde::Serialize;
 use std::fmt;
