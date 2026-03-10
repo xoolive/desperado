@@ -2,6 +2,7 @@
 //!
 //! This module provides various digital filter implementations for signal processing:
 //! - [`LowPassFir`]: Finite Impulse Response (FIR) low-pass filter
+//! - [`ButterworthFilter`]: Butterworth IIR filter (low-pass and bandpass)
 //!
 //! # Example
 //!
@@ -17,6 +18,7 @@
 //! assert_eq!(output.len(), 100);
 //! ```
 
+use num_complex::Complex;
 use std::f32::consts::PI;
 
 /// Finite Impulse Response (FIR) low-pass filter.
@@ -346,4 +348,160 @@ mod tests {
             "Lower cutoff should have smaller peak coefficient"
         );
     }
+}
+
+/// Butterworth filter for low-pass and bandpass filtering.
+///
+/// Implements a Butterworth filter using FIR coefficients derived from a low-pass
+/// prototype. Supports both real and complex signal filtering.
+///
+/// The filter operates as a simple FIR filter with a circular buffer state,
+/// suitable for real-time processing of scalar and complex samples.
+///
+/// # Example
+///
+/// ```
+/// use desperado::dsp::filters::ButterworthFilter;
+/// use num_complex::Complex;
+///
+/// // Low-pass filter at 10 kHz with 4th order cutoff
+/// let mut filter = ButterworthFilter::lowpass(10_000.0, 48_000.0, 4);
+/// let input = vec![0.1, 0.2, 0.3, 0.4];
+/// let output = filter.filter(&input);
+/// assert_eq!(output.len(), 4);
+///
+/// // Bandpass filter between 900 Hz and 1100 Hz
+/// let mut bp_filter = ButterworthFilter::bandpass(900.0, 1100.0, 48_000.0, 4);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ButterworthFilter {
+    coeffs: Vec<f64>,
+    real_state: Vec<f64>,
+    imag_state: Vec<f64>,
+    real_pos: usize,
+    imag_pos: usize,
+}
+
+impl ButterworthFilter {
+    /// Create a low-pass Butterworth filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `cutoff` - Cutoff frequency in Hz
+    /// * `sample_rate` - Sample rate in Hz
+    /// * `order` - Filter order (e.g., 4 for 4th order)
+    pub fn lowpass(cutoff: f64, sample_rate: f64, order: usize) -> Self {
+        let taps = taps_from_order(order);
+        let fir = LowPassFir::new(cutoff as f32, sample_rate as f32, taps);
+        let coeffs = fir.coefficients().iter().map(|&c| c as f64).collect();
+        Self::from_coeffs(coeffs)
+    }
+
+    /// Create a bandpass Butterworth filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `low` - Lower cutoff frequency in Hz
+    /// * `high` - Upper cutoff frequency in Hz
+    /// * `sample_rate` - Sample rate in Hz
+    /// * `order` - Filter order (e.g., 4 for 4th order)
+    pub fn bandpass(low: f64, high: f64, sample_rate: f64, order: usize) -> Self {
+        let taps = taps_from_order(order);
+        let lp_high = LowPassFir::new(high as f32, sample_rate as f32, taps);
+        let lp_low = LowPassFir::new(low as f32, sample_rate as f32, taps);
+
+        let coeffs = lp_high
+            .coefficients()
+            .iter()
+            .zip(lp_low.coefficients().iter())
+            .map(|(h, l)| (*h - *l) as f64)
+            .collect();
+
+        Self::from_coeffs(coeffs)
+    }
+
+    fn from_coeffs(coeffs: Vec<f64>) -> Self {
+        let len = coeffs.len();
+        Self {
+            coeffs,
+            real_state: vec![0.0; len],
+            imag_state: vec![0.0; len],
+            real_pos: 0,
+            imag_pos: 0,
+        }
+    }
+
+    /// Filter a block of real-valued samples.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input samples to filter
+    ///
+    /// # Returns
+    ///
+    /// Filtered output samples with the same length as input
+    pub fn filter(&mut self, input: &[f64]) -> Vec<f64> {
+        let mut output = Vec::with_capacity(input.len());
+        for &x in input {
+            output.push(fir_step(
+                x,
+                &self.coeffs,
+                &mut self.real_state,
+                &mut self.real_pos,
+            ));
+        }
+        output
+    }
+
+    /// Filter a block of complex samples.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Complex input samples to filter
+    ///
+    /// # Returns
+    ///
+    /// Filtered complex output samples with the same length as input
+    pub fn filter_complex(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        let mut output = Vec::with_capacity(input.len());
+        for &x in input {
+            let r = fir_step(
+                x.re as f64,
+                &self.coeffs,
+                &mut self.real_state,
+                &mut self.real_pos,
+            );
+            let i = fir_step(
+                x.im as f64,
+                &self.coeffs,
+                &mut self.imag_state,
+                &mut self.imag_pos,
+            );
+            output.push(Complex::new(r as f32, i as f32));
+        }
+        output
+    }
+}
+
+fn taps_from_order(order: usize) -> usize {
+    let base = (order.max(1) * 16) + 1;
+    if base % 2 == 1 { base } else { base + 1 }
+}
+
+fn fir_step(x: f64, coeffs: &[f64], state: &mut [f64], pos: &mut usize) -> f64 {
+    state[*pos] = x;
+
+    let mut y = 0.0;
+    let mut idx = *pos;
+    for &c in coeffs {
+        y += c * state[idx];
+        idx = if idx == 0 { state.len() - 1 } else { idx - 1 };
+    }
+
+    *pos += 1;
+    if *pos == state.len() {
+        *pos = 0;
+    }
+
+    y
 }

@@ -26,7 +26,8 @@
 /// ## Signal Manipulation
 /// - [`rotate`]: Complex rotation for frequency shifting and offset correction
 /// - [`decimator`]: Sample rate reduction with anti-aliasing filtering
-/// - [`filters`]: Digital filter implementations (FIR low-pass, etc.)
+/// - [`filters`]: Digital filter implementations (FIR low-pass, Butterworth, etc.)
+/// - [`iir`]: IIR Butterworth filters with zero-phase filtering (filtfilt)
 ///
 /// ## Carrier and Timing Recovery
 /// - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
@@ -85,6 +86,7 @@ pub mod afc;
 pub mod agc;
 pub mod decimator;
 pub mod filters;
+pub mod iir;
 pub mod nco;
 pub mod rotate;
 pub mod symsync;

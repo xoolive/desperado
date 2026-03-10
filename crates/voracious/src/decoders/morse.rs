@@ -1,105 +1,43 @@
-//! VOR radial decoding and output
+//! Generic Morse code parsing for radio navigation identifiers.
+//!
+//! This module provides reusable Morse code decoding functionality for extracting
+//! 3-letter identifiers (VOR, NDB, ILS, DME, etc.) from modulated audio signals.
+//!
+//! The algorithm:
+//! 1. Converts envelope signal to bit stream (threshold-based detection)
+//! 2. Extracts run lengths to identify dots (short) vs dashes (long)
+//! 3. Decodes Morse symbols to characters
+//! 4. Extracts 3-letter sliding windows with minimum complexity
+//! 5. Clusters near-matches (Hamming distance ≤ 1) and votes for consensus
+//!
+//! This approach handles noisy conditions by trying multiple thresholds and
+//! clustering similar results rather than relying on a single decoding.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::dsp::filter::{ButterworthFilter, envelope, hilbert_transform};
-use crate::dsp::iir::filtfilt_lowpass;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VorRadial {
-    pub timestamp: f64,
-    pub radial_deg: f64,
-    pub frequency_mhz: f64,
-    pub signal_quality: Option<SignalQualityMetrics>,
-    pub ident: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub morse_debug: Option<MorseDebugInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignalQualityMetrics {
-    pub clipping_ratio: String,
-    pub snr_30hz_db: f64,
-    pub snr_9960hz_db: f64,
-    pub lock_quality: String,
-    pub radial_variance: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MorseDebugInfo {
-    pub candidates: Vec<MorseCandidate>,
-    pub total_tokens: usize,
-    pub windows_total: usize,
-    pub ident_hits_seconds: Vec<f64>,
-    pub repeat_interval_seconds: Option<f64>,
-    pub next_expected_seconds: Option<f64>,
-    pub decode_attempts: Vec<MorseDecodeAttempt>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MorseCandidate {
-    pub token: String,
-    pub count: usize,
-    pub confidence: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MorseDecodeAttempt {
-    pub threshold_k: f64,
-    pub on_ratio: f64,
-    pub dot_ms: Option<f64>,
-    pub tokens_found: usize,
-    pub sample_tokens: Vec<String>,
-}
-
-impl VorRadial {
-    pub fn new(timestamp: f64, radial_deg: f64, frequency_mhz: f64) -> Self {
-        Self {
-            timestamp,
-            radial_deg,
-            frequency_mhz,
-            signal_quality: None,
-            ident: None,
-            morse_debug: None,
-        }
-    }
-
-    pub fn with_quality(mut self, quality: SignalQualityMetrics) -> Self {
-        self.signal_quality = Some(quality);
-        self
-    }
-
-    pub fn with_ident(mut self, ident: Option<String>) -> Self {
-        self.ident = ident;
-        self
-    }
-
-    pub fn with_morse_debug(mut self, debug: Option<MorseDebugInfo>) -> Self {
-        self.morse_debug = debug;
-        self
-    }
-}
-
+/// Decode Morse ident from an audio signal envelope.
+///
+/// # Arguments
+///
+/// * `env` - Signal envelope (magnitude over time)
+/// * `sample_rate` - Sample rate in Hz
+///
+/// # Returns
+///
+/// Tuple of (best_ident, all_tokens, decode_attempts)
+/// - `best_ident`: Most likely 3-letter identifier (or None if no valid result)
+/// - `all_tokens`: All extracted 3-letter tokens from all thresholds
+/// - `decode_attempts`: Metadata about each threshold attempt (for debugging)
 pub fn decode_morse_ident(
-    audio: &[f64],
+    env: &[f64],
     sample_rate: f64,
 ) -> (Option<String>, Vec<String>, Vec<MorseDecodeAttempt>) {
-    if audio.len() < (sample_rate as usize / 2) {
+    if env.is_empty() {
         return (None, Vec::new(), Vec::new());
     }
 
-    // Python-proven path: bandpass + Hilbert envelope + aggressive lowpass around 1020 Hz
-    // Use FIR bandpass (reliable) + IIR lowpass with zero-phase filtering for envelope
-    let mut bpf = ButterworthFilter::bandpass(900.0, 1100.0, sample_rate, 4);
-    let tone = bpf.filter(audio);
-    let analytic = hilbert_transform(&tone);
-    let env_raw = envelope(&analytic);
-
-    // Use proper IIR Butterworth lowpass with zero-phase filtering (filtfilt) via biquad crate
-    let env = filtfilt_lowpass(&env_raw, 40.0, sample_rate, 4);
-    let (all_tokens, attempts) = decode_tokens_from_env(&env, sample_rate);
-
+    let (all_tokens, attempts) = decode_tokens_from_env(env, sample_rate);
     let ident = pick_best_ident(&all_tokens);
     (ident, all_tokens, attempts)
 }
@@ -258,7 +196,7 @@ fn decode_tokens_from_bits(bits: &[bool]) -> Option<Vec<String>> {
     }
 }
 
-fn run_lengths(bits: &[bool]) -> Vec<(bool, usize)> {
+pub fn run_lengths(bits: &[bool]) -> Vec<(bool, usize)> {
     if bits.is_empty() {
         return Vec::new();
     }
@@ -402,4 +340,14 @@ fn morse_to_char(code: &str) -> Option<char> {
         "----." => '9',
         _ => return None,
     })
+}
+
+/// Metadata about a single Morse decode attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MorseDecodeAttempt {
+    pub threshold_k: f64,
+    pub on_ratio: f64,
+    pub dot_ms: Option<f64>,
+    pub tokens_found: usize,
+    pub sample_tokens: Vec<String>,
 }

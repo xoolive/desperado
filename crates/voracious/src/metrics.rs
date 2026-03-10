@@ -18,7 +18,7 @@
 //! - **Circular Variance:** Converts degree-based radials to unit vectors, measures spread
 //! - **Clipping Detection:** Tracks when |I| ≥ 0.98 or |Q| ≥ 0.98 during sample collection
 
-use crate::decode::SignalQualityMetrics;
+use crate::decoders::SignalQualityMetrics;
 
 /// Compute all signal quality metrics for a VOR measurement window.
 ///

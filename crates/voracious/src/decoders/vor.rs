@@ -1,8 +1,14 @@
-//! VOR signal demodulator
+//! VOR (VHF Omnidirectional Range) decoder.
 //!
-//! VOR (VHF Omnidirectional Range) stations transmit on 108-117.95 MHz.
-//! The signal consists of:
-//! - Carrier with voice/ident
+//! VOR (VHF Omnidirectional Range) demodulation and radial calculation.
+//! - Signal demodulation (frequency shift, filtering, subcarrier extraction)
+//! - 30 Hz reference and variable signal extraction
+//! - Radial calculation (bearing to station)
+//!
+//! Morse ident decoding is handled by the generic [`super::morse`] module.
+//!
+//! VOR stations transmit on 108-117.95 MHz with:
+//! - Carrier with voice/ident modulation
 //! - 30 Hz reference signal (FM modulated on 9960 Hz subcarrier)
 //! - 30 Hz variable signal (AM modulated, rotates mechanically or electronically)
 //!
@@ -10,9 +16,13 @@
 //! between the 30 Hz variable and reference signals.
 
 use num_complex::Complex;
+use rustfft::FftPlanner;
+use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-use super::filter::{ButterworthFilter, decimate, envelope, hilbert_transform};
+use super::morse;
+use desperado::dsp::filters::ButterworthFilter;
+use desperado::dsp::iir::filtfilt_lowpass;
 
 pub const VOR_SAMPLE_RATE_1_8M: u32 = 1_800_000;
 
@@ -174,6 +184,60 @@ impl VorDemodulator {
     }
 }
 
+fn decimate(input: &[f64], factor: usize) -> Vec<f64> {
+    if factor <= 1 {
+        return input.to_vec();
+    }
+    input.iter().step_by(factor).copied().collect()
+}
+
+fn hilbert_transform(signal: &[f64]) -> Vec<Complex<f64>> {
+    let n = signal.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(n);
+    let ifft = planner.plan_fft_inverse(n);
+
+    let mut spectrum: Vec<Complex<f64>> = signal
+        .iter()
+        .map(|&x| Complex::<f64>::new(x, 0.0))
+        .collect();
+
+    fft.process(&mut spectrum);
+
+    if n.is_multiple_of(2) {
+        for x in spectrum.iter_mut().take(n / 2).skip(1) {
+            *x *= 2.0;
+        }
+        for x in spectrum.iter_mut().skip(n / 2 + 1) {
+            *x = Complex::new(0.0, 0.0);
+        }
+    } else {
+        for x in spectrum.iter_mut().take(n.div_ceil(2)).skip(1) {
+            *x *= 2.0;
+        }
+        for x in spectrum.iter_mut().skip(n.div_ceil(2)) {
+            *x = Complex::new(0.0, 0.0);
+        }
+    }
+
+    ifft.process(&mut spectrum);
+
+    let scale = 1.0 / n as f64;
+    for x in &mut spectrum {
+        *x *= scale;
+    }
+
+    spectrum
+}
+
+fn envelope(signal: &[Complex<f64>]) -> Vec<f64> {
+    signal.iter().map(|c| c.norm()).collect()
+}
+
 /// Calculate VOR radial from phase difference using FFT
 pub fn calculate_radial(var_30: &[f64], ref_30: &[f64], sample_rate: f64) -> Option<f64> {
     let n = var_30.len().min(ref_30.len());
@@ -261,7 +325,6 @@ pub fn calculate_radial_vortrack(signal: &[f64], sample_rate: f64) -> Option<f64
     Some(avg)
 }
 
-/// Normalize signal to unit RMS
 fn normalize_signal(signal: &[f64]) -> Vec<f64> {
     let mean = signal.iter().sum::<f64>() / signal.len() as f64;
     let centered: Vec<f64> = signal.iter().map(|x| x - mean).collect();
@@ -343,4 +406,97 @@ impl VortrackFilter {
                 + (1.997_232_651_1 * self.yv[3]);
         self.yv[4]
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VorRadial {
+    pub timestamp: f64,
+    pub radial_deg: f64,
+    pub frequency_mhz: f64,
+    pub signal_quality: Option<SignalQualityMetrics>,
+    pub ident: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub morse_debug: Option<MorseDebugInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalQualityMetrics {
+    pub clipping_ratio: String,
+    pub snr_30hz_db: f64,
+    pub snr_9960hz_db: f64,
+    pub lock_quality: String,
+    pub radial_variance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MorseDebugInfo {
+    pub candidates: Vec<MorseCandidate>,
+    pub total_tokens: usize,
+    pub windows_total: usize,
+    pub ident_hits_seconds: Vec<f64>,
+    pub repeat_interval_seconds: Option<f64>,
+    pub next_expected_seconds: Option<f64>,
+    pub decode_attempts: Vec<morse::MorseDecodeAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MorseCandidate {
+    pub token: String,
+    pub count: usize,
+    pub confidence: f64,
+}
+
+impl VorRadial {
+    pub fn new(timestamp: f64, radial_deg: f64, frequency_mhz: f64) -> Self {
+        Self {
+            timestamp,
+            radial_deg,
+            frequency_mhz,
+            signal_quality: None,
+            ident: None,
+            morse_debug: None,
+        }
+    }
+
+    pub fn with_quality(mut self, quality: SignalQualityMetrics) -> Self {
+        self.signal_quality = Some(quality);
+        self
+    }
+
+    pub fn with_ident(mut self, ident: Option<String>) -> Self {
+        self.ident = ident;
+        self
+    }
+
+    pub fn with_morse_debug(mut self, debug: Option<MorseDebugInfo>) -> Self {
+        self.morse_debug = debug;
+        self
+    }
+}
+
+/// VOR-specific Morse ident decoding wrapper.
+///
+/// Applies VOR-specific signal processing (bandpass 900-1100 Hz for VOR ident)
+/// then delegates generic Morse parsing to [`morse::decode_morse_ident`].
+pub fn decode_morse_ident(
+    audio: &[f64],
+    sample_rate: f64,
+) -> (Option<String>, Vec<String>, Vec<morse::MorseDecodeAttempt>) {
+    if audio.len() < (sample_rate as usize / 2) {
+        return (None, Vec::new(), Vec::new());
+    }
+
+    // VOR-specific processing: bandpass + Hilbert envelope + lowpass
+    // Python-proven path: bandpass + Hilbert envelope + aggressive lowpass around 1020 Hz
+    // Use FIR bandpass (reliable) + IIR lowpass with zero-phase filtering for envelope
+    let mut bpf = ButterworthFilter::bandpass(900.0, 1100.0, sample_rate, 4);
+    let tone = bpf.filter(audio);
+    let analytic = hilbert_transform(&tone);
+    let env_raw = envelope(&analytic);
+
+    // Use proper IIR Butterworth lowpass with zero-phase filtering (filtfilt) via biquad crate
+    let env = filtfilt_lowpass(&env_raw, 40.0, sample_rate, 4);
+
+    // Delegate to generic Morse decoding
+    morse::decode_morse_ident(&env, sample_rate)
 }

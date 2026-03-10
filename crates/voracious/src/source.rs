@@ -45,8 +45,10 @@ use chrono::NaiveDateTime;
 use desperado::Gain;
 use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
 
-use crate::decode::{MorseCandidate, MorseDebugInfo, VorRadial, decode_morse_ident};
-use crate::dsp::VorDemodulator;
+use crate::decoders::{
+    MorseCandidate, MorseDebugInfo, VorDemodulator, VorRadial, calculate_radial_vortrack,
+    decode_morse_ident,
+};
 use crate::metrics;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
@@ -174,9 +176,7 @@ impl Iterator for IqSource {
             // Check if we have enough for a radial calculation window
             if self.audio_buffer.len() >= self.window_samples {
                 let audio_rate = self.demodulator.audio_rate();
-                if let Some(radial) =
-                    crate::dsp::vor::calculate_radial_vortrack(&self.audio_buffer, audio_rate)
-                {
+                if let Some(radial) = calculate_radial_vortrack(&self.audio_buffer, audio_rate) {
                     self.radial_history.push(radial);
                     if self.radial_history.len() > 20 {
                         self.radial_history.remove(0);

@@ -471,6 +471,7 @@ name = "desperado"
 version = "0.3.0"
 dependencies = [
  "approx",
+ "biquad",
  "clap 4.5.60",
  "dirs",
  "futures",
