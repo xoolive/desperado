@@ -1,0 +1,15 @@
+{
+  "source_file": "crates/voracious/samples/gqrx_20251107_182558_116000000_1800000_fc.raw",
+  "stem": "gqrx_20251107_182558_116000000_1800000_fc",
+  "vor_freq_mhz": 116.0,
+  "center_freq_mhz": 116.0,
+  "freq_offset_hz": 0.0,
+  "sample_rate_hz": 1800000,
+  "audio_rate_hz": 47368.42105263158,
+  "decim_factor": 38,
+  "duration_s": 27.0,
+  "audio_samples": 1278948,
+  "expected_ident": "ARL",
+  "expected_radial_min": 113.0,
+  "expected_radial_max": 118.0
+}
