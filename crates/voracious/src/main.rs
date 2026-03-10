@@ -2,10 +2,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use voracious::sources::{IqFormat, IqSource};
-
-/*#[cfg(feature = "rtlsdr")]
-use voracious::sources::RtlSdrSource;*/
+use voracious::{IqFormat, IqSource};
 
 #[derive(Parser)]
 #[command(name = "voracious")]
@@ -19,6 +16,7 @@ struct Cli {
     sample_rate: Option<u32>,
 
     /// I/Q format for file inputs (cu8, cs8, cs16, cf32)
+    /// gqrx files are always cf32, rtlsdr files are always cu8
     #[arg(short, long, default_value = "cf32")]
     format: String,
 
@@ -51,8 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || input_str.starts_with("airspy://")
         || input_str.starts_with("soapy://");
 
+    // Can be convenient to infer sample rate and center frequency from gqrx filenames
     let inferred = infer_gqrx_metadata(&cli.input);
 
+    // For SDR URIs, also attempt to infer from URI parameters
     let sample_rate = cli
         .sample_rate
         .or_else(|| {
@@ -65,6 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| inferred.as_ref().map(|m| m.sample_rate_hz))
         .unwrap_or(1_800_000);
 
+    // For center frequency, we prioritize CLI > URI > gqrx filename > default.
+    // This is because the center frequency is critical for correct decoding,
+    // and it's safer to require explicit specification if it can't be reliably
+    // inferred.
     let center_freq = match cli
         .center_freq
         .or_else(|| {
@@ -87,6 +91,8 @@ Use --center-freq explicitly or provide a gqrx file named like gqrx_*_<centerHz>
         }
     };
 
+    // gqrx files are always complex float
+    // rtlsdr files are always complex uint8 (cu8)
     let iq_format = match cli.format.parse::<IqFormat>() {
         Ok(v) => v,
         Err(_) => {

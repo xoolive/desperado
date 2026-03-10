@@ -365,6 +365,8 @@ pub enum DeviceConfig {
     RtlSdr(rtlsdr::RtlSdrConfig),
     #[cfg(feature = "soapy")]
     Soapy(soapy::SoapyConfig),
+    #[cfg(feature = "airspy")]
+    Airspy(airspy::AirspyConfig),
 }
 
 impl std::str::FromStr for DeviceConfig {
@@ -626,6 +628,69 @@ impl std::str::FromStr for DeviceConfig {
                     gain,
                 }))
             }
+            #[cfg(feature = "airspy")]
+            "airspy" => {
+                // Parse: airspy://[device_index]?freq=...&rate=...&gain=...
+                let (device_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let device_index = if device_part.is_empty() {
+                    0
+                } else {
+                    device_part.parse::<usize>().map_err(|_| {
+                        Error::other(format!("Invalid airspy device index: {}", device_part))
+                    })?
+                };
+
+                // Parse query parameters
+                let mut center_freq: Option<u32> = None;
+                let mut sample_rate: Option<u32> = None;
+                let mut gain = Gain::Auto;
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(parse_si_value(kv[1])?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(parse_si_value(kv[1])?);
+                        }
+                        "gain" => {
+                            if kv[1].to_lowercase() == "auto" {
+                                gain = Gain::Auto;
+                            } else {
+                                let gain_db: f64 = kv[1].parse().map_err(|_| {
+                                    Error::other(format!("Invalid gain: {}", kv[1]))
+                                })?;
+                                gain = Gain::Manual(gain_db);
+                            }
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::Airspy(airspy::AirspyConfig::new(
+                    device_index,
+                    center_freq,
+                    sample_rate,
+                    gain,
+                )))
+            }
             _ => Err(Error::other(format!("Unknown device scheme: {}", scheme))),
         }
     }
@@ -676,6 +741,9 @@ pub enum IqSource {
     /// SoapySDR-based IQ source (requires "soapy" feature)
     #[cfg(feature = "soapy")]
     SoapySdr(soapy::SoapySdrReader),
+    /// Airspy-based IQ source (requires "airspy" feature)
+    #[cfg(feature = "airspy")]
+    Airspy(airspy::AirspySdrReader),
 }
 
 impl Iterator for IqSource {
@@ -692,6 +760,8 @@ impl Iterator for IqSource {
             IqSource::RtlSdr(source) => source.next(),
             #[cfg(feature = "soapy")]
             IqSource::SoapySdr(source) => source.next(),
+            #[cfg(feature = "airspy")]
+            IqSource::Airspy(source) => source.next(),
         }
     }
 }
@@ -786,6 +856,11 @@ impl IqSource {
                 let source = soapy::SoapySdrReader::new(&cfg)?;
                 Ok(IqSource::SoapySdr(source))
             }
+            #[cfg(feature = "airspy")]
+            DeviceConfig::Airspy(cfg) => {
+                let source = airspy::AirspySdrReader::new(&cfg)?;
+                Ok(IqSource::Airspy(source))
+            }
         }
     }
 
@@ -848,6 +923,19 @@ impl IqSource {
         };
         let source = soapy::SoapySdrReader::new(&config)?;
         Ok(IqSource::SoapySdr(source))
+    }
+
+    #[cfg(feature = "airspy")]
+    /// Create a new Airspy-based I/Q source
+    pub fn from_airspy(
+        device_index: usize,
+        center_freq: u32,
+        sample_rate: u32,
+        gain: Gain,
+    ) -> error::Result<Self> {
+        let config = airspy::AirspyConfig::new(device_index, center_freq, sample_rate, gain);
+        let source = airspy::AirspySdrReader::new(&config)?;
+        Ok(IqSource::Airspy(source))
     }
 }
 
@@ -1079,6 +1167,10 @@ impl IqAsyncSource {
                 let async_reader = soapy::AsyncSoapySdrReader::new(cfg)?;
                 Ok(IqAsyncSource::SoapySdr(async_reader))
             }
+            #[cfg(feature = "airspy")]
+            DeviceConfig::Airspy(_) => Err(error::Error::other(
+                "Airspy is only supported via IqSource (sync), not IqAsyncSource".to_string(),
+            )),
         }
     }
 }

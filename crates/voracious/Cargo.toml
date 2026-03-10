@@ -1,11 +1,13 @@
 [package]
 name = "voracious"
-version = "0.1.0"
-edition = "2021"
-authors = ["Xavier Olive <git@xoolive.org>"]
-license = "MIT"
 description = "VOR signal decoder for aviation navigation"
-repository = "https://github.com/xoolive/voracious"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "readme.md"
 keywords = ["vor", "aviation", "radio", "decoder", "navigation"]
 
 [dependencies]

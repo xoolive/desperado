@@ -12,7 +12,7 @@
 use num_complex::Complex;
 use std::f64::consts::PI;
 
-use super::filter::{decimate, envelope, hilbert_transform, ButterworthFilter};
+use super::filter::{ButterworthFilter, decimate, envelope, hilbert_transform};
 
 pub const VOR_SAMPLE_RATE_1_8M: u32 = 1_800_000;
 

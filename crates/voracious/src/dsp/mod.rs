@@ -4,4 +4,4 @@ pub mod filter;
 pub mod iir;
 pub mod vor;
 
-pub use vor::{calculate_radial, VorDemodulator, VOR_SAMPLE_RATE_1_8M};
+pub use vor::{VOR_SAMPLE_RATE_1_8M, VorDemodulator, calculate_radial};

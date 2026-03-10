@@ -1,4 +1,38 @@
-//! I/Q sources built on desperado readers
+//! I/Q source handling for VOR signal processing
+//!
+//! This module provides unified input handling for both file and live device sources,
+//! with integrated VOR demodulation and signal quality analysis.
+//!
+//! # Overview
+//!
+//! The `IqSource` struct wraps synchronous file I/O or device access
+//! (e.g., Airspy, RTL-SDR, SoapySDR)
+//!
+//! # Input Sources
+//!
+//! Supports two classes of input:
+//!
+//! ## File-based Input
+//! - GQRX `.raw` recordings (complex float, auto-detected sample rate & center frequency from filename)
+//! - Raw I/Q binary files (cu8, cs8, cs16, cf32 formats supported)
+//!
+//! ## Live Devices (URI scheme)
+//! - `rtlsdr://[?freq=...&rate=...]` - RTL-SDR dongles
+//! - `soapy://[?freq=...&rate=...]` - SoapySDR compatible devices
+//! - `airspy://[device_idx][?freq=...&rate=...&lna=...&mixer=...&vga=...]` - Airspy HF+ / Mini
+//!
+//! # Processing Pipeline
+//!
+//! ```text
+//! Input (File/Device) → I/Q Samples → Demodulator → Audio (3 kHz)
+//!                                                    └─ Variable 30 Hz signal
+//!                                                    └─ Reference 30 Hz signal
+//!                                                    └─ Morse audio buffer
+//!
+//! Audio Buffer (3 samples) → Radial Calculation → Signal Quality Metrics
+//!                          → Morse Decoding → Ident Detection
+//!                          → VorRadial Output
+//! ```
 
 use std::collections::HashMap;
 use std::io;
@@ -9,29 +43,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::NaiveDateTime;
 #[cfg(feature = "airspy")]
 use desperado::Gain;
-use desperado::{
-    DeviceConfig, IqAsyncSource as BaseIqAsyncSource, IqFormat, IqSource as BaseIqSource,
-};
-#[cfg(feature = "airspy")]
-use futures::StreamExt;
+use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
 
-use crate::decode::{
-    decode_morse_ident, MorseCandidate, MorseDebugInfo, SignalQualityMetrics, VorRadial,
-};
+use crate::decode::{MorseCandidate, MorseDebugInfo, VorRadial, decode_morse_ident};
 use crate::dsp::VorDemodulator;
+use crate::metrics;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
-
-pub type IqAsyncSource = BaseIqAsyncSource;
-
-enum SourceInner {
-    Sync(BaseIqSource),
-    #[cfg(feature = "airspy")]
-    Async {
-        runtime: tokio::runtime::Runtime,
-        source: BaseIqAsyncSource,
-    },
-}
 
 enum TimestampBase {
     FileStartUnix(f64),
@@ -39,7 +57,7 @@ enum TimestampBase {
 }
 
 pub struct IqSource {
-    source: SourceInner,
+    source: BaseIqSource,
     demodulator: VorDemodulator,
     vor_frequency: f64,
     center_frequency: f64,
@@ -80,15 +98,14 @@ impl IqSource {
         let source = if is_live {
             build_device_source(&input, center_freq_hz, sample_rate)?
         } else {
-            let file_source = BaseIqSource::from_file(
+            BaseIqSource::from_file(
                 path_ref,
                 center_freq_hz,
                 sample_rate,
                 DEFAULT_CHUNK_SAMPLES,
                 format,
             )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            SourceInner::Sync(file_source)
+            .map_err(|e| io::Error::other(e.to_string()))?
         };
         let timestamp_base = if is_live {
             TimestampBase::LiveWallClock
@@ -131,20 +148,11 @@ impl Iterator for IqSource {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let samples = match &mut self.source {
-                SourceInner::Sync(source) => match source.next() {
-                    Some(Ok(s)) if s.is_empty() => return None,
-                    Some(Ok(s)) => s,
-                    Some(Err(e)) => return Some(Err(io::Error::other(e.to_string()))),
-                    None => return None,
-                },
-                #[cfg(feature = "airspy")]
-                SourceInner::Async { runtime, source } => match runtime.block_on(source.next()) {
-                    Some(Ok(s)) if s.is_empty() => return None,
-                    Some(Ok(s)) => s,
-                    Some(Err(e)) => return Some(Err(io::Error::other(e.to_string()))),
-                    None => return None,
-                },
+            let samples = match self.source.next() {
+                Some(Ok(s)) if s.is_empty() => return None,
+                Some(Ok(s)) => s,
+                Some(Err(e)) => return Some(Err(io::Error::other(e.to_string()))),
+                None => return None,
             };
 
             let freq_offset = self.vor_frequency - self.center_frequency;
@@ -259,7 +267,9 @@ impl Iterator for IqSource {
                                         .map(|(ident, _)| ident.clone());
                                     focus_ident
                                         .and_then(|id| self.ident_hit_timestamps.get(&id))
-                                        .and_then(|hits| estimate_repeat_interval_seconds(hits))
+                                        .and_then(|hits| {
+                                            metrics::estimate_repeat_interval_seconds(hits)
+                                        })
                                 },
                                 next_expected_seconds: {
                                     let focus_ident = self
@@ -270,7 +280,8 @@ impl Iterator for IqSource {
                                     focus_ident
                                         .and_then(|id| self.ident_hit_timestamps.get(&id))
                                         .and_then(|hits| {
-                                            let interval = estimate_repeat_interval_seconds(hits)?;
+                                            let interval =
+                                                metrics::estimate_repeat_interval_seconds(hits)?;
                                             let last = hits.last().copied()?;
                                             Some(last + interval)
                                         })
@@ -292,7 +303,7 @@ impl Iterator for IqSource {
                         None
                     };
 
-                    let signal_quality = compute_signal_quality(
+                    let signal_quality = metrics::compute_signal_quality(
                         window_clipping_ratio,
                         &self.audio_buffer,
                         &self.var_30_buffer,
@@ -309,8 +320,8 @@ impl Iterator for IqSource {
                     self.window_clip_count = 0;
 
                     let vor_radial = VorRadial::new(
-                        round_decimals(timestamp, 5),
-                        round_decimals(radial, 2),
+                        metrics::round_decimals(timestamp, 5),
+                        metrics::round_decimals(radial, 2),
                         self.vor_frequency / 1e6,
                     )
                     .with_quality(signal_quality)
@@ -339,7 +350,7 @@ fn build_device_source(
     uri: &str,
     center_freq_hz: u32,
     sample_rate: u32,
-) -> Result<SourceInner, io::Error> {
+) -> Result<BaseIqSource, io::Error> {
     if uri.starts_with("airspy://") {
         return build_airspy_source(uri, center_freq_hz, sample_rate);
     }
@@ -347,9 +358,7 @@ fn build_device_source(
     let configured_uri = ensure_tuning_query(uri, center_freq_hz, sample_rate);
     let config =
         DeviceConfig::from_str(&configured_uri).map_err(|e| io::Error::other(e.to_string()))?;
-    let source =
-        BaseIqSource::from_device_config(config).map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(SourceInner::Sync(source))
+    BaseIqSource::from_device_config(config).map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {
@@ -381,7 +390,7 @@ fn build_airspy_source(
     uri: &str,
     center_freq_hz: u32,
     sample_rate: u32,
-) -> Result<SourceInner, io::Error> {
+) -> Result<BaseIqSource, io::Error> {
     let rest = &uri["airspy://".len()..];
     let (device_part, query) = if let Some(pos) = rest.find('?') {
         (&rest[..pos], &rest[pos + 1..])
@@ -389,19 +398,15 @@ fn build_airspy_source(
         (rest, "")
     };
 
-    let device_index =
-        if device_part.is_empty() {
-            None
-        } else {
-            Some(device_part.parse::<usize>().map_err(|_| {
-                io::Error::other(format!("Invalid airspy device index: {device_part}"))
-            })?)
-        };
+    let device_index = if device_part.is_empty() {
+        0
+    } else {
+        device_part
+            .parse::<usize>()
+            .map_err(|_| io::Error::other(format!("Invalid airspy device index: {device_part}")))?
+    };
 
     let mut gain = Gain::Auto;
-    let mut lna_gain: Option<u8> = None;
-    let mut mixer_gain: Option<u8> = None;
-    let mut vga_gain: Option<u8> = None;
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -411,50 +416,27 @@ fn build_airspy_source(
         if kv.len() != 2 {
             continue;
         }
-        match kv[0] {
-            "gain" => {
-                gain =
-                    if kv[1].eq_ignore_ascii_case("auto") {
-                        Gain::Auto
-                    } else {
-                        Gain::Manual(kv[1].parse::<f64>().map_err(|_| {
-                            io::Error::other(format!("Invalid airspy gain: {}", kv[1]))
-                        })?)
-                    };
-            }
-            "lna" | "lna_gain" => {
-                lna_gain = Some(kv[1].parse::<u8>().map_err(|_| {
-                    io::Error::other(format!("Invalid airspy lna gain: {}", kv[1]))
-                })?);
-            }
-            "mixer" | "mixer_gain" => {
-                mixer_gain = Some(kv[1].parse::<u8>().map_err(|_| {
-                    io::Error::other(format!("Invalid airspy mixer gain: {}", kv[1]))
-                })?);
-            }
-            "vga" | "vga_gain" => {
-                vga_gain = Some(kv[1].parse::<u8>().map_err(|_| {
-                    io::Error::other(format!("Invalid airspy vga gain: {}", kv[1]))
-                })?);
-            }
-            _ => {}
+        if kv[0] == "gain" {
+            gain = if kv[1].eq_ignore_ascii_case("auto") {
+                Gain::Auto
+            } else {
+                Gain::Manual(
+                    kv[1]
+                        .parse::<f64>()
+                        .map_err(|_| io::Error::other(format!("Invalid airspy gain: {}", kv[1])))?,
+                )
+            };
         }
+        // Note: lna_gain, mixer_gain, vga_gain are part of AirspyConfig but
+        // currently not parsed from URI for simplicity
     }
 
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| io::Error::other(e.to_string()))?;
-    let source = runtime
-        .block_on(BaseIqAsyncSource::from_airspy(
-            device_index,
-            center_freq_hz,
-            sample_rate,
-            gain,
-            lna_gain,
-            mixer_gain,
-            vga_gain,
-        ))
+    let config =
+        desperado::airspy::AirspyConfig::new(device_index, center_freq_hz, sample_rate, gain);
+    let source = desperado::airspy::AirspySdrReader::new(&config)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(SourceInner::Async { runtime, source })
+    Ok(BaseIqSource::Airspy(source))
 }
 
 #[cfg(not(feature = "airspy"))]
@@ -462,7 +444,7 @@ fn build_airspy_source(
     _uri: &str,
     _center_freq_hz: u32,
     _sample_rate: u32,
-) -> Result<SourceInner, io::Error> {
+) -> Result<BaseIqSource, io::Error> {
     Err(io::Error::other(
         "airspy:// is not enabled. Rebuild with --features airspy",
     ))
@@ -519,176 +501,4 @@ fn parse_gqrx_start_unix(path: &Path) -> Option<f64> {
 
     let dt = NaiveDateTime::parse_from_str(&format!("{date}{time}"), "%Y%m%d%H%M%S").ok()?;
     Some(dt.and_utc().timestamp() as f64)
-}
-
-fn compute_signal_quality(
-    clipping_ratio: Option<f64>,
-    audio: &[f64],
-    var_30: &[f64],
-    ref_30: &[f64],
-    sample_rate: f64,
-    window_iq_count: usize,
-    radial_history: &[f64],
-) -> SignalQualityMetrics {
-    let snr_9960_db = tone_snr_db(
-        audio,
-        sample_rate,
-        9960.0,
-        &[9600.0, 9700.0, 9800.0, 10100.0, 10200.0, 10300.0],
-    );
-
-    let p30_var = rms_power(var_30);
-    let p30_ref = rms_power(ref_30);
-    let p30_min = p30_var.min(p30_ref);
-    let n30 = avg_tone_power(var_30, sample_rate, &[15.0, 20.0, 25.0, 35.0, 40.0, 45.0])
-        .min(avg_tone_power(
-            ref_30,
-            sample_rate,
-            &[15.0, 20.0, 25.0, 35.0, 40.0, 45.0],
-        ))
-        .max(1e-12);
-    let snr_30_db = 10.0 * ((p30_min + 1e-12) / n30).log10();
-
-    let lock_score = phase_lock_score(var_30, ref_30);
-
-    let radial_var = circular_variance(radial_history);
-
-    let clipping_ratio_raw = clipping_ratio.unwrap_or(0.0).clamp(0.0, 1.0);
-    let clipping_ratio_display = if clipping_ratio_raw == 0.0 {
-        // If no clipped sample is observed in this output window,
-        // report the measurement floor instead of a hard zero.
-        let resolution = 1.0 / (window_iq_count.max(1) as f64);
-        format!("<{:.2e}", resolution)
-    } else {
-        format_scientific(clipping_ratio_raw, 2)
-    };
-
-    SignalQualityMetrics {
-        clipping_ratio: clipping_ratio_display,
-        snr_30hz_db: round_decimals(snr_30_db, 2),
-        snr_9960hz_db: round_decimals(snr_9960_db, 2),
-        lock_quality: format_scientific(lock_score, 2),
-        radial_variance: format_scientific(radial_var, 2),
-    }
-}
-
-fn round_decimals(value: f64, decimals: u32) -> f64 {
-    let factor = 10_f64.powi(decimals as i32);
-    (value * factor).round() / factor
-}
-
-fn format_scientific(value: f64, decimals: usize) -> String {
-    format!("{value:.decimals$e}")
-}
-
-fn rms_power(signal: &[f64]) -> f64 {
-    if signal.is_empty() {
-        return 0.0;
-    }
-    signal.iter().map(|x| x * x).sum::<f64>() / signal.len() as f64
-}
-
-fn tone_power(signal: &[f64], sample_rate: f64, freq: f64) -> f64 {
-    if signal.len() < 4 || sample_rate <= 0.0 {
-        return 0.0;
-    }
-
-    let n = signal.len() as f64;
-    let mut i_sum = 0.0;
-    let mut q_sum = 0.0;
-    for (k, &x) in signal.iter().enumerate() {
-        let phase = 2.0 * std::f64::consts::PI * freq * k as f64 / sample_rate;
-        i_sum += x * phase.cos();
-        q_sum += x * phase.sin();
-    }
-
-    (i_sum * i_sum + q_sum * q_sum) / (n * n)
-}
-
-fn avg_tone_power(signal: &[f64], sample_rate: f64, freqs: &[f64]) -> f64 {
-    if freqs.is_empty() {
-        return 0.0;
-    }
-    let sum: f64 = freqs
-        .iter()
-        .map(|&f| tone_power(signal, sample_rate, f))
-        .sum();
-    sum / freqs.len() as f64
-}
-
-fn tone_snr_db(signal: &[f64], sample_rate: f64, tone_freq: f64, noise_freqs: &[f64]) -> f64 {
-    let p_sig = tone_power(signal, sample_rate, tone_freq).max(1e-12);
-    let p_noise = avg_tone_power(signal, sample_rate, noise_freqs).max(1e-12);
-    10.0 * (p_sig / p_noise).log10()
-}
-
-fn phase_lock_score(var_30: &[f64], ref_30: &[f64]) -> f64 {
-    let n = var_30.len().min(ref_30.len());
-    if n < 8 {
-        return 0.0;
-    }
-
-    let (mut dot, mut v2, mut r2) = (0.0, 0.0, 0.0);
-    for i in 0..n {
-        let v = var_30[i];
-        let r = ref_30[i];
-        dot += v * r;
-        v2 += v * v;
-        r2 += r * r;
-    }
-
-    let denom = (v2 * r2).sqrt();
-    if denom <= 1e-12 {
-        0.0
-    } else {
-        (dot.abs() / denom).clamp(0.0, 1.0)
-    }
-}
-
-fn circular_variance(radials_deg: &[f64]) -> f64 {
-    if radials_deg.len() < 2 {
-        return 1.0;
-    }
-    let mut c = 0.0;
-    let mut s = 0.0;
-    for &deg in radials_deg {
-        let r = deg.to_radians();
-        c += r.cos();
-        s += r.sin();
-    }
-    let n = radials_deg.len() as f64;
-    let r = (c * c + s * s).sqrt() / n;
-    (1.0 - r).clamp(0.0, 1.0)
-}
-
-fn estimate_repeat_interval_seconds(hits: &[f64]) -> Option<f64> {
-    if hits.len() < 2 {
-        return None;
-    }
-    let mut deltas: Vec<f64> = hits
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .filter(|d| *d >= 7.0)
-        .collect();
-    if deltas.is_empty() {
-        return None;
-    }
-
-    let mut folded_candidates = Vec::new();
-    for d in &deltas {
-        for n in 1..=5 {
-            let candidate = *d / n as f64;
-            if (6.0..=14.0).contains(&candidate) {
-                folded_candidates.push(candidate);
-            }
-        }
-    }
-
-    if !folded_candidates.is_empty() {
-        folded_candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        return Some(folded_candidates[folded_candidates.len() / 2]);
-    }
-
-    deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(deltas[deltas.len() / 2])
 }

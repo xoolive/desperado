@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::dsp::filter::{envelope, hilbert_transform, ButterworthFilter};
+use crate::dsp::filter::{ButterworthFilter, envelope, hilbert_transform};
 use crate::dsp::iir::filtfilt_lowpass;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
