@@ -71,6 +71,9 @@ jobs:
       - name: Run tests
         run: cargo test --verbose ${{ matrix.features }}
 
+      - name: Run integration tests (release, ignored)
+        run: cargo test --release --verbose ${{ matrix.features }} -- --include-ignored
+
   # Documentation build
   docs:
     name: Documentation

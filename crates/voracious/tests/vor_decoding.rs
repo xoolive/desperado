@@ -1,5 +1,12 @@
 //! Integration tests for VOR decoding using pre-demodulated audio fixtures.
 //!
+//! Tests that load fixture files are marked `#[ignore]` because they are slow
+//! in a debug build.  Run them with:
+//!
+//! ```sh
+//! cargo test --release -p voracious -- --include-ignored
+//! ```
+//!
 //! # Test Fixtures
 //!
 //! Fixtures are stored in `tests/data/` as pre-demodulated f32 binary files,
@@ -90,6 +97,7 @@ const ARL_STEM: &str = "gqrx_20251107_182558_116000000_1800000_fc";
 
 /// VORtrack radial should be in the expected range for KLO (~119°).
 #[test]
+#[ignore]
 fn test_klo_vortrack_radial_in_range() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -105,6 +113,7 @@ fn test_klo_vortrack_radial_in_range() {
 /// VORtrack radial on 3-second windows should be consistent with the full-signal result.
 /// This mirrors production behaviour where radial is computed per 3-second window.
 #[test]
+#[ignore]
 fn test_klo_vortrack_windowed_consistent() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -133,6 +142,7 @@ fn test_klo_vortrack_windowed_consistent() {
 
 /// Morse decoder should identify the KLO ident from audio using 15-second sliding windows.
 #[test]
+#[ignore]
 fn test_klo_morse_ident() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -153,6 +163,7 @@ fn test_klo_morse_ident() {
 
 /// VORtrack radial should be in the expected range for ARL (~115°).
 #[test]
+#[ignore]
 fn test_arl_vortrack_radial_in_range() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 
@@ -167,6 +178,7 @@ fn test_arl_vortrack_radial_in_range() {
 
 /// VORtrack radial on 3-second windows should be consistent with the full-signal result.
 #[test]
+#[ignore]
 fn test_arl_vortrack_windowed_consistent() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 
@@ -196,6 +208,7 @@ fn test_arl_vortrack_windowed_consistent() {
 /// Morse decoder should identify the ARL ident using sliding 15-second windows.
 /// ARL has strong signal with ident bursts at t≈0–3 s, 8–11 s, and 23–26 s.
 #[test]
+#[ignore]
 fn test_arl_morse_ident() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 

@@ -1,10 +1,7 @@
 target/
 waterfall.png
-
-# I/Q sample files
-*.iq
-*.wav
-*.bin
+samples
+references
 
 # macOS metadata
 Icon\r
