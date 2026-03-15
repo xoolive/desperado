@@ -13,6 +13,8 @@
 use reed_solomon::Decoder as RsDecoder;
 use tracing::{debug, info, warn};
 
+use crate::pad::{PadData, PadExtractor};
+
 /// Number of logical frames per superframe.
 const FRAMES_PER_SUPERFRAME: usize = 5;
 
@@ -617,11 +619,17 @@ impl AacDecoder {
 /// Complete DAB+ audio decoder.
 ///
 /// Feed it MSC logical frames and get back PCM audio samples.
+pub struct DabPlusDecodeOutput {
+    pub pcm: Vec<f32>,
+    pub metadata: Vec<PadData>,
+}
+
 pub struct DabPlusDecoder {
     pub superframe: SuperframeDecoder,
     pub aac: AacDecoder,
     /// Whether AAC decoder has been configured with ASC.
     aac_configured: bool,
+    pad: PadExtractor,
 }
 
 impl DabPlusDecoder {
@@ -631,6 +639,7 @@ impl DabPlusDecoder {
             superframe: SuperframeDecoder::new(bitrate_kbps),
             aac: AacDecoder::new(),
             aac_configured: false,
+            pad: PadExtractor::new(),
         }
     }
 
@@ -638,12 +647,24 @@ impl DabPlusDecoder {
     ///
     /// Returns decoded PCM f32 samples (interleaved stereo at 48 kHz typically)
     /// whenever a complete superframe's worth of audio is decoded.
+    #[allow(dead_code)]
     pub fn feed_frame(&mut self, frame: &[u8]) -> Vec<f32> {
+        self.feed_frame_with_metadata(frame).pcm
+    }
+
+    /// Feed one MSC logical frame and return audio + extracted metadata candidates.
+    pub fn feed_frame_with_metadata(&mut self, frame: &[u8]) -> DabPlusDecodeOutput {
         let mut pcm_out = Vec::new();
+        let mut metadata = Vec::new();
 
         let aus = match self.superframe.feed_frame(frame) {
             Some(aus) => aus,
-            None => return pcm_out,
+            None => {
+                return DabPlusDecodeOutput {
+                    pcm: pcm_out,
+                    metadata,
+                };
+            }
         };
 
         // Configure AAC decoder on first successful superframe
@@ -679,12 +700,16 @@ impl DabPlusDecoder {
 
         // Decode each AU
         for au in &aus {
+            metadata.extend(self.pad.extract_all_from_au(au));
             if let Some(samples) = self.aac.decode_au(au) {
                 pcm_out.extend_from_slice(&samples);
             }
         }
 
-        pcm_out
+        DabPlusDecodeOutput {
+            pcm: pcm_out,
+            metadata,
+        }
     }
 }
 

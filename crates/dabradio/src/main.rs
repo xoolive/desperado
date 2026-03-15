@@ -14,6 +14,7 @@ mod pad;
 use clap::Parser;
 use crossbeam_channel as channel;
 use desperado::IqFormat;
+use pad::PadData;
 use tinyaudio::prelude::*;
 use tracing::{debug, info, warn};
 
@@ -23,7 +24,7 @@ const AUDIO_RATE: usize = 48_000;
 #[command(name = "dabradio", about = "DAB/DAB+ digital radio decoder")]
 struct Cli {
     /// Source: file path to IQ recording
-    source: String,
+    source: Option<String>,
 
     /// DAB channel (e.g. "12A", "12C")
     #[arg(long)]
@@ -40,6 +41,10 @@ struct Cli {
     /// List services and exit (no audio)
     #[arg(long)]
     list: bool,
+
+    /// List all standard DAB Band III channels and exit
+    #[arg(long)]
+    list_channels: bool,
 
     /// Output as JSON
     #[arg(long)]
@@ -61,6 +66,14 @@ struct Cli {
     #[arg(long)]
     no_audio: bool,
 
+    /// Print extracted PAD/DLS metadata candidates while decoding
+    #[arg(long)]
+    metadata: bool,
+
+    /// Save MOT slideshow images to directory (e.g. --slideshow ./images)
+    #[arg(long)]
+    slideshow: Option<String>,
+
     /// Debug: bypass time de-interleaving in MSC
     #[arg(long)]
     bypass_deinterleave: bool,
@@ -71,6 +84,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    if cli.list_channels {
+        print_channels(cli.json);
+        return Ok(());
+    }
+
+    if cli.channel.is_some() && cli.freq.is_some() {
+        warn!("Both --channel and --freq were provided; using --channel");
+    }
+
+    let source = cli
+        .source
+        .as_ref()
+        .ok_or("Source file path is required unless --list-channels is used")?;
+
     // Resolve center frequency
     let center_freq = if let Some(channel) = &cli.channel {
         constants::channel_frequency(channel)
@@ -80,6 +107,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         return Err("Either --channel or --freq must be specified".into());
     };
+
+    if cli.channel.is_none() {
+        if constants::is_band_iii_frequency(center_freq) {
+            let (nearest_name, nearest_hz, delta_hz) = constants::nearest_channel(center_freq);
+            if delta_hz > 0 {
+                warn!(
+                    "Frequency {} Hz is in Band III but not on a standard DAB channel center; nearest is {} ({} Hz, delta {} Hz)",
+                    center_freq, nearest_name, nearest_hz, delta_hz,
+                );
+            }
+        } else {
+            let (nearest_name, nearest_hz, delta_hz) = constants::nearest_channel(center_freq);
+            warn!(
+                "Frequency {} Hz is outside DAB Band III ({}..={} Hz); nearest channel is {} ({} Hz, delta {} Hz)",
+                center_freq,
+                constants::BAND_III_MIN_HZ,
+                constants::BAND_III_MAX_HZ,
+                nearest_name,
+                nearest_hz,
+                delta_hz,
+            );
+        }
+    }
 
     // Parse IQ format
     let iq_format = match cli.format.as_str() {
@@ -92,13 +142,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         "Opening {} (freq={} Hz, format={})",
-        cli.source, center_freq, cli.format
+        source, center_freq, cli.format
     );
 
     // Open IQ source using desperado's synchronous reader
     let chunk_size = constants::T_F; // One frame's worth of samples
     let source = desperado::iqread::IqRead::from_file(
-        &cli.source,
+        source,
         center_freq,
         constants::SAMPLE_RATE,
         chunk_size,
@@ -115,6 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dab_plus_decoder: Option<audio::DabPlusDecoder> = None;
     let mut msc_output: Vec<Vec<u8>> = Vec::new();
     let decoding_service = cli.service.is_some();
+    let mut mot_image_count = 0usize;
 
     // Audio output setup (tinyaudio + crossbeam channel)
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 4); // 4 seconds buffer
@@ -205,18 +256,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Feed to DAB+ decoder for audio
                         if let Some(ref mut dab_dec) = dab_plus_decoder {
-                            let pcm = dab_dec.feed_frame(&decoded);
-                            if !pcm.is_empty() && _device.is_some() {
+                            let decoded_out = dab_dec.feed_frame_with_metadata(&decoded);
+
+                            // Handle PAD metadata (DLS text and MOT slideshows)
+                            for item in &decoded_out.metadata {
+                                match item {
+                                    PadData::Dls(dls) => {
+                                        if cli.metadata {
+                                            eprintln!("DLS: {}", dls.text);
+                                        }
+                                    }
+                                    PadData::Mot(mot) => {
+                                        mot_image_count += 1;
+                                        let ext = if mot.content_type.contains("png") {
+                                            "png"
+                                        } else {
+                                            "jpg"
+                                        };
+                                        if cli.metadata {
+                                            eprintln!(
+                                                "MOT: {} bytes, type={}, name={:?}",
+                                                mot.data.len(),
+                                                mot.content_type,
+                                                mot.content_name
+                                            );
+                                        }
+                                        // Save to slideshow directory if specified
+                                        if let Some(ref dir) = cli.slideshow {
+                                            let filename = format!(
+                                                "{}/slide_{:03}.{}",
+                                                dir, mot_image_count, ext
+                                            );
+                                            if let Err(e) = std::fs::write(&filename, &mot.data) {
+                                                warn!("Failed to write {}: {}", filename, e);
+                                            } else {
+                                                info!("Saved slideshow image: {}", filename);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !decoded_out.pcm.is_empty() && _device.is_some() {
                                 // Send PCM samples to audio output
                                 if is_file_source {
                                     // Blocking send — audio buffer controls pacing
-                                    for sample in &pcm {
+                                    for sample in &decoded_out.pcm {
                                         if tx.send(*sample).is_err() {
                                             break;
                                         }
                                     }
                                 } else {
-                                    for sample in &pcm {
+                                    for sample in &decoded_out.pcm {
                                         if tx.try_send(*sample).is_err() {
                                             break;
                                         }
@@ -303,6 +394,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_channels(json: bool) {
+    let channels = constants::band_iii_channels();
+
+    if json {
+        let rows: Vec<serde_json::Value> = channels
+            .iter()
+            .map(|(name, hz)| {
+                serde_json::json!({
+                    "channel": name,
+                    "frequency_hz": hz,
+                    "frequency_mhz": (*hz as f64) / 1_000_000.0,
+                })
+            })
+            .collect();
+        if let Ok(s) = serde_json::to_string_pretty(&rows) {
+            println!("{}", s);
+        }
+        return;
+    }
+
+    println!("DAB Band III channels:");
+    println!("{:<8} {:<12} Frequency", "Channel", "Hz");
+    println!("{}", "-".repeat(40));
+    for (name, hz) in channels {
+        println!(
+            "{:<8} {:<12} {:.3} MHz",
+            name,
+            hz,
+            (*hz as f64) / 1_000_000.0
+        );
+    }
 }
 
 /// Try to find the requested service and initialize an MSC handler for it.
