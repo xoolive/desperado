@@ -1,0 +1,29 @@
+[package]
+name = "dabradio"
+description = "A DAB/DAB+ digital radio decoder"
+keywords = ["sdr", "radio", "dab", "ofdm", "digital-radio"]
+readme = "readme.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dabradio"
+path = "src/main.rs"
+
+[dependencies]
+desperado = { version = "0.3.0", path = "../desperado" }
+num-complex = "0.4"
+rustfft = "6"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+fdk-aac = "0.8"
+reed-solomon = "0.2"
+tinyaudio = "0.1"
+crossbeam-channel = "0.5"
