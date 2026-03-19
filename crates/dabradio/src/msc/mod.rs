@@ -248,6 +248,17 @@ impl MscHandler {
         }
 
         self.frames_decoded += 1;
+
+        // Debug: log first few bytes of decoded frame to verify data integrity
+        if self.frames_decoded <= 3 {
+            debug!(
+                "MSC decoded frame {}: {} bytes, first 16: {:02X?}",
+                self.frames_decoded,
+                bytes.len(),
+                &bytes[..16.min(bytes.len())]
+            );
+        }
+
         Some(bytes)
     }
 

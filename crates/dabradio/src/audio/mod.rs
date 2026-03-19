@@ -382,6 +382,15 @@ impl SuperframeDecoder {
         // On a clean signal the header bytes are usually error-free,
         // so fire code passes on the raw data. RS corrects the rest.
         if !fire_code_check(&self.sf_buf) {
+            // Debug: log first few bytes of superframe header to understand why fire code fails
+            if self.superframes_decoded == 0 && self.frame_count == 0 {
+                debug!(
+                    "Fire code check failed. Header bytes: {:02X?}, stored_crc=0x{:04X}, calc_crc=0x{:04X}",
+                    &self.sf_buf[..16.min(self.sf_buf.len())],
+                    (self.sf_buf[0] as u16) << 8 | self.sf_buf[1] as u16,
+                    fire_code_crc(&self.sf_buf[2..11.min(self.sf_buf.len())])
+                );
+            }
             return None;
         }
 

@@ -2,6 +2,7 @@
 
 use crate::constants::*;
 use num_complex::Complex;
+use tracing::trace;
 
 /// Build the frequency de-interleaving permutation table for Mode I.
 ///
@@ -103,6 +104,31 @@ pub fn dqpsk_decode(symbols: &[Vec<Complex<f32>>]) -> Vec<Vec<i8>> {
             // This matches welle.io: ibits[i] = -real(r1) * ab1
             soft_bits[i] = (-r1.re * scale).clamp(-127.0, 127.0) as i8;
             soft_bits[K + i] = (-r1.im * scale).clamp(-127.0, 127.0) as i8;
+        }
+
+        // Log soft bit statistics for the first 3 symbols (FIC)
+        if sym_idx <= 3 {
+            let sum_abs: i64 = soft_bits.iter().map(|&x| (x as i64).abs()).sum();
+            let avg_abs = sum_abs as f64 / (K * 2) as f64;
+            let count_high: usize = soft_bits.iter().filter(|&&x| x.abs() > 50).count();
+            // Print first 20 soft bits for symbol 1
+            if sym_idx == 1 {
+                let first_20: Vec<i8> = soft_bits[..20].to_vec();
+                trace!(
+                    sym_idx,
+                    avg_abs = format!("{:.1}", avg_abs),
+                    count_high,
+                    first_20 = ?first_20,
+                    "DQPSK soft bit stats"
+                );
+            } else {
+                trace!(
+                    sym_idx,
+                    avg_abs = format!("{:.1}", avg_abs),
+                    count_high,
+                    "DQPSK soft bit stats"
+                );
+            }
         }
 
         all_soft_bits.push(soft_bits);

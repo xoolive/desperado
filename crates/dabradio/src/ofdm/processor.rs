@@ -34,6 +34,8 @@ enum SyncState {
     NeedPrsCorrelation,
     /// Synced — ready to process frame data.
     Synced,
+    /// Waiting to skip null symbol (have processed frame but need more samples).
+    NeedNullSkip,
 }
 
 /// OFDM processor: consumes IQ samples and produces OFDM frames.
@@ -54,6 +56,11 @@ pub struct OfdmProcessor {
     /// Running phase for frequency correction — continuous across frames.
     /// This matches welle.io's `localPhase` which never resets.
     running_phase: f32,
+    /// True if we just came from null detection (buffer at guard start).
+    /// False if we came from successful frame processing (buffer at useful start).
+    from_null_detect: bool,
+    /// Count of consecutive PRS correlation failures (for re-acquisition).
+    prs_fail_count: u32,
 }
 
 impl OfdmProcessor {
@@ -77,6 +84,8 @@ impl OfdmProcessor {
             coarse_freq_carriers: 0,
             last_prs_snr: 0.0,
             running_phase: 0.0,
+            from_null_detect: true,
+            prs_fail_count: 0,
         }
     }
 
@@ -184,34 +193,101 @@ impl OfdmProcessor {
                     // the phase accumulator. We don't know exactly how many null
                     // samples were consumed, so we just let the phase drift here.
                     // This is fine for initial sync — we'll re-estimate freq anyway.
+                    self.from_null_detect = true;
                     self.state = SyncState::NeedPrsCorrelation;
                 }
 
                 SyncState::NeedPrsCorrelation => {
-                    // We need T_U samples to run PRS correlation.
-                    // After null detection or null consumption, buffer[0] ≈ PRS guard start.
+                    // After null detection: buffer[0] ≈ PRS guard start
+                    // After frame+drain: buffer[0] ≈ PRS guard start (after NeedNullSkip)
+                    trace!(
+                        frame_count = self.frame_count,
+                        buffer_len = self.buffer.len(),
+                        from_null_detect = self.from_null_detect,
+                        "Entering PRS correlation state"
+                    );
+
+                    // Use PRS correlation to find exact timing
                     let (prs_start, prs_snr) = self.find_prs_start();
                     if prs_start < 0 {
                         // Not enough data — wait for more
                         break;
                     }
-                    if prs_snr < 5.0 {
-                        // PRS correlation too weak — frame alignment likely lost
-                        // (e.g. due to dropped samples). Re-acquire from null detection.
-                        debug!(
-                            snr = format!("{:.2}", prs_snr),
-                            "PRS correlation failed, re-acquiring sync"
-                        );
-                        self.state = SyncState::NeedNullDetect;
-                        continue;
+
+                    let best_lag = prs_start - T_G as i32;
+
+                    // For frame-to-frame tracking, if PRS SNR is low, the correlation is unreliable.
+                    // In this case, trust the timing and just drain T_G samples to get to useful start.
+                    // For initial sync (from_null_detect), we need good PRS correlation.
+                    let drain_count = if self.from_null_detect {
+                        // Initial sync - use PRS correlation result
+                        if prs_snr < 5.0 || best_lag.abs() > 1500 {
+                            debug!(
+                                snr = format!("{:.2}", prs_snr),
+                                best_lag,
+                                frame_count = self.frame_count,
+                                "PRS correlation failed during initial sync, re-acquiring"
+                            );
+                            self.state = SyncState::NeedNullDetect;
+                            continue;
+                        }
+                        prs_start as usize
+                    } else {
+                        // Frame-to-frame tracking: trust timing, just skip guard interval.
+                        // PRS correlation during tracking is unreliable because the
+                        // frequency-corrected PRS doesn't match the ideal reference
+                        // (the correction removes the carrier offset but introduces
+                        // a starting-phase dependency). Instead, we trust that the
+                        // null skip placed us correctly and just drain T_G to reach
+                        // the PRS useful start. If timing drifts, the CP correlation
+                        // in process_frame will detect it via fine_freq changes.
+                        //
+                        // Fall back to re-acquisition only if PRS SNR is extremely
+                        // poor AND the lag suggests we're completely lost.
+                        if prs_snr > 10.0 && best_lag.abs() < 100 {
+                            // Good PRS correlation, use for fine timing
+                            self.prs_fail_count = 0;
+                            prs_start as usize
+                        } else {
+                            // PRS correlation failed — re-acquire sync immediately.
+                            // Don't try to continue with estimated timing, as even a
+                            // small timing error produces corrupted OFDM symbols that
+                            // cascade into MSC errors and audio dropouts.
+                            self.prs_fail_count += 1;
+                            debug!(
+                                snr = format!("{:.1}", prs_snr),
+                                best_lag,
+                                consecutive = self.prs_fail_count,
+                                "PRS lost, re-acquiring sync"
+                            );
+                            self.state = SyncState::NeedNullDetect;
+                            continue;
+                        }
+                    };
+
+                    // Check that we have enough data for the full frame BEFORE
+                    // draining the PRS guard. This prevents the state machine from
+                    // splitting PRS correlation and frame processing across process()
+                    // calls, which would cause issues if new USB data appended between
+                    // calls has a sample gap.
+                    let frame_data_len = T_U + (L_SYMBOLS - 1) * T_S;
+                    if self.buffer.len() < drain_count + frame_data_len {
+                        // Not enough data yet — wait without changing state.
+                        // PRS correlation will be redone on next call with fresh data.
+                        break;
                     }
+
                     // Drain up to the PRS useful-part start
-                    if prs_start > 0 {
-                        // Apply freq correction to the drained samples to keep phase continuous
-                        let drain_count = prs_start as usize;
+                    if drain_count > 0 {
                         let mut drained: Vec<Complex<f32>> = self.buffer[..drain_count].to_vec();
                         self.apply_freq_correction(&mut drained);
                         self.buffer.drain(..drain_count);
+                        trace!(
+                            drain_count,
+                            best_lag,
+                            from_null_detect = self.from_null_detect,
+                            "PRS sync: drained to PRS useful start"
+                        );
                     }
                     self.last_prs_snr = prs_snr;
                     self.state = SyncState::Synced;
@@ -219,10 +295,6 @@ impl OfdmProcessor {
 
                 SyncState::Synced => {
                     // buffer[0] = PRS useful-part start.
-                    // Frame layout:
-                    //   PRS useful: [0, T_U)
-                    //   75 data symbols: each T_S samples (guard + useful)
-                    //   Total: T_U + 75 * T_S = 193448
                     let frame_data_len = T_U + (L_SYMBOLS - 1) * T_S;
                     if self.buffer.len() < frame_data_len {
                         break;
@@ -233,36 +305,49 @@ impl OfdmProcessor {
 
                     if let Some(frame) = frame {
                         // Drain the processed frame data
+                        trace!(
+                            frame_data_len,
+                            buffer_len_before = self.buffer.len(),
+                            "Draining frame data"
+                        );
                         self.buffer.drain(..frame_data_len);
                         self.frame_count += 1;
                         frames.push(frame);
 
-                        // After the frame, we expect T_NULL samples of null symbol,
-                        // then T_G samples of PRS guard, then T_U of PRS useful.
-                        //
-                        // welle.io reads T_NULL for the null symbol, then T_U for PRS
-                        // correlation (which starts at the PRS guard).
-                        //
-                        // We consume ONLY T_NULL samples here so that buffer[0] is at
-                        // the PRS guard interval start. find_prs_start() expects
-                        // buffer[0] ≈ guard start and looks at buffer[T_G..T_G+T_U]
-                        // for the PRS useful part.
-                        if self.buffer.len() >= T_NULL {
-                            // Apply freq correction to null samples for phase continuity
-                            let mut null_samples: Vec<Complex<f32>> =
-                                self.buffer[..T_NULL].to_vec();
-                            self.apply_freq_correction(&mut null_samples);
-                            self.buffer.drain(..T_NULL);
-                            // Go directly to PRS correlation (no null re-detection)
-                            self.state = SyncState::NeedPrsCorrelation;
-                        } else {
-                            // Not enough data for null consumption yet — wait for more
-                            self.state = SyncState::NeedPrsCorrelation;
-                            break;
-                        }
+                        // After the frame, we're at the null symbol start.
+                        // Transition to NeedNullSkip to handle the null symbol.
+                        self.state = SyncState::NeedNullSkip;
+                        // Continue to process NeedNullSkip state
                     } else {
                         break;
                     }
+                }
+
+                SyncState::NeedNullSkip => {
+                    // We're at the null symbol start. Skip it while maintaining phase.
+                    if self.buffer.len() < T_NULL {
+                        // Not enough samples for null skip, wait for more data
+                        break;
+                    }
+
+                    trace!(
+                        t_null = T_NULL,
+                        buffer_len = self.buffer.len(),
+                        "Skipping null symbol"
+                    );
+                    // Frequency-correct and drain the null symbol samples
+                    let mut null_samples: Vec<Complex<f32>> = self.buffer[..T_NULL].to_vec();
+                    self.apply_freq_correction(&mut null_samples);
+                    self.buffer.drain(..T_NULL);
+
+                    trace!(
+                        buffer_len_after_null = self.buffer.len(),
+                        "After null skip, ready for PRS correlation"
+                    );
+                    // After skipping null, buffer[0] ≈ PRS guard start
+                    // Go directly to PRS correlation
+                    self.from_null_detect = false;
+                    self.state = SyncState::NeedPrsCorrelation;
                 }
             }
         }
@@ -279,31 +364,70 @@ impl OfdmProcessor {
     /// 4. FFT all 76 symbols
     fn process_frame(&mut self, frame_data_len: usize) -> Option<OfdmFrame> {
         // ----------------------------------------------------------
-        // Step 1: Frequency-correct the frame data
+        // Step 1: Estimate fine frequency from cyclic prefixes FIRST
         // ----------------------------------------------------------
-        let mut corrected = self.buffer[..frame_data_len].to_vec();
-        self.apply_freq_correction(&mut corrected);
+        // We need the frequency estimate BEFORE applying correction, because
+        // on the first frame (and whenever freq changes rapidly), the current
+        // correction may be far off. The CP correlation works even on uncorrected
+        // data since it measures phase difference over T_U samples, which gives
+        // the total frequency offset including any uncorrected residual.
+        //
+        // welle.io handles this differently: it applies correction sample-by-sample
+        // as data is read (with the PREVIOUS frame's estimate), then updates the
+        // estimate after the frame. This works because welle.io's estimate converges
+        // slowly (0.1 gain). But for the first frame, the correction is zero and the
+        // full offset remains uncorrected.
+        //
+        // Our approach: estimate the full residual frequency offset from the raw
+        // (uncorrected) data's CP correlation, then apply it all at once. This gives
+        // immediate correction even on the first frame.
 
-        // ----------------------------------------------------------
-        // Step 2: Extract raw data symbols (with guard) for fine freq estimation
-        // ----------------------------------------------------------
-        // welle.io reads each data symbol as T_S samples and accumulates
-        // CP correlation across all 75 symbols.
-        let mut data_symbol_bufs: Vec<Vec<Complex<f32>>> = Vec::with_capacity(L_SYMBOLS - 1);
+        // Extract raw data symbols from buffer for CP correlation (before any correction)
+        let mut raw_symbol_bufs: Vec<Vec<Complex<f32>>> = Vec::with_capacity(L_SYMBOLS - 1);
         for i in 1..L_SYMBOLS {
             let sym_start = T_U + (i - 1) * T_S;
             let sym_end = sym_start + T_S;
-            if sym_end > corrected.len() {
+            if sym_end > frame_data_len || sym_end > self.buffer.len() {
                 break;
             }
-            data_symbol_bufs.push(corrected[sym_start..sym_end].to_vec());
+            raw_symbol_bufs.push(self.buffer[sym_start..sym_end].to_vec());
         }
+        let raw_fine_freq = Self::estimate_fine_freq_from_symbols(&raw_symbol_bufs);
 
-        let fine_freq = Self::estimate_fine_freq_from_symbols(&data_symbol_bufs);
-        // welle.io ALWAYS uses 0.1 gain: fineCorrector += 0.1 * arg(FreqCorr) / PI * (carrierDiff / 2)
-        // This makes fine frequency converge gradually over ~20 frames.
-        // Each frame's residual error is within the cyclic prefix tolerance.
-        self.fine_freq_hz += 0.1 * fine_freq;
+        // The raw CP correlation gives the TOTAL frequency offset (including any
+        // already-known offset). The new residual is: raw estimate - current correction.
+        let current_total_hz =
+            self.fine_freq_hz + self.coarse_freq_carriers as f32 * CARRIER_DIFF as f32;
+        let residual_hz = raw_fine_freq - current_total_hz;
+
+        // For the first frame, apply the full estimated offset immediately.
+        // For subsequent frames, only update if the estimate is plausible
+        // (within ±200 Hz of the current estimate — larger deviations indicate
+        // a timing error rather than a real frequency change).
+        if self.frame_count == 0 {
+            // First frame: apply the full CP estimate as our correction
+            self.fine_freq_hz = raw_fine_freq;
+            trace!(
+                raw_fine_freq = format!("{:.1}", raw_fine_freq),
+                "First frame: applying full CP frequency estimate"
+            );
+        } else if residual_hz.abs() < 200.0 {
+            // Plausible residual — gradual convergence
+            self.fine_freq_hz += 0.1 * residual_hz;
+            trace!(
+                raw_fine_freq = format!("{:.1}", raw_fine_freq),
+                residual_hz = format!("{:.1}", residual_hz),
+                new_fine_hz = format!("{:.1}", self.fine_freq_hz),
+                "Frame-to-frame freq update"
+            );
+        } else {
+            // Large residual — likely timing error, ignore this estimate
+            trace!(
+                raw_fine_freq = format!("{:.1}", raw_fine_freq),
+                residual_hz = format!("{:.1}", residual_hz),
+                "Ignoring implausible CP frequency estimate"
+            );
+        }
 
         // Migrate fine to coarse if fine exceeds half a carrier
         let half_carrier = CARRIER_DIFF as f32 / 2.0;
@@ -314,6 +438,20 @@ impl OfdmProcessor {
             self.coarse_freq_carriers -= 1;
             self.fine_freq_hz += CARRIER_DIFF as f32;
         }
+
+        // ----------------------------------------------------------
+        // Step 2: Apply frequency correction with updated estimate
+        // ----------------------------------------------------------
+        let mut corrected = self.buffer[..frame_data_len].to_vec();
+        let phase_before = self.running_phase;
+        self.apply_freq_correction(&mut corrected);
+        trace!(
+            frame = self.frame_count,
+            fine_freq_hz = format!("{:.1}", self.fine_freq_hz),
+            phase_before = format!("{:.4}", phase_before),
+            phase_after = format!("{:.4}", self.running_phase),
+            "process_frame: applied freq correction"
+        );
 
         // ----------------------------------------------------------
         // Step 3: Estimate coarse frequency from PRS
@@ -406,6 +544,15 @@ impl OfdmProcessor {
         // Window at the expected useful part location: buffer[T_G..T_G+T_U]
         let win_start = T_G;
         let mut fft_buf: Vec<Complex<f32>> = self.buffer[win_start..win_start + T_U].to_vec();
+
+        // No frequency correction for PRS correlation. The frequency offset (~100-200 Hz)
+        // is much smaller than the carrier spacing (1000 Hz), so it only adds a phase
+        // rotation to each carrier without shifting the FFT bins. The IFFT correlation
+        // magnitude is unaffected by this rotation.
+
+        // Debug: compute signal power in the window
+        let window_power: f32 = fft_buf.iter().map(|c| c.norm_sqr()).sum::<f32>() / T_U as f32;
+
         self.fft.process(&mut fft_buf);
 
         let mut corr_buf: Vec<Complex<f32>> = fft_buf
@@ -440,6 +587,16 @@ impl OfdmProcessor {
         };
 
         let prs_start = win_start as i32 + best_lag;
+
+        trace!(
+            buffer_len = self.buffer.len(),
+            window_power = format!("{:.1}", window_power),
+            best_lag,
+            best_mag = format!("{:.1}", best_mag.sqrt()),
+            avg_mag = format!("{:.1}", avg_mag),
+            snr = format!("{:.2}", snr),
+            "find_prs_start"
+        );
 
         (prs_start.max(0), snr)
     }
@@ -484,8 +641,25 @@ impl OfdmProcessor {
             }
         }
 
+        trace!(
+            buffer_len = self.buffer.len(),
+            search_len,
+            best_pos,
+            best_ratio = format!("{:.2}", best_ratio),
+            "find_null_symbol"
+        );
+
         if best_ratio < 4.0 {
             let discard = self.buffer.len().min(T_F / 2);
+            // Advance phase for discarded samples to maintain continuity
+            let total_freq_hz =
+                self.fine_freq_hz + self.coarse_freq_carriers as f32 * CARRIER_DIFF as f32;
+            let phase_step = -2.0 * PI * total_freq_hz / SAMPLE_RATE as f32;
+            self.running_phase += phase_step * discard as f32;
+            self.running_phase = self.running_phase.rem_euclid(2.0 * PI);
+            if self.running_phase > PI {
+                self.running_phase -= 2.0 * PI;
+            }
             self.buffer.drain(..discard);
             return false;
         }
@@ -493,6 +667,28 @@ impl OfdmProcessor {
         if best_pos >= self.buffer.len() {
             return false;
         }
+
+        // CRITICAL: Advance running_phase for all drained samples to maintain phase
+        // continuity. Without this, the frequency correction applied in process_frame()
+        // starts with the wrong phase, causing constellation rotation that gets worse
+        // for later symbols (MSC).
+        let total_freq_hz =
+            self.fine_freq_hz + self.coarse_freq_carriers as f32 * CARRIER_DIFF as f32;
+        let phase_step = -2.0 * PI * total_freq_hz / SAMPLE_RATE as f32;
+        self.running_phase += phase_step * best_pos as f32;
+        // Wrap to [-PI, PI) for numerical stability
+        self.running_phase = self.running_phase.rem_euclid(2.0 * PI);
+        if self.running_phase > PI {
+            self.running_phase -= 2.0 * PI;
+        }
+
+        trace!(
+            drained = best_pos,
+            phase_advance = format!("{:.4}", phase_step * best_pos as f32),
+            running_phase = format!("{:.4}", self.running_phase),
+            "find_null_symbol: advancing phase for drained samples"
+        );
+
         self.buffer.drain(..best_pos);
         true
     }

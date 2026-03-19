@@ -13,8 +13,9 @@ mod pad;
 
 use clap::Parser;
 use crossbeam_channel as channel;
-use desperado::IqFormat;
+use desperado::{DeviceConfig, IqFormat, IqSource};
 use pad::PadData;
+use std::str::FromStr;
 use tinyaudio::prelude::*;
 use tracing::{debug, info, warn};
 
@@ -23,7 +24,7 @@ const AUDIO_RATE: usize = 48_000;
 #[derive(Parser)]
 #[command(name = "dabradio", about = "DAB/DAB+ digital radio decoder")]
 struct Cli {
-    /// Source: file path to IQ recording
+    /// Source: file path or SDR URI (rtlsdr://, soapy://, airspy://)
     source: Option<String>,
 
     /// DAB channel (e.g. "12A", "12C")
@@ -34,7 +35,7 @@ struct Cli {
     #[arg(short = 'f', long)]
     freq: Option<u32>,
 
-    /// IQ format: cu8, cs8, cs16, cf32
+    /// IQ format for file sources: cu8, cs8, cs16, cf32
     #[arg(long, default_value = "cu8")]
     format: String,
 
@@ -96,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = cli
         .source
         .as_ref()
-        .ok_or("Source file path is required unless --list-channels is used")?;
+        .ok_or("Source path or SDR URI is required unless --list-channels is used")?;
 
     // Resolve center frequency
     let center_freq = if let Some(channel) = &cli.channel {
@@ -145,9 +146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         source, center_freq, cli.format
     );
 
-    // Open IQ source using desperado's synchronous reader
+    // Open IQ source (file or live SDR URI)
     let chunk_size = constants::T_F; // One frame's worth of samples
-    let source = desperado::iqread::IqRead::from_file(
+    let (source, is_file_source) = open_iq_source(
         source,
         center_freq,
         constants::SAMPLE_RATE,
@@ -168,7 +169,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mot_image_count = 0usize;
 
     // Audio output setup (tinyaudio + crossbeam channel)
-    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 4); // 4 seconds buffer
+    // Buffer: 48000 * 2ch * 4s = 384k samples. The blocking send provides real-time
+    // pacing for file sources and absorbs jitter for SDR sources.
+    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * 4);
 
     let _device = if decoding_service && !cli.no_audio {
         let config = OutputDeviceParameters {
@@ -188,8 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let is_file_source = true; // Currently only file sources are supported
-
     for chunk in source {
         let samples = chunk?;
         let frames = ofdm_processor.process(&samples);
@@ -199,6 +200,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // DQPSK decode all symbols
             let soft_bits = ofdm::decoder::dqpsk_decode(&frame.symbols);
+
+            // Debug: compare per-symbol soft bit statistics across the frame
+            // This helps identify if later symbols (MSC) degrade compared to earlier ones (FIC)
+            if frame_count <= 5 {
+                // Compute per-symbol mean absolute soft bit value
+                let mut sym_stats: Vec<(usize, f64)> = Vec::new();
+                for (idx, sym) in soft_bits.iter().enumerate() {
+                    let mean_abs: f64 = sym.iter().map(|&x| (x as f64).abs()).sum::<f64>()
+                        / (constants::K * 2) as f64;
+                    sym_stats.push((idx, mean_abs));
+                }
+
+                // Sample 8 symbols spread across the frame: indices 0,1,2 (FIC), 10, 25, 40, 55, 70 (MSC)
+                let sample_indices = [0, 1, 2, 10, 25, 40, 55, 70];
+                let samples: Vec<String> = sample_indices
+                    .iter()
+                    .filter_map(|&i| {
+                        sym_stats
+                            .get(i)
+                            .map(|(idx, val)| format!("{}:{:.1}", idx, val))
+                    })
+                    .collect();
+
+                debug!(
+                    frame = frame_count,
+                    per_symbol = samples.join(" "),
+                    "Symbol quality across frame"
+                );
+            }
 
             // Extract FIC data from symbols 0..2 (first 3 data symbols after PRS)
             if soft_bits.len() >= constants::FIC_SYMBOLS {
@@ -218,8 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            // Fallback: if --list and we've processed enough frames, print what we have
-            if cli.list && frame_count >= 50 && ensemble.has_services() {
+            // Fallback for file sources: if --list and we've processed enough frames,
+            // print what we have even if labels are still incomplete.
+            // For live SDR sources, keep waiting for full FIC so service labels can arrive.
+            if cli.list && is_file_source && frame_count >= 50 && ensemble.has_services() {
                 ensemble.resolve_services();
                 print_services(&ensemble, cli.json);
                 return Ok(());
@@ -298,19 +330,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if !decoded_out.pcm.is_empty() && _device.is_some() {
-                                // Send PCM samples to audio output
-                                if is_file_source {
-                                    // Blocking send — audio buffer controls pacing
-                                    for sample in &decoded_out.pcm {
-                                        if tx.send(*sample).is_err() {
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    for sample in &decoded_out.pcm {
-                                        if tx.try_send(*sample).is_err() {
-                                            break;
-                                        }
+                                // Always use blocking send. This provides:
+                                // - File sources: natural pacing by audio playback rate
+                                // - Live SDR: backpressure when buffer is full (brief stalls
+                                //   are absorbed by the background reader's 64-chunk buffer)
+                                // - Stdin pipe: pacing for files, backpressure for live
+                                //
+                                // The RTL-SDR background reader thread has ~8 seconds of
+                                // buffering (64 chunks × 131k samples), so brief stalls
+                                // from blocking send don't cause sample loss.
+                                for sample in &decoded_out.pcm {
+                                    if tx.send(*sample).is_err() {
+                                        break;
                                     }
                                 }
                             }
@@ -394,6 +425,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn open_iq_source(
+    input: &str,
+    center_freq: u32,
+    sample_rate: u32,
+    chunk_size: usize,
+    iq_format: IqFormat,
+) -> Result<(IqSource, bool), Box<dyn std::error::Error>> {
+    if input == "-" {
+        // Read from stdin. Treat as file-like source (blocking audio send)
+        // so that piped file data gets proper pacing. When piped from rtl_sdr,
+        // the data arrives at real-time rate, so blocking send is fine too.
+        let source = IqSource::from_stdin(center_freq, sample_rate, chunk_size, iq_format)?;
+        return Ok((source, true));
+    }
+
+    if !is_device_uri(input) {
+        let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
+        return Ok((source, true));
+    }
+
+    if input.starts_with("rtlsdr://") {
+        #[cfg(not(feature = "rtlsdr"))]
+        {
+            return Err("rtlsdr:// is not enabled. Rebuild with --features rtlsdr, \
+                 or pipe: rtl_sdr -f FREQ -s 2048000 - | dabradio - --freq FREQ --format cu8"
+                .into());
+        }
+    }
+    if input.starts_with("soapy://") {
+        #[cfg(not(feature = "soapy"))]
+        {
+            return Err("soapy:// is not enabled. Rebuild with --features soapy".into());
+        }
+    }
+    if input.starts_with("airspy://") {
+        #[cfg(not(feature = "airspy"))]
+        {
+            return Err("airspy:// is not enabled. Rebuild with --features airspy".into());
+        }
+    }
+
+    let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
+    info!("Opening live SDR source: {}", configured_uri);
+    let config = DeviceConfig::from_str(&configured_uri)?;
+    let source = IqSource::from_device_config(config)?;
+    Ok((source, false))
+}
+
+fn is_device_uri(input: &str) -> bool {
+    input.starts_with("rtlsdr://")
+        || input.starts_with("soapy://")
+        || input.starts_with("airspy://")
+}
+
+fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {
+    let has_query = uri.contains('?');
+    let has_freq = uri.contains("freq=") || uri.contains("frequency=");
+    let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
+
+    let mut out = uri.to_string();
+    if !has_query {
+        out.push('?');
+    }
+    if !has_freq {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str(&format!("freq={center_freq_hz}"));
+    }
+    if !has_rate {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str(&format!("rate={sample_rate}"));
+    }
+    out
 }
 
 fn print_channels(json: bool) {

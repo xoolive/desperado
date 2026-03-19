@@ -8,6 +8,9 @@ A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting
 - **Multi-service support** — List all available services or decode a specific one
 - **Robust synchronization** — Handles frame alignment drift due to dropped samples or clock errors
 - **DAB+ audio output** — AAC-LC and HE-AAC v2 decoding via fdk-aac, 48 kHz stereo output
+- **Programme Associated Data (PAD)** — Extract DLS text metadata and MOT slideshow images
+  - **DLS (Dynamic Label Segment)**: Song titles, artist names, and text metadata
+  - **MOT (Multimedia Object Transfer)**: Album art and slideshow images (JPEG/PNG)
 - **JSON output** — Service listings as JSON for programmatic access
 - **Multiple input formats** — cu8, cs8, cs16, cf32 IQ samples from files or network streams
 - **Real-time audio playback** — Streams decoded audio directly to soundcard via tinyaudio
@@ -18,6 +21,11 @@ A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting
 ```bash
 # From the desperado workspace root:
 cargo build --release -p dabradio
+
+# Enable live SDR backends as needed:
+cargo build --release -p dabradio --features rtlsdr
+cargo build --release -p dabradio --features soapy
+cargo build --release -p dabradio --features airspy
 ```
 
 The binary will be at `target/release/dabradio`.
@@ -63,6 +71,21 @@ SId      Label                SubCh  Bitrate    Protection
   --output frames.bin --no-audio
 ```
 
+### Live SDR sources (Phase 6)
+
+```bash
+# RTL-SDR (build with --features rtlsdr)
+./target/release/dabradio rtlsdr:// --channel 12A --service "FIP"
+
+# SoapySDR (build with --features soapy)
+./target/release/dabradio soapy://driver=rtlsdr --channel 12A --service "FIP"
+
+# Airspy (build with --features airspy)
+./target/release/dabradio airspy://0 --channel 12A --service "FIP"
+```
+
+If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from `--channel`/`--freq` and the DAB sample rate (2.048 MHz).
+
 ### Output formats
 
 ```bash
@@ -73,6 +96,30 @@ SId      Label                SubCh  Bitrate    Protection
 ./target/release/dabradio recording.cu8 --channel 12A --max-frames 100
 ```
 
+### Extract DLS Metadata and MOT Slideshow Images
+
+```bash
+# Display DLS text metadata while decoding audio
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP" --metadata
+
+# Extract MOT slideshow images to directory (album art, cover art, etc.)
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
+  --metadata --slideshow /tmp/fip_slides
+
+# Extract images without audio playback
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
+  --metadata --slideshow /tmp/fip_slides --no-audio
+```
+
+**Output example:**
+```
+$ ls -lah /tmp/fip_slides/
+-rw-r--r-- 1 user user 14279 slide_001.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user 14279 slide_002.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user 17639 slide_003.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user  5416 slide_004.png  (PNG 320×240)
+```
+
 ## Command-line Reference
 
 ```
@@ -80,7 +127,7 @@ USAGE:
     dabradio <SOURCE> --channel <CHANNEL> [OPTIONS]
 
 ARGUMENTS:
-    <SOURCE>    File path to IQ recording
+    <SOURCE>    File path or SDR URI (rtlsdr://, soapy://, airspy://)
 
 OPTIONS:
     --channel <CHANNEL>
@@ -90,7 +137,7 @@ OPTIONS:
             Center frequency in Hz (alternative to --channel)
 
     --format <FORMAT>
-            IQ format: cu8, cs8, cs16, cf32 [default: cu8]
+            IQ format for file sources: cu8, cs8, cs16, cf32 [default: cu8]
 
     --list
             List services and exit (no audio decoding)
@@ -106,6 +153,12 @@ OPTIONS:
 
     --no-audio
             Disable audio output to soundcard
+
+    --metadata
+            Display DLS text metadata (song titles, artist names)
+
+    --slideshow <DIR>
+            Extract MOT slideshow images to directory
 
     --max-frames <MAX_FRAMES>
             Maximum number of OFDM frames to process [default: 0 = unlimited]
@@ -183,7 +236,7 @@ cargo clippy -p dabradio --tests
 cargo build --release -p dabradio
 ```
 
-All 32 unit tests pass (2 require welle.io debug files and are ignored). 0 clippy warnings.
+All 45 unit tests pass (2 require external test fixtures and are ignored). 0 clippy warnings.
 
 ## IQ Format Support
 
@@ -232,8 +285,7 @@ DAB uses 2.048 MHz sample rate. Ensure your recordings are at exactly 2048000 sa
 
 1. **MSC decoding requires complete FIC** — services can only be decoded after ensemble info is available (typically 1-2 seconds)
 2. **Single service at a time** — use `--service` to select one service; multiplexing not yet supported
-3. **No slideshow/PAD support** — PAD (Programme Associated Data) is parsed but not displayed
-4. **Soundcard output on Mac** — requires audio device permissions via system settings
+3. **Soundcard output on Mac** — requires audio device permissions via system settings
 
 ## Debugging
 
@@ -277,10 +329,11 @@ See `LICENSE` in the workspace root.
 Contributions welcome! Areas for enhancement:
 
 - [ ] Multiplex multiple services in a single run
-- [ ] Slideshow/PAD display
 - [ ] Real-time recording from SDRs (SoapySDR/Airspy)
+- [ ] TII (Transmitter Identification Information) decoder for SFN detection
 - [ ] WebAssembly/browser decoder
 - [ ] Ensemble metadata export (RSID/PI-code)
+- [ ] JSON output for metadata and MOT images
 
 ---
 

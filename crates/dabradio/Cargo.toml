@@ -27,3 +27,9 @@ fdk-aac = "0.8"
 reed-solomon = "0.2"
 tinyaudio = "0.1"
 crossbeam-channel = "0.5"
+
+[features]
+default = []
+rtlsdr = ["desperado/rtlsdr"]
+soapy = ["desperado/soapy"]
+airspy = ["desperado/airspy"]

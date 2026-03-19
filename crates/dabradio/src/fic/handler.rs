@@ -13,10 +13,13 @@
 
 use crate::constants::*;
 use crate::fec;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Size of one FIC sub-block after puncturing (transmitted soft bits).
 const FIC_SUBBLOCK_SIZE: usize = 2304;
+
+// Debug: log when this is the first frame
+static FIRST_FIC_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Number of data bits per sub-block after Viterbi decoding (3 FIBs × 256 bits).
 const FIC_DECODED_BITS: usize = 768;
@@ -91,6 +94,12 @@ pub fn process_fic(fic_soft_bits: &[Vec<i8>]) -> Vec<[u8; FIB_LENGTH]> {
 
         let subblock = &combined[start..end];
 
+        // Log first subblock soft bits for debugging (only once)
+        if sb == 0 && !FIRST_FIC_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let first_20: Vec<i8> = subblock[..20].to_vec();
+            debug!(first_20 = ?first_20, "First FIC subblock soft bits");
+        }
+
         // Step 1: Depuncture (insert erasures at punctured positions) → 3096 soft bits
         let depunctured = fec::eep::depuncture_fic(subblock);
 
@@ -147,7 +156,13 @@ pub fn process_fic(fic_soft_bits: &[Vec<i8>]) -> Vec<[u8; FIB_LENGTH]> {
             // Check CRC on packed bytes
             let byte_crc_ok = crate::constants::fib_crc_valid(&fib_bytes);
 
+            trace!(fib_idx, bit_crc_ok, byte_crc_ok, "FIB CRC check");
+
             if bit_crc_ok || byte_crc_ok {
+                debug!(
+                    subblock = sb,
+                    fib_idx, bit_crc_ok, byte_crc_ok, "FIB CRC PASSED!"
+                );
                 fibs.push(fib_bytes);
             }
         }
