@@ -14,27 +14,37 @@ mod pad;
 use clap::Parser;
 use crossbeam_channel as channel;
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-use desperado::IqAsyncSource;
+use desperado::DeviceConfig;
 use desperado::{IqFormat, IqSource};
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-use futures::StreamExt;
 use num_complex::Complex;
 use pad::PadData;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::{IsTerminal, Write};
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use std::str::FromStr;
+use std::time::Duration;
 use tinyaudio::prelude::*;
+use tracing::Level;
 use tracing::{debug, info, warn};
+use tracing_subscriber::prelude::*;
 
 /// Unified IQ chunk iterator that works with both sync and async sources.
 ///
 /// For file/stdin sources, uses synchronous `IqSource` (simple, no threading).
-/// For live SDR sources, uses `IqAsyncSource` which runs USB reads in a
-/// background thread, preventing sample loss during heavy OFDM processing.
+/// For live SDR sources, uses sync `IqSource` inside a dedicated reader thread,
+/// then consumes IQ chunks through an async channel.
 enum IqChunkSource {
-    Sync(IqSource),
+    Sync(Box<IqSource>),
     #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-    Async(IqAsyncSource),
+    Threaded(tokio::sync::mpsc::Receiver<desperado::error::Result<Vec<Complex<f32>>>>),
 }
+
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+type IqChunkResult = desperado::error::Result<Vec<Complex<f32>>>;
+
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+type IqChunkRx = tokio::sync::mpsc::Receiver<IqChunkResult>;
 
 impl IqChunkSource {
     /// Get the next chunk of IQ samples.
@@ -44,8 +54,46 @@ impl IqChunkSource {
         match self {
             IqChunkSource::Sync(source) => source.next(),
             #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-            IqChunkSource::Async(source) => source.next().await,
+            IqChunkSource::Threaded(rx) => rx.recv().await,
         }
+    }
+}
+
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+fn spawn_sync_reader_thread(
+    configured_uri: String,
+    queue_chunks: usize,
+) -> Result<IqChunkRx, Box<dyn std::error::Error>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(queue_chunks);
+    let (tx_init, rx_init) = std::sync::mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+        let source_res = (|| -> Result<IqSource, String> {
+            let config = DeviceConfig::from_str(&configured_uri).map_err(|e| e.to_string())?;
+            IqSource::from_device_config(config).map_err(|e| e.to_string())
+        })();
+
+        let source = match source_res {
+            Ok(source) => {
+                let _ = tx_init.send(Ok(()));
+                source
+            }
+            Err(e) => {
+                let _ = tx_init.send(Err(e));
+                return;
+            }
+        };
+
+        for chunk in source {
+            if tx.blocking_send(chunk).is_err() {
+                break;
+            }
+        }
+    });
+
+    match rx_init.recv() {
+        Ok(Ok(())) => Ok(rx),
+        Ok(Err(e)) => Err(std::io::Error::other(e).into()),
+        Err(_) => Err(std::io::Error::other("Reader thread failed to initialize").into()),
     }
 }
 
@@ -97,22 +145,30 @@ struct Cli {
     #[arg(long)]
     no_audio: bool,
 
-    /// Print extracted PAD/DLS metadata candidates while decoding
-    #[arg(long)]
-    metadata: bool,
-
     /// Save MOT slideshow images to directory (e.g. --slideshow ./images)
     #[arg(long)]
     slideshow: Option<String>,
 
-    /// Debug: bypass time de-interleaving in MSC
-    #[arg(long)]
-    bypass_deinterleave: bool,
+    /// MOT inline image width in terminal cells (0 = auto)
+    #[arg(long, default_value = "40")]
+    mot_width: u32,
+
+    /// MOT inline image height in terminal cells (0 = auto)
+    #[arg(long, default_value = "0")]
+    mot_height: u32,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    let log_filter = tracing_subscriber::filter::Targets::new()
+        .with_target("dabradio", Level::INFO)
+        .with_target("desperado", Level::INFO)
+        .with_target("rtl_sdr_rs", Level::WARN)
+        .with_default(Level::WARN);
+    tracing_subscriber::registry()
+        .with(log_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
     let cli = Cli::parse();
 
@@ -198,12 +254,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dab_plus_decoder: Option<audio::DabPlusDecoder> = None;
     let mut msc_output: Vec<Vec<u8>> = Vec::new();
     let decoding_service = cli.service.is_some();
+    let selected_service_sid = cli.service.as_deref().and_then(parse_service_id_arg);
+    let mut announced_service_label = false;
     let mut mot_image_count = 0usize;
+    let mut last_mot_hash: Option<u64> = None;
+    let term_image_support = terminal_supports_inline_images();
 
     // Audio output setup (tinyaudio + crossbeam channel)
-    // Buffer: 48000 * 2ch * 4s = 384k samples. The blocking send provides real-time
-    // pacing for file sources and absorbs jitter for SDR sources.
-    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * 4);
+    // Buffer sizing:
+    // - File/stdin: blocking sender naturally paces to playback.
+    // - Live SDR: larger queue absorbs decode jitter without stalling RF processing.
+    let audio_queue_seconds = if is_file_source { 4 } else { 8 };
+    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * audio_queue_seconds);
 
     let _device = if decoding_service && !cli.no_audio {
         let config = OutputDeviceParameters {
@@ -273,6 +335,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if msc_handler.is_some()
+                && !announced_service_label
+                && let Some(sid) = selected_service_sid
+                && let Some(label) = ensemble
+                    .services
+                    .get(&sid)
+                    .and_then(|service| service.label.as_deref())
+                && !label.trim().is_empty()
+            {
+                info!(label = %label.trim(), "Resolved service label");
+                announced_service_label = true;
+            }
+
             // Check if we have enough info to list services
             if cli.list && ensemble.is_complete() {
                 ensemble.resolve_services();
@@ -295,11 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref service_arg) = cli.service
                     && let Some((handler, bitrate)) = try_init_msc(&ensemble, service_arg)
                 {
-                    let mut handler = handler;
-                    if cli.bypass_deinterleave {
-                        handler.set_bypass_deinterleave(true);
-                        debug!("Time de-interleaving BYPASSED");
-                    }
                     msc_handler = Some(handler);
                     dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
                 }
@@ -326,9 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for item in &decoded_out.metadata {
                                 match item {
                                     PadData::Dls(dls) => {
-                                        if cli.metadata {
-                                            eprintln!("DLS: {}", dls.text);
-                                        }
+                                        info!(text = %dls.text, "DLS");
                                     }
                                     PadData::Mot(mot) => {
                                         mot_image_count += 1;
@@ -337,14 +405,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         } else {
                                             "jpg"
                                         };
-                                        if cli.metadata {
-                                            eprintln!(
-                                                "MOT: {} bytes, type={}, name={:?}",
-                                                mot.data.len(),
-                                                mot.content_type,
-                                                mot.content_name
-                                            );
-                                        }
+                                        info!(
+                                            bytes = mot.data.len(),
+                                            content_type = %mot.content_type,
+                                            content_name = ?mot.content_name,
+                                            "MOT"
+                                        );
                                         // Save to slideshow directory if specified
                                         if let Some(ref dir) = cli.slideshow {
                                             let filename = format!(
@@ -357,23 +423,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 info!("Saved slideshow image: {}", filename);
                                             }
                                         }
+
+                                        let mot_hash = hash_bytes(&mot.data);
+                                        if term_image_support && Some(mot_hash) != last_mot_hash {
+                                            match show_image_in_terminal(
+                                                &mot.data,
+                                                ext,
+                                                cli.mot_width,
+                                                cli.mot_height,
+                                            ) {
+                                                Ok(()) => {
+                                                    info!(
+                                                        bytes = mot.data.len(),
+                                                        content_type = %mot.content_type,
+                                                        "Displayed MOT image in terminal"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(error = %e, "Failed to display MOT image in terminal");
+                                                }
+                                            }
+                                        }
+                                        last_mot_hash = Some(mot_hash);
                                     }
                                 }
                             }
 
                             if !decoded_out.pcm.is_empty() && _device.is_some() {
-                                // Always use blocking send. This provides:
-                                // - File sources: natural pacing by audio playback rate
-                                // - Live SDR: backpressure when buffer is full (brief stalls
-                                //   are absorbed by the background reader's 64-chunk buffer)
-                                // - Stdin pipe: pacing for files, backpressure for live
-                                //
-                                // The RTL-SDR background reader thread has ~8 seconds of
-                                // buffering (64 chunks × 131k samples), so brief stalls
-                                // from blocking send don't cause sample loss.
-                                for sample in &decoded_out.pcm {
-                                    if tx.send(*sample).is_err() {
-                                        break;
+                                if is_file_source {
+                                    for sample in &decoded_out.pcm {
+                                        if tx.send(*sample).is_err() {
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    for sample in &decoded_out.pcm {
+                                        if tx.try_send(*sample).is_err()
+                                            && tx
+                                                .send_timeout(*sample, Duration::from_millis(1))
+                                                .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -404,23 +495,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Print decode summary
         if let Some(ref dab_dec) = dab_plus_decoder {
             let sf = &dab_dec.superframe;
-            eprintln!(
-                "DAB+ decode: {} superframes, {} RS corrections, {} RS errors, {} AU CRC errors",
-                sf.superframes_decoded, sf.rs_corrections, sf.rs_errors, sf.au_crc_errors,
+            info!(
+                superframes = sf.superframes_decoded,
+                rs_corrections = sf.rs_corrections,
+                rs_errors = sf.rs_errors,
+                au_crc_errors = sf.au_crc_errors,
+                "DAB+ decode summary"
             );
         }
 
         if let Some(ref handler) = msc_handler {
-            eprintln!(
-                "MSC: {} logical frames decoded ({} OFDM frames, {} FIBs)",
-                handler.frames_decoded, frame_count, fib_count,
+            info!(
+                logical_frames = handler.frames_decoded,
+                ofdm_frames = frame_count,
+                fibs = fib_count,
+                "MSC summary"
             );
         } else {
-            eprintln!(
-                "No MSC frames decoded (processed {} OFDM frames, {} FIBs)",
-                frame_count, fib_count
+            info!(
+                ofdm_frames = frame_count,
+                fibs = fib_count,
+                "No MSC frames decoded"
             );
-            eprintln!("  (MSC handler never initialized -- service not found?)");
+            info!("MSC handler never initialized (service not found?)");
         }
 
         // Write raw frames to output file if specified
@@ -433,7 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 all_bytes.extend_from_slice(frame_data);
             }
             std::fs::write(output_path, &all_bytes)?;
-            eprintln!("Wrote {} bytes to {}", all_bytes.len(), output_path);
+            info!(bytes = all_bytes.len(), path = %output_path, "Wrote decoded MSC output");
         }
     } else {
         // Just print service listing
@@ -442,7 +539,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            eprintln!("Processed {} frames, {} valid FIBs", frame_count, fib_count);
+            info!(
+                frames = frame_count,
+                fibs = fib_count,
+                "Processed OFDM/FIC frames"
+            );
             print_services(&ensemble, false);
         }
 
@@ -469,15 +570,16 @@ async fn open_iq_source(
     // File and stdin: use synchronous IqSource (simple, reliable)
     if input == "-" {
         let source = IqSource::from_stdin(center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(source), true));
+        return Ok((IqChunkSource::Sync(Box::new(source)), true));
     }
 
     if !is_device_uri(input) {
         let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(source), true));
+        return Ok((IqChunkSource::Sync(Box::new(source)), true));
     }
 
-    // Live SDR: use async IqAsyncSource (background thread prevents USB FIFO overflow)
+    // Live SDR: use sync IqSource in a dedicated reader thread.
+    // This architecture was historically smoother for DAB under heavy OFDM load.
     if input.starts_with("rtlsdr://") {
         #[cfg(not(feature = "rtlsdr"))]
         {
@@ -504,9 +606,10 @@ async fn open_iq_source(
 
     #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
     {
-        let config = desperado::DeviceConfig::from_str(&configured_uri)?;
-        let source = IqAsyncSource::from_device_config(&config).await?;
-        Ok((IqChunkSource::Async(source), false))
+        const LIVE_QUEUE_CHUNKS: usize = 512;
+
+        let rx = spawn_sync_reader_thread(configured_uri.clone(), LIVE_QUEUE_CHUNKS)?;
+        Ok((IqChunkSource::Threaded(rx), false))
     }
 
     #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
@@ -579,6 +682,65 @@ fn print_channels(json: bool) {
     }
 }
 
+fn parse_service_id_arg(service_arg: &str) -> Option<u32> {
+    let hex = service_arg
+        .strip_prefix("0x")
+        .or_else(|| service_arg.strip_prefix("0X"))?;
+    u32::from_str_radix(hex, 16).ok()
+}
+
+fn hash_bytes(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn terminal_supports_inline_images() -> bool {
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+
+    let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
+    let term_program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_lowercase();
+
+    std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || term.contains("kitty")
+        || term.contains("ghostty")
+        || term_program.contains("ghostty")
+}
+
+fn show_image_in_terminal(
+    data: &[u8],
+    ext: &str,
+    mot_width: u32,
+    mot_height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("dabradio_terminal_mot.{}", ext));
+    std::fs::write(&path, data)?;
+
+    let cfg = viuer::Config {
+        absolute_offset: false,
+        x: 0,
+        y: 0,
+        restore_cursor: false,
+        width: (mot_width > 0).then_some(mot_width),
+        height: (mot_height > 0).then_some(mot_height),
+        transparent: true,
+        truecolor: true,
+        use_kitty: true,
+        use_iterm: false,
+        ..Default::default()
+    };
+
+    viuer::print_from_file(&path, &cfg)?;
+    std::io::stdout().flush()?;
+
+    Ok(())
+}
+
 /// Try to find the requested service and initialize an MSC handler for it.
 /// Returns the handler and the service bitrate.
 fn try_init_msc(
@@ -586,14 +748,7 @@ fn try_init_msc(
     service_arg: &str,
 ) -> Option<(msc::MscHandler, u16)> {
     // Try to match by hex SId (e.g. "0xF201") or by label (case-insensitive)
-    let target_sid = if let Some(hex) = service_arg
-        .strip_prefix("0x")
-        .or_else(|| service_arg.strip_prefix("0X"))
-    {
-        u32::from_str_radix(hex, 16).ok()
-    } else {
-        None
-    };
+    let target_sid = parse_service_id_arg(service_arg);
 
     let service = if let Some(sid) = target_sid {
         ensemble.services.get(&sid)
@@ -612,26 +767,23 @@ fn try_init_msc(
     let subch = ensemble.subchannels.get(&subch_id)?;
     let bitrate = subch.bitrate;
 
-    eprintln!(
-        "Decoding service: {} (SId: 0x{:04X}, SubCh: {}, {} kbps, {})",
-        service.label.as_deref().unwrap_or("?"),
-        service.service_id,
-        subch_id,
-        bitrate,
-        if subch.is_eep {
+    info!(
+        label = %service.label.as_deref().unwrap_or("(label pending)"),
+        service_id = format_args!("0x{:04X}", service.service_id),
+        subchannel_id = subch_id,
+        bitrate_kbps = bitrate,
+        protection = %if subch.is_eep {
             let opt = if subch.eep_option == 0 { "A" } else { "B" };
             format!("EEP {}-{}", subch.protection_level + 1, opt)
         } else {
             format!("UEP {}", subch.protection_level)
-        }
+        },
+        "Decoding service"
     );
 
     let handler = msc::MscHandler::new(subch);
     if handler.is_none() {
-        eprintln!(
-            "Failed to initialize MSC handler for subchannel {}",
-            subch_id
-        );
+        warn!(subchannel_id = subch_id, "Failed to initialize MSC handler");
     }
     handler.map(|h| (h, bitrate))
 }

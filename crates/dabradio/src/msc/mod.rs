@@ -274,11 +274,6 @@ impl MscHandler {
             buf.fill(0);
         }
     }
-
-    /// Enable or disable time de-interleaving bypass (for debugging).
-    pub fn set_bypass_deinterleave(&mut self, bypass: bool) {
-        self.bypass_deinterleave = bypass;
-    }
 }
 
 #[cfg(test)]

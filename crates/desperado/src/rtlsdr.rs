@@ -11,6 +11,8 @@ use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
 
 use crate::{Gain, IqFormat, error};
 
+const ASYNC_QUEUE_CHUNKS: usize = 512;
+
 // WORKAROUND: Temporary device enumeration until rtl-sdr-rs PR #26 is merged
 // This module can be removed once PR #26 is available
 mod device_workaround {
@@ -292,72 +294,123 @@ fn open_device_with_selector(selector: &DeviceSelector) -> error::Result<RtlSdr>
  * Synchronous RTL-SDR I/Q Reader
  */
 pub struct RtlSdrReader {
-    rtlsdr: RtlSdr,
-    buf: Vec<u8>,
-    pos: usize,
-    end: usize,
+    config: RtlSdrConfig,
+    buf_size: usize,
+    /// Background reader thread receiver (lazily initialized on first `next()` call).
+    /// Sends raw u8 bytes to minimize time between USB reads.
+    bg_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+}
+
+fn configure_rtlsdr(rtlsdr: &mut RtlSdr, config: &RtlSdrConfig) -> error::Result<()> {
+    rtlsdr.set_sample_rate(config.sample_rate)?;
+    let _ = rtlsdr.set_freq_correction(config.freq_correction_ppm);
+    rtlsdr.set_center_freq(config.center_freq)?;
+    match config.gain {
+        Gain::Manual(gain_db) => {
+            let gain_tenths = (gain_db * 10.0) as i32;
+            tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
+            rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+        }
+        Gain::Auto => {
+            tracing::info!("Setting automatic tuner gain");
+            rtlsdr.set_tuner_gain(TunerGain::Auto)?
+        }
+        Gain::Elements(_) => {
+            eprintln!(
+                "Warning: RTL-SDR does not support element-based gain control, using auto gain"
+            );
+            rtlsdr.set_tuner_gain(TunerGain::Auto)?
+        }
+    };
+    let _ = rtlsdr.set_bias_tee(config.bias_tee);
+    rtlsdr.reset_buffer()?;
+    Ok(())
 }
 
 impl RtlSdrReader {
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
-        let mut rtlsdr = open_device_with_selector(&config.device)?;
-        rtlsdr.set_sample_rate(config.sample_rate)?;
-        let _ = rtlsdr.set_freq_correction(config.freq_correction_ppm);
-        rtlsdr.set_center_freq(config.center_freq)?;
-        match config.gain {
-            Gain::Manual(gain_db) => {
-                let gain_tenths = (gain_db * 10.0) as i32;
-                tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
-                rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
-            }
-            Gain::Auto => {
-                tracing::info!("Setting automatic tuner gain");
-                rtlsdr.set_tuner_gain(TunerGain::Auto)?
-            }
-            Gain::Elements(_) => {
-                eprintln!(
-                    "Warning: RTL-SDR does not support element-based gain control, using auto gain"
-                );
-                rtlsdr.set_tuner_gain(TunerGain::Auto)?
-            }
-        };
-        let _ = rtlsdr.set_bias_tee(config.bias_tee);
-        rtlsdr.reset_buffer()?;
         Ok(Self {
-            rtlsdr,
-            buf: vec![0u8; DEFAULT_BUF_LENGTH],
-            pos: 0,
-            end: 0,
+            config: config.clone(),
+            buf_size: DEFAULT_BUF_LENGTH,
+            bg_rx: None,
         })
+    }
+
+    fn start_reader_thread(&mut self) -> error::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(64);
+        let (tx_init, rx_init) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
+        let config = self.config.clone();
+        let buf_size = self.buf_size;
+
+        std::thread::spawn(move || {
+            let mut rtlsdr = match open_device_with_selector(&config.device) {
+                Ok(dev) => dev,
+                Err(e) => {
+                    let _ = tx_init.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+            if let Err(e) = configure_rtlsdr(&mut rtlsdr, &config) {
+                let _ = tx_init.send(Err(e.to_string()));
+                return;
+            }
+            let _ = tx_init.send(Ok(()));
+
+            let mut buf_a = vec![0u8; buf_size];
+            let mut buf_b = vec![0u8; buf_size];
+            let mut use_a = true;
+
+            loop {
+                let buf = if use_a { &mut buf_a } else { &mut buf_b };
+                match rtlsdr.read_sync(buf) {
+                    Ok(bytes_read) => {
+                        if bytes_read == 0 {
+                            continue;
+                        }
+                        if tx.send(Ok(buf[..bytes_read].to_vec())).is_err() {
+                            break;
+                        }
+                        use_a = !use_a;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        match rx_init.recv() {
+            Ok(Ok(())) => {
+                self.bg_rx = Some(rx);
+                Ok(())
+            }
+            Ok(Err(msg)) => Err(error::Error::Other(msg)),
+            Err(_) => Err(error::Error::device(
+                "Failed to initialize RTL-SDR reader thread",
+            )),
+        }
     }
 
     /// Retune the reader to a new center frequency.
     pub fn tune(&mut self, center_freq: u32) -> error::Result<()> {
-        self.rtlsdr.set_center_freq(center_freq)?;
-        self.rtlsdr.reset_buffer()?;
-        self.pos = 0;
-        self.end = 0;
+        if self.bg_rx.is_none() {
+            self.config.center_freq = center_freq;
+            let mut rtlsdr = open_device_with_selector(&self.config.device)?;
+            configure_rtlsdr(&mut rtlsdr, &self.config)?;
+        }
         Ok(())
     }
 
     /// Change tuner gain mode/value.
     pub fn set_gain(&mut self, gain: Gain) -> error::Result<()> {
-        match gain {
-            Gain::Manual(gain_db) => {
-                let gain_tenths = (gain_db * 10.0) as i32;
-                self.rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
-            }
-            Gain::Auto => self.rtlsdr.set_tuner_gain(TunerGain::Auto)?,
-            Gain::Elements(_) => {
-                eprintln!(
-                    "Warning: RTL-SDR does not support element-based gain control, using auto gain"
-                );
-                self.rtlsdr.set_tuner_gain(TunerGain::Auto)?
-            }
-        };
-        self.rtlsdr.reset_buffer()?;
-        self.pos = 0;
-        self.end = 0;
+        if self.bg_rx.is_none() {
+            self.config.gain = gain;
+            let mut rtlsdr = open_device_with_selector(&self.config.device)?;
+            configure_rtlsdr(&mut rtlsdr, &self.config)?;
+        }
         Ok(())
     }
 }
@@ -366,22 +419,23 @@ impl Iterator for RtlSdrReader {
     type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.end {
-            match self.rtlsdr.read_sync(&mut self.buf) {
-                Ok(bytes_read) => {
-                    if bytes_read == 0 {
-                        return None; // End of stream
-                    }
-                    self.pos = 0;
-                    self.end = bytes_read;
-                }
-                Err(e) => return Some(Err(e.into())),
-            }
+        if self.bg_rx.is_none()
+            && let Err(e) = self.start_reader_thread()
+        {
+            return Some(Err(e));
         }
 
-        let samples = crate::convert_bytes_to_complex(IqFormat::Cu8, &self.buf[self.pos..self.end]);
-        self.pos = self.end;
-        Some(Ok(samples))
+        if let Some(ref rx) = self.bg_rx {
+            return match rx.recv() {
+                Ok(Ok(bytes)) => {
+                    let samples = crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes);
+                    Some(Ok(samples))
+                }
+                Ok(Err(msg)) => Some(Err(error::Error::Other(msg))),
+                Err(_) => None,
+            };
+        }
+        None
     }
 }
 
@@ -395,7 +449,8 @@ pub struct AsyncRtlSdrReader {
 
 impl AsyncRtlSdrReader {
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(ASYNC_QUEUE_CHUNKS);
         let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
