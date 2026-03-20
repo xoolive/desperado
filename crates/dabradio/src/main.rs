@@ -13,11 +13,41 @@ mod pad;
 
 use clap::Parser;
 use crossbeam_channel as channel;
-use desperado::{DeviceConfig, IqFormat, IqSource};
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+use desperado::IqAsyncSource;
+use desperado::{IqFormat, IqSource};
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+use futures::StreamExt;
+use num_complex::Complex;
 use pad::PadData;
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use std::str::FromStr;
 use tinyaudio::prelude::*;
 use tracing::{debug, info, warn};
+
+/// Unified IQ chunk iterator that works with both sync and async sources.
+///
+/// For file/stdin sources, uses synchronous `IqSource` (simple, no threading).
+/// For live SDR sources, uses `IqAsyncSource` which runs USB reads in a
+/// background thread, preventing sample loss during heavy OFDM processing.
+enum IqChunkSource {
+    Sync(IqSource),
+    #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+    Async(IqAsyncSource),
+}
+
+impl IqChunkSource {
+    /// Get the next chunk of IQ samples.
+    /// For sync sources, this blocks until data is available.
+    /// For async sources, this awaits the background reader thread.
+    async fn next_chunk(&mut self) -> Option<desperado::error::Result<Vec<Complex<f32>>>> {
+        match self {
+            IqChunkSource::Sync(source) => source.next(),
+            #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+            IqChunkSource::Async(source) => source.next().await,
+        }
+    }
+}
 
 const AUDIO_RATE: usize = 48_000;
 
@@ -80,7 +110,8 @@ struct Cli {
     bypass_deinterleave: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -148,13 +179,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open IQ source (file or live SDR URI)
     let chunk_size = constants::T_F; // One frame's worth of samples
-    let (source, is_file_source) = open_iq_source(
+    let (mut source, is_file_source) = open_iq_source(
         source,
         center_freq,
         constants::SAMPLE_RATE,
         chunk_size,
         iq_format,
-    )?;
+    )
+    .await?;
 
     let mut ofdm_processor = ofdm::processor::OfdmProcessor::new();
     let mut ensemble = fic::fib::EnsembleInfo::new();
@@ -191,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    for chunk in source {
+    while let Some(chunk) = source.next_chunk().await {
         let samples = chunk?;
         let frames = ofdm_processor.process(&samples);
 
@@ -427,26 +459,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn open_iq_source(
+async fn open_iq_source(
     input: &str,
     center_freq: u32,
     sample_rate: u32,
     chunk_size: usize,
     iq_format: IqFormat,
-) -> Result<(IqSource, bool), Box<dyn std::error::Error>> {
+) -> Result<(IqChunkSource, bool), Box<dyn std::error::Error>> {
+    // File and stdin: use synchronous IqSource (simple, reliable)
     if input == "-" {
-        // Read from stdin. Treat as file-like source (blocking audio send)
-        // so that piped file data gets proper pacing. When piped from rtl_sdr,
-        // the data arrives at real-time rate, so blocking send is fine too.
         let source = IqSource::from_stdin(center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((source, true));
+        return Ok((IqChunkSource::Sync(source), true));
     }
 
     if !is_device_uri(input) {
         let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((source, true));
+        return Ok((IqChunkSource::Sync(source), true));
     }
 
+    // Live SDR: use async IqAsyncSource (background thread prevents USB FIFO overflow)
     if input.starts_with("rtlsdr://") {
         #[cfg(not(feature = "rtlsdr"))]
         {
@@ -470,9 +501,19 @@ fn open_iq_source(
 
     let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
     info!("Opening live SDR source: {}", configured_uri);
-    let config = DeviceConfig::from_str(&configured_uri)?;
-    let source = IqSource::from_device_config(config)?;
-    Ok((source, false))
+
+    #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+    {
+        let config = desperado::DeviceConfig::from_str(&configured_uri)?;
+        let source = IqAsyncSource::from_device_config(&config).await?;
+        Ok((IqChunkSource::Async(source), false))
+    }
+
+    #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+    Err(
+        format!("No SDR backend enabled for URI: {configured_uri}. Rebuild with --features rtlsdr")
+            .into(),
+    )
 }
 
 fn is_device_uri(input: &str) -> bool {

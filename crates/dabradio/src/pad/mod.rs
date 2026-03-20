@@ -275,9 +275,8 @@ impl DlsReassembler {
 /// Decode EBU Latin character set to UTF-8 (ETSI TS 101 756).
 fn decode_charset(data: &[u8], charset: u8) -> String {
     match charset {
-        0 => decode_ebu_latin(data),                     // EBU Latin (default)
-        6 => String::from_utf8_lossy(data).into_owned(), // UTF-8
-        15 => decode_ebu_latin(data),                    // EBU Latin (explicit)
+        0 | 15 => crate::charsets::ebu_latin_to_utf8(data), // EBU Latin
+        6 => String::from_utf8_lossy(data).into_owned(),    // UTF-8
         _ => {
             // For other charsets, try UTF-8 then fall back to Latin-1
             if let Ok(s) = std::str::from_utf8(data) {
@@ -287,69 +286,6 @@ fn decode_charset(data: &[u8], charset: u8) -> String {
             }
         }
     }
-}
-
-/// Decode EBU Latin to UTF-8 (subset mapping).
-fn decode_ebu_latin(data: &[u8]) -> String {
-    let mut result = String::with_capacity(data.len());
-    for &b in data {
-        // EBU Latin is mostly compatible with ISO 8859-1/15
-        // Map common special characters
-        let c = match b {
-            0x00..=0x1F => ' ', // Control chars -> space
-            0x8D => 'ß',        // German sharp S
-            0x8E => '¿',
-            0x8F => '¡',
-            0x91 => 'æ',
-            0x92 => 'Æ',
-            0x93 => 'ô',
-            0x94 => 'ö',
-            0x95 => 'ò',
-            0x96 => 'û',
-            0x97 => 'ù',
-            0x98 => 'ÿ',
-            0x99 => 'Ö',
-            0x9A => 'Ü',
-            0x9C => '£',
-            0x9D => '¥',
-            0x9F => 'ƒ',
-            0xE0 => 'Ω', // Greek omega
-            0xE1 => 'á',
-            0xE2 => 'í',
-            0xE3 => 'ó',
-            0xE4 => 'ú',
-            0xE5 => 'ñ',
-            0xE6 => 'Ñ',
-            0xE7 => 'ª',
-            0xE8 => 'º',
-            0xE9 => '¿',
-            0xEA => '⌐',
-            0xEB => '¬',
-            0xEC => '½',
-            0xED => '¼',
-            0xEE => '¡',
-            0xEF => '«',
-            0xF0 => '»',
-            0xF1 => 'À',
-            0xF2 => 'Â',
-            0xF3 => 'Ê',
-            0xF4 => 'Ë',
-            0xF5 => 'È',
-            0xF6 => 'Î',
-            0xF7 => 'Ï',
-            0xF8 => 'Ì',
-            0xF9 => 'Ô',
-            0xFA => 'Ò',
-            0xFB => 'Û',
-            0xFC => 'Ù',
-            0xFD => 'ÿ',
-            0xFE => '¯',
-            0xFF => '\u{00A0}', // Non-breaking space
-            _ => b as char,     // Direct mapping for printable ASCII + Latin-1
-        };
-        result.push(c);
-    }
-    result.trim().to_string()
 }
 
 /// F-PAD length in bytes.
@@ -1007,15 +943,15 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_ebu_latin() {
+    fn test_decode_charset_ebu_latin() {
         let data = b"FRANCE CULTURE";
-        let result = decode_ebu_latin(data);
+        let result = decode_charset(data, 0);
         assert_eq!(result, "FRANCE CULTURE");
 
-        // With special characters
-        let data2 = [b'C', b'a', b'f', 0xE9]; // "Café" with é
-        let result2 = decode_ebu_latin(&data2);
-        assert!(result2.starts_with("Caf"));
+        // With EBU Latin accented characters (charset 0)
+        let data2 = [b'C', b'a', b'f', 0x82]; // "Café" — 0x82 = é in EBU Latin
+        let result2 = decode_charset(&data2, 0);
+        assert_eq!(result2, "Café");
     }
 
     #[test]
