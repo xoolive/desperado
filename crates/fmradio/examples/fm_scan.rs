@@ -274,6 +274,7 @@ fn open_scan_reader(
             sample_rate,
             gain: gain_from_tenths_db(gain_tenths_db),
             bias_tee: false,
+            freq_correction_ppm: 0,
         }) {
             Ok(reader) => {
                 if retry_count > 0 {

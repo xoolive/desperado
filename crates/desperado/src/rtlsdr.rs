@@ -161,6 +161,8 @@ pub struct RtlSdrConfig {
     pub gain: Gain,
     /// Enable bias tee (default: false)
     pub bias_tee: bool,
+    /// Frequency correction in PPM (default: 0)
+    pub freq_correction_ppm: i32,
 }
 
 impl RtlSdrConfig {
@@ -172,6 +174,7 @@ impl RtlSdrConfig {
             sample_rate,
             gain,
             bias_tee: false,
+            freq_correction_ppm: 0,
         }
     }
 
@@ -194,6 +197,7 @@ impl RtlSdrConfig {
             sample_rate,
             gain,
             bias_tee: false,
+            freq_correction_ppm: 0,
         }
     }
 }
@@ -298,14 +302,18 @@ impl RtlSdrReader {
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
         let mut rtlsdr = open_device_with_selector(&config.device)?;
         rtlsdr.set_sample_rate(config.sample_rate)?;
+        let _ = rtlsdr.set_freq_correction(config.freq_correction_ppm);
         rtlsdr.set_center_freq(config.center_freq)?;
         match config.gain {
             Gain::Manual(gain_db) => {
-                // Convert dB to rtl-sdr units (gain * 10)
                 let gain_tenths = (gain_db * 10.0) as i32;
+                tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
                 rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
             }
-            Gain::Auto => rtlsdr.set_tuner_gain(TunerGain::Auto)?,
+            Gain::Auto => {
+                tracing::info!("Setting automatic tuner gain");
+                rtlsdr.set_tuner_gain(TunerGain::Auto)?
+            }
             Gain::Elements(_) => {
                 eprintln!(
                     "Warning: RTL-SDR does not support element-based gain control, using auto gain"
@@ -371,10 +379,9 @@ impl Iterator for RtlSdrReader {
             }
         }
 
-        Some(Ok(crate::convert_bytes_to_complex(
-            IqFormat::Cu8,
-            &self.buf[self.pos..self.end],
-        )))
+        let samples = crate::convert_bytes_to_complex(IqFormat::Cu8, &self.buf[self.pos..self.end]);
+        self.pos = self.end;
+        Some(Ok(samples))
     }
 }
 
@@ -396,6 +403,7 @@ impl AsyncRtlSdrReader {
             let init_res = (|| -> error::Result<RtlSdr> {
                 let mut rtl = open_device_with_selector(&cfg.device)?;
                 rtl.set_sample_rate(cfg.sample_rate)?;
+                let _ = rtl.set_freq_correction(cfg.freq_correction_ppm);
                 rtl.set_center_freq(cfg.center_freq)?;
                 match cfg.gain {
                     Gain::Manual(gain_db) => {

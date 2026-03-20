@@ -462,6 +462,7 @@ impl std::str::FromStr for DeviceConfig {
                 let mut sample_rate: Option<u32> = None;
                 let mut gain = Gain::Auto;
                 let mut bias_tee = false;
+                let mut ppm: i32 = 0;
 
                 for param in query.split('&') {
                     if param.is_empty() {
@@ -491,6 +492,11 @@ impl std::str::FromStr for DeviceConfig {
                         "bias_tee" | "bias-tee" => {
                             bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
                         }
+                        "ppm" | "freq_correction" | "freq-correction" => {
+                            ppm = kv[1]
+                                .parse::<i32>()
+                                .map_err(|_| Error::other(format!("Invalid ppm: {}", kv[1])))?;
+                        }
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -506,6 +512,7 @@ impl std::str::FromStr for DeviceConfig {
                     sample_rate,
                     gain,
                     bias_tee,
+                    freq_correction_ppm: ppm,
                 }))
             }
             #[cfg(feature = "soapy")]
@@ -899,6 +906,7 @@ impl IqSource {
                 None => Gain::Auto,
             },
             bias_tee: false,
+            freq_correction_ppm: 0,
         };
         let source = rtlsdr::RtlSdrReader::new(&config)?;
         Ok(IqSource::RtlSdr(source))
@@ -1090,6 +1098,7 @@ impl IqAsyncSource {
                 None => Gain::Auto,
             },
             bias_tee: false,
+            freq_correction_ppm: 0,
         };
         let async_reader = rtlsdr::AsyncRtlSdrReader::new(&config)?;
         Ok(IqAsyncSource::RtlSdr(async_reader))
