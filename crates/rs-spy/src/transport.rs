@@ -484,6 +484,52 @@ impl Airspy {
         Ok(())
     }
 
+    /// Set sample rate by value (Hz), matching libairspy behavior.
+    ///
+    /// When IQ conversion is enabled in host-side processing, libairspy sends
+    /// double the requested rate (in kHz units) to firmware.
+    pub fn set_sample_rate_hz(&self, sample_rate_hz: u32, iq_mode: bool) -> Result<()> {
+        tracing::debug!(sample_rate_hz, iq_mode, "set_sample_rate_hz");
+
+        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+            tracing::trace!(
+                "clear_halt before set_sample_rate_hz: {:?} (may be expected)",
+                e
+            );
+        }
+
+        let mut retval = [0u8; 1];
+        let mut value_hz = sample_rate_hz;
+        if value_hz >= 1_000_000 {
+            if iq_mode {
+                value_hz = value_hz.saturating_mul(2);
+            }
+            value_hz /= 1000;
+        }
+
+        let n = self.control_in(
+            0xC0,
+            AirspyCommand::SetSamplerate.as_u8(),
+            0,
+            value_hz as u16,
+            &mut retval,
+        )?;
+
+        if n < 1 {
+            return Err(Error::ControlTransferFailed(
+                "SET_SAMPLERATE_HZ: no response".to_string(),
+            ));
+        }
+
+        tracing::debug!(
+            sample_rate_hz,
+            value_hz,
+            response = retval[0],
+            "set_sample_rate_hz: success"
+        );
+        Ok(())
+    }
+
     /// Set the LNA (Low Noise Amplifier) gain.
     ///
     /// # Arguments
