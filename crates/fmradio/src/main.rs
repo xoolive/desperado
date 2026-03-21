@@ -182,91 +182,96 @@ fn spawn_inline_tui(
                 };
 
                 let bar = level_bar(s.iq_level_dbfs);
-                let rt = one_line(&s.rds_rt, 56);
-                let ps = one_line(&s.rds_ps, 16);
-                let src = one_line(&s.source, 48);
-                let lines = vec![
-                    Line::from(format!(" Source: {}", src)),
-                    Line::from(format!(
-                        " Tune: {:.3} MHz   In: {} Hz   MPX: {:.0} Hz",
-                        s.center_freq_hz as f32 / 1_000_000.0,
-                        s.sample_rate_hz,
-                        s.mpx_rate_hz
-                    )),
-                    Line::from(""),
-                    Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
-                    Line::from(format!(" Audio Buffer: {} samples", s.audio_buf_fill)),
-                    Line::from(""),
-                    Line::from(format!(" RDS PS: {}", ps)),
-                    Line::from(format!(" RDS RT: {}", rt)),
-                    Line::from(format!(
-                        " RDS Blocks: valid={} total={}  BLER={:5.1}%",
-                        s.rds_valid_blocks, s.rds_total_blocks, rds_bler
-                    )),
-                    Line::from(format!(" RDS Groups: {}", s.rds_groups)),
-                    Line::from(""),
-                    Line::from(" Controls: <-/-> 100kHz, ^/v 1MHz, S stereo, q/Esc quit"),
-                ];
-
                 let title = format!(" FM Radio Dashboard ({}) ", s.mode);
                 let _ = terminal.draw(|f| {
+                    let area = f.area();
+                    let inner = area.width.saturating_sub(4) as usize;
+                    let src = one_line(&s.source, inner.saturating_sub(9));
+                    let ps = one_line(&s.rds_ps, inner.saturating_sub(10));
+                    let rt = one_line(&s.rds_rt, inner.saturating_sub(10));
+                    let lines = vec![
+                        Line::from(format!(" Source: {}", src)),
+                        Line::from(format!(
+                            " Tune: {:.3} MHz   In: {} Hz   MPX: {:.0} Hz",
+                            s.center_freq_hz as f32 / 1_000_000.0,
+                            s.sample_rate_hz,
+                            s.mpx_rate_hz
+                        )),
+                        Line::from(""),
+                        Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
+                        Line::from(format!(" Audio Buffer: {} samples", s.audio_buf_fill)),
+                        Line::from(""),
+                        Line::from(format!(" RDS PS: {}", ps)),
+                        Line::from(format!(" RDS RT: {}", rt)),
+                        Line::from(format!(
+                            " RDS Blocks: valid={} total={}  BLER={:5.1}%",
+                            s.rds_valid_blocks, s.rds_total_blocks, rds_bler
+                        )),
+                        Line::from(format!(" RDS Groups: {}", s.rds_groups)),
+                        Line::from(""),
+                        Line::from(" Controls: <-/-> 100kHz, ^/v 1MHz, S stereo, q/Esc quit"),
+                    ];
                     let p = Paragraph::new(lines)
                         .block(Block::default().title(title).borders(Borders::ALL));
-                    f.render_widget(p, f.area());
+                    f.render_widget(p, area);
                 });
             }
 
-            if event::poll(Duration::from_millis(1)).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
-                && key.kind == KeyEventKind::Press
-            {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        running.store(false, Ordering::Relaxed);
-                        break;
+            if event::poll(Duration::from_millis(1)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Resize(_, _)) => {
+                        let _ = terminal.autoresize();
+                        let _ = terminal.clear();
                     }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        let now = stereo_enabled.load(Ordering::Relaxed);
-                        stereo_enabled.store(!now, Ordering::Relaxed);
-                    }
-                    KeyCode::Left if can_hard_retune => {
-                        let next = requested_center_hz
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(100_000)
-                            .max(100_000);
-                        requested_center_hz.store(next, Ordering::Relaxed);
-                        if let Ok(mut s) = state.lock() {
-                            s.center_freq_hz = next;
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            running.store(false, Ordering::Relaxed);
+                            break;
                         }
-                    }
-                    KeyCode::Right if can_hard_retune => {
-                        let next = requested_center_hz
-                            .load(Ordering::Relaxed)
-                            .saturating_add(100_000);
-                        requested_center_hz.store(next, Ordering::Relaxed);
-                        if let Ok(mut s) = state.lock() {
-                            s.center_freq_hz = next;
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            let now = stereo_enabled.load(Ordering::Relaxed);
+                            stereo_enabled.store(!now, Ordering::Relaxed);
                         }
-                    }
-                    KeyCode::Up if can_hard_retune => {
-                        let next = requested_center_hz
-                            .load(Ordering::Relaxed)
-                            .saturating_add(1_000_000);
-                        requested_center_hz.store(next, Ordering::Relaxed);
-                        if let Ok(mut s) = state.lock() {
-                            s.center_freq_hz = next;
+                        KeyCode::Left if can_hard_retune => {
+                            let next = requested_center_hz
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(100_000)
+                                .max(100_000);
+                            requested_center_hz.store(next, Ordering::Relaxed);
+                            if let Ok(mut s) = state.lock() {
+                                s.center_freq_hz = next;
+                            }
                         }
-                    }
-                    KeyCode::Down if can_hard_retune => {
-                        let next = requested_center_hz
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(1_000_000)
-                            .max(100_000);
-                        requested_center_hz.store(next, Ordering::Relaxed);
-                        if let Ok(mut s) = state.lock() {
-                            s.center_freq_hz = next;
+                        KeyCode::Right if can_hard_retune => {
+                            let next = requested_center_hz
+                                .load(Ordering::Relaxed)
+                                .saturating_add(100_000);
+                            requested_center_hz.store(next, Ordering::Relaxed);
+                            if let Ok(mut s) = state.lock() {
+                                s.center_freq_hz = next;
+                            }
                         }
-                    }
+                        KeyCode::Up if can_hard_retune => {
+                            let next = requested_center_hz
+                                .load(Ordering::Relaxed)
+                                .saturating_add(1_000_000);
+                            requested_center_hz.store(next, Ordering::Relaxed);
+                            if let Ok(mut s) = state.lock() {
+                                s.center_freq_hz = next;
+                            }
+                        }
+                        KeyCode::Down if can_hard_retune => {
+                            let next = requested_center_hz
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(1_000_000)
+                                .max(100_000);
+                            requested_center_hz.store(next, Ordering::Relaxed);
+                            if let Ok(mut s) = state.lock() {
+                                s.center_freq_hz = next;
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
