@@ -45,20 +45,20 @@ cargo build --release -p fmradio --features soapy
 Listen to stereo FM on 103.5 MHz with RTL-SDR:
 
 ```bash
-cargo run --release -p fmradio -- -f 103.5M
+cargo run --release -p fmradio -- rtlsdr:// -f 103.5M
 ```
 
 Pipe audio to `play` (SoX):
 
 ```bash
-cargo run --release -p fmradio -- -f 103.5M | \
+cargo run --release -p fmradio -- rtlsdr:// -f 103.5M | \
   play -r 48000 -t raw -e s -b 16 -c 2 -
 ```
 
 ### Airspy Backend
 
 ```bash
-cargo run --release -p fmradio -- -f 99.1M --source airspy://
+cargo run --release -p fmradio -- airspy:// -f 99.1M
 ```
 
 ### RDS JSON Output
@@ -66,7 +66,7 @@ cargo run --release -p fmradio -- -f 99.1M --source airspy://
 Extract RDS data as JSON (newline-delimited, one group per line):
 
 ```bash
-cargo run --release -p fmradio -- -f 98.1M --json
+cargo run --release -p fmradio -- rtlsdr:// -f 98.1M
 ```
 
 ### Band Scan (Naive Signal Ranking)
@@ -135,7 +135,7 @@ Example output:
 Output raw MPX signal for comparison with reference implementation:
 
 ```bash
-cargo run --release -p fmradio -- -f 103.5M --raw-out --resample-out 228000 | \
+cargo run --release -p fmradio -- rtlsdr:// -f 103.5M --raw-out --resample-out 228000 | \
   redsea -r 228000
 ```
 
@@ -175,7 +175,7 @@ Input (6 MSps)
 Listen to 99.1 MHz and save RDS data to a file:
 
 ```bash
-cargo run --release -p fmradio -- -f 99.1M --json > rds_log.jsonl &
+cargo run --release -p fmradio -- rtlsdr:// -f 99.1M > rds_log.jsonl &
 # Press Ctrl+C to stop
 ```
 
@@ -185,7 +185,7 @@ Stream FM audio over network:
 
 ```bash
 # Receiver
-cargo run --release -p fmradio -- -f 103.5M | nc -l localhost 12345
+cargo run --release -p fmradio -- rtlsdr:// -f 103.5M | nc -l localhost 12345
 
 # Client
 nc localhost 12345 | play -r 48000 -t raw -e s -b 16 -c 2 -
@@ -196,7 +196,7 @@ nc localhost 12345 | play -r 48000 -t raw -e s -b 16 -c 2 -
 Monitor RDS with no audio playback:
 
 ```bash
-cargo run --release -p fmradio -- -f 98.1M --no-audio --json | jq '.ps'
+cargo run --release -p fmradio -- rtlsdr:// -f 98.1M --no-audio | jq '.ps'
 ```
 
 ## Testing
@@ -218,32 +218,32 @@ Run with live FM signal (manual verification):
 ### With redsea (Reference RDS Decoder)
 
 ```bash
-fmradio -f 103.5M --raw-out --resample-out 171000 | redsea -r 171000
+fmradio rtlsdr:// -f 103.5M --raw-out --resample-out 171000 | redsea -r 171000
 ```
 
 ### With sox/play
 
 ```bash
-fmradio -f 99.1M | play -t raw -r 48000 -e s -b 16 -c 2 -
+fmradio rtlsdr:// -f 99.1M | play -t raw -r 48000 -e s -b 16 -c 2 -
 ```
 
 ### With ffmpeg
 
 ```bash
-fmradio -f 103.5M | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.mp3
+fmradio rtlsdr:// -f 103.5M | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.mp3
 ```
 
 ## Troubleshooting
 
 ### No Audio Output
-- Check `--source` is correct and device is connected
+- Check source URI/path is correct and device is connected
 - Try `--mono` if stereo causes issues
 - Verify gain with `-g auto` or manual value
 
 ### RDS Data Not Appearing
 - Weak signal? Try increasing gain: `-g 50` (RTL-SDR)
 - Some stations broadcast incomplete RDS groups
-- Use `--json` to verify JSON output format
+- RDS output is emitted as JSON lines by default
 
 ### USB Device Not Found
 - **Linux:** Install udev rules for your device

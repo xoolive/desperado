@@ -9,14 +9,14 @@
 //! - redsea (<https://github.com/windytan/redsea>)
 //! - liquid-dsp (<https://github.com/jgaeddert/liquid-dsp>)
 
-use super::parser::{DIFlags, RdsGroupJson, RdsParser};
+use super::parser::{RdsGroupJson, RdsParser};
 use desperado::dsp::filters::LowPassFir;
 use desperado::dsp::{agc::Agc, nco::Nco, symsync::SymSync};
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::f32::consts::PI;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Stereo decoder using a complex PLL locked to the 19 kHz pilot tone.
 pub struct StereoDecoderPLL {
@@ -259,7 +259,9 @@ impl RdsResamplerCustom {
             let expected_delta = 2.0 * std::f64::consts::PI * 19000.0 / self.input_rate as f64;
             trace!(
                 "[RDS-PILOT-DBG] avg_delta: {:.5}, expected: {:.5}, measured_freq: {:.1} Hz",
-                avg_delta, expected_delta, measured_freq
+                avg_delta,
+                expected_delta,
+                measured_freq
             );
         }
 
@@ -399,20 +401,12 @@ pub struct RdsDecoder {
     bits: Vec<u8>,
     rds_parser: RdsParser,
 
-    // Display state
-    last_station: Option<String>,
-    last_radiotext: Option<String>,
-    last_pty: u8,
-    last_di_flags: DIFlags,
-    last_af_list: Vec<u16>,
     debug_counter: u64,
 
     // PLL acquisition state
     pll_locked: bool,        // True when PLL has acquired lock
     pll_lock_counter: usize, // Count consecutive low phase errors
 
-    // JSON output mode
-    json_mode: bool,
     print_json_output: bool,
     json_output_cache: Vec<RdsGroupJson>,
 }
@@ -423,10 +417,10 @@ impl RdsDecoder {
     /// - 171 kHz input rate
     /// - Decimate by 24 → 7125 Hz
     /// - 7125 / 2375 = 3.0 samples per symbol exactly
-    pub fn new(_sample_rate: f32, verbose: bool, json: bool) -> Self {
+    pub fn new(_sample_rate: f32, verbose: bool) -> Self {
         let mut rds_parser = RdsParser::new();
         rds_parser.set_verbose(verbose);
-        rds_parser.set_json_mode(json);
+        rds_parser.set_json_mode(true);
 
         // Fixed parameters matching redsea exactly
         let sample_rate = 171_000.0_f32; // We now expect 171 kHz input (from resampler)
@@ -454,9 +448,9 @@ impl RdsDecoder {
         // The NCO runs at the DECIMATED rate (7125 Hz) for phase tracking at symbol rate
         let decimated_rate = 7125.0_f64;
         let mut nco = Nco::new(0.0, decimated_rate); // Zero frequency for IQ path
-        // PLL bandwidth for phase tracking (at 7125 Hz rate, 2375 symbol rate)
-        // Use ~2 Hz effective bandwidth for stable tracking
-        // At symbol rate ~2375 Hz, we update every ~3 samples, so effective = nominal * (2375/7125) / 3 ≈ nominal * 0.11
+                                                     // PLL bandwidth for phase tracking (at 7125 Hz rate, 2375 symbol rate)
+                                                     // Use ~2 Hz effective bandwidth for stable tracking
+                                                     // At symbol rate ~2375 Hz, we update every ~3 samples, so effective = nominal * (2375/7125) / 3 ≈ nominal * 0.11
         nco.set_pll_bandwidth(20.0, decimated_rate); // ~2.2 Hz effective at symbol rate
 
         debug!("[RDS-DSP] NCO: freq=0 Hz (IQ path), PLL bandwidth=20Hz (~2Hz effective)");
@@ -492,15 +486,9 @@ impl RdsDecoder {
             prev_biphase_bit: false,
             bits: Vec::new(),
             rds_parser,
-            last_station: None,
-            last_radiotext: None,
-            last_pty: 255,
-            last_di_flags: DIFlags::default(),
-            last_af_list: Vec::new(),
             debug_counter: 0,
             pll_locked: false,
             pll_lock_counter: 0,
-            json_mode: json,
             print_json_output: true,
             json_output_cache: Vec::new(),
         }
@@ -751,7 +739,10 @@ impl RdsDecoder {
                 if self.debug_counter % 30000 < 200 && old_polarity != self.biphase_polarity {
                     trace!(
                         "[RDS-BIPH-CLK] even: {:.1}, odd: {:.1}, polarity: {} -> {}",
-                        even_sum, odd_sum, old_polarity, self.biphase_polarity
+                        even_sum,
+                        odd_sum,
+                        old_polarity,
+                        self.biphase_polarity
                     );
                 }
             }
@@ -777,7 +768,9 @@ impl RdsDecoder {
                 }
                 trace!(
                     "[RDS-BIPH] diff_product: {:+.3}, biph_bit: {}, Δphase: {:+.1}°",
-                    diff_product, biphase_bit, phase_diff
+                    diff_product,
+                    biphase_bit,
+                    phase_diff
                 );
             }
 
@@ -990,7 +983,10 @@ impl RdsDecoder {
                     let biphase_mag = (biphase_i * biphase_i + biphase_q * biphase_q).sqrt();
                     trace!(
                         "[RDS-BIPH-IQ] biphase_i: {:.3}, biphase_q: {:.3}, mag: {:.3}, bit: {}",
-                        biphase_i, biphase_q, biphase_mag, biphase_bit
+                        biphase_i,
+                        biphase_q,
+                        biphase_mag,
+                        biphase_bit
                     );
                 }
 
@@ -1015,6 +1011,10 @@ impl RdsDecoder {
 
     pub fn station_name(&self) -> Option<String> {
         self.rds_parser.station_name()
+    }
+
+    pub fn radio_text(&self) -> Option<String> {
+        self.rds_parser.radio_text()
     }
 
     pub fn stats(&self) -> (u64, u32, u32) {
@@ -1051,146 +1051,15 @@ impl RdsDecoder {
 
             self.rds_parser.push_bits(&self.bits);
 
-            // In JSON mode, output JSON objects and skip human-readable output
-            if self.json_mode {
-                let outputs = self.rds_parser.take_json_outputs();
-                if self.print_json_output {
-                    for json_out in outputs {
-                        if let Ok(json_str) = serde_json::to_string(&json_out) {
-                            println!("{}", json_str);
-                        }
+            let outputs = self.rds_parser.take_json_outputs();
+            if self.print_json_output {
+                for json_out in outputs {
+                    if let Ok(json_str) = serde_json::to_string(&json_out) {
+                        info!(target: "fmradio::rds_json", "{}", json_str);
                     }
-                } else {
-                    self.json_output_cache.extend(outputs);
                 }
-                self.bits.clear();
-                return;
-            }
-
-            // Display station name
-            if let Some(station) = self.rds_parser.station_name()
-                && self.last_station.as_ref() != Some(&station)
-            {
-                println!("[RDS] Station: {}", station);
-                self.last_station = Some(station);
-            }
-
-            // Display radio text
-            if let Some(text) = self.rds_parser.radio_text()
-                && self.last_radiotext.as_ref() != Some(&text)
-            {
-                println!("[RDS] Radio Text: {}", text);
-                self.last_radiotext = Some(text);
-            }
-
-            // Display metadata from Group 0A/0B (only on change, and only if we've received data)
-            let info = self.rds_parser.station_info();
-            let (bits, blocks, groups) = self.rds_parser.stats();
-
-            // Print debug stats periodically (every ~10k bits = ~84 groups worth)
-            if bits % 10000 < 200 && bits > 0 {
-                debug!(
-                    "[RDS-DBG] Bits: {}, Blocks: {}, Groups: {}",
-                    bits, blocks, groups
-                );
-            }
-
-            // Only print PTY and DI if they changed AND we've actually received groups
-            if self.rds_parser.has_data()
-                && (self.last_pty != info.program_type || self.last_di_flags != info.di_flags)
-            {
-                println!(
-                    "[RDS] PTY: {} ({}) | DI: {}",
-                    info.program_type,
-                    self.rds_parser.program_type_name(),
-                    info.di_flags.as_string()
-                );
-                self.last_pty = info.program_type;
-                self.last_di_flags = info.di_flags.clone();
-            }
-
-            // Print flags if present
-            if info.is_traffic_program || info.is_traffic_announcement {
-                let mut metadata = String::new();
-                if info.is_traffic_program {
-                    metadata.push_str("TP ");
-                }
-                if info.is_traffic_announcement {
-                    metadata.push_str("TA ");
-                }
-                if !metadata.is_empty() {
-                    println!("[RDS] Flags: {}", metadata.trim());
-                }
-            }
-
-            // Print AF list if changed
-            if info.af_list != self.last_af_list && !info.af_list.is_empty() {
-                let frequencies: Vec<String> = info
-                    .af_list
-                    .iter()
-                    .map(|f| format!("{:.1}", (*f as f32) * 0.01 + 87.5))
-                    .collect();
-                println!("[RDS] Alt Frequencies: {}", frequencies.join(", "));
-                self.last_af_list = info.af_list.clone();
-            }
-
-            // Display Group 1A data
-            if let Some(pin) = &info.program_item {
-                println!(
-                    "[RDS-1A] PIN: Day {}, {:02}:{:02}",
-                    pin.day, pin.hour, pin.minute
-                );
-            }
-            if let Some(lang) = info.language_code
-                && let Some(lang_name) = self.rds_parser.language_name()
-            {
-                println!("[RDS-1A] Language: {} (0x{:02X})", lang_name, lang);
-            }
-            if let Some(ecc) = info.extended_country_code {
-                println!("[RDS-1A] ECC: 0x{:02X}", ecc);
-            }
-            if let Some(tmc_id) = info.tmc_id {
-                println!("[RDS-1A] TMC ID: 0x{:03X}", tmc_id);
-            }
-
-            // Display Group 3A data
-            if let Some(oda) = &info.oda_info {
-                println!(
-                    "[RDS-3A] ODA: Target={}A, App ID=0x{:04X} ({})",
-                    oda.target_group_type,
-                    oda.app_id,
-                    RdsParser::oda_app_name(oda.app_id)
-                );
-            }
-
-            // Display Group 4A data
-            if let Some(clock) = &info.clock_time {
-                println!(
-                    "[RDS-4A] Time: {}-{:02}-{:02} {:02}:{:02} UTC, Offset: {:+.1}h",
-                    clock.year,
-                    clock.month,
-                    clock.day,
-                    clock.hour,
-                    clock.minute,
-                    clock.local_offset
-                );
-            }
-
-            // Display Group 14A data
-            if let Some(eon) = &info.eon_info {
-                println!(
-                    "[RDS-14A] EON: PI=0x{:04X}, Variant {}",
-                    eon.pi, eon.variant
-                );
-                if let Some(pty) = eon.program_type {
-                    println!("[RDS-14A] EON PTY: {}", pty);
-                }
-                if let Some(has_link) = eon.has_linkage
-                    && has_link
-                    && let Some(lsn) = eon.linkage_set
-                {
-                    println!("[RDS-14A] Linkage Set: 0x{:03X}", lsn);
-                }
+            } else {
+                self.json_output_cache.extend(outputs);
             }
 
             self.bits.clear();

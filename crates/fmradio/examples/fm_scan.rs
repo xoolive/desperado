@@ -187,7 +187,7 @@ fn verify_rds(
         let mpx_rate = sample_rate as f32 / factor as f32;
         let mut stereo = StereoDecoderPLL::new(mpx_rate);
         let mut rds_resampler = RdsResamplerCustom::new(mpx_rate, 171_000.0);
-        let mut rds = RdsDecoder::new(171_000.0, false, true);
+        let mut rds = RdsDecoder::new(171_000.0, false);
         rds.set_print_json_output(false);
 
         let mut warmup_chunks = 4usize;

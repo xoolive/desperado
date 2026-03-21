@@ -18,7 +18,7 @@
 //! cargo test --release -p fmradio -- --include-ignored
 //! ```
 
-use desperado::dsp::{DspBlock, decimator::Decimator, filters::LowPassFir, rotate::Rotate};
+use desperado::dsp::{decimator::Decimator, filters::LowPassFir, rotate::Rotate, DspBlock};
 use fmradio::fm::PhaseExtractor;
 use fmradio::rds::{RdsDecoder, RdsGroupJson, RdsResamplerCustom, StereoDecoderPLL};
 use std::f32::consts::PI;
@@ -46,7 +46,7 @@ fn decode_rds(offset_hz: i32) -> Vec<RdsGroupJson> {
 
     let mut stereo = StereoDecoderPLL::new(actual_mpx_rate);
     let mut rds_resampler = RdsResamplerCustom::new(actual_mpx_rate, RDS_TARGET_RATE);
-    let mut rds = RdsDecoder::new(RDS_TARGET_RATE, false, true);
+    let mut rds = RdsDecoder::new(RDS_TARGET_RATE, false);
     rds.set_print_json_output(false);
 
     // Lowpass not used in stereo path but keeps the chain consistent with main.rs
