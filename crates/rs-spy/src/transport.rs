@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::{AIRSPY_PID, AIRSPY_VID};
 use rusb::{Context, Device, DeviceHandle, UsbContext};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 

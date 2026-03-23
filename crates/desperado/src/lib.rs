@@ -1192,7 +1192,12 @@ impl IqAsyncSource {
     ///
     /// This is a convenience method that dispatches to the appropriate device-specific
     /// constructor based on the DeviceConfig variant.
-    #[cfg(any(feature = "rtlsdr", feature = "pluto", feature = "soapy", feature = "airspy"))]
+    #[cfg(any(
+        feature = "rtlsdr",
+        feature = "pluto",
+        feature = "soapy",
+        feature = "airspy"
+    ))]
     pub async fn from_device_config(config: &DeviceConfig) -> error::Result<Self> {
         match config {
             #[cfg(feature = "rtlsdr")]

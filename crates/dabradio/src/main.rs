@@ -12,22 +12,29 @@ mod ofdm;
 mod pad;
 
 use clap::Parser;
+use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossbeam_channel as channel;
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use desperado::DeviceConfig;
-use desperado::dsp::rotate::Rotate;
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+use desperado::IqAsyncSource;
 use desperado::dsp::DspBlock;
 #[cfg(feature = "resampler")]
 use desperado::dsp::dab_resampler::DabResampler;
+use desperado::dsp::rotate::Rotate;
 use desperado::{IqFormat, IqSource};
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-use desperado::IqAsyncSource;
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use futures::StreamExt;
 use num_complex::Complex;
 use pad::PadData;
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    text::Line,
+    widgets::{Block, Borders, Paragraph},
+};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -38,13 +45,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
-};
 use tinyaudio::prelude::*;
 use tracing::Level;
 use tracing::{debug, info, warn};
@@ -172,17 +172,43 @@ fn spawn_dab_tui(
                         " Controls: Ctrl-C quit (stdin is piped)"
                     };
                     let left_lines = vec![
-                        Line::from(format!(" Source: {}", one_line(&s.source, inner.saturating_sub(9)))),
-                        Line::from(format!(" Channel: {}   Freq: {:.3} MHz", one_line(&s.channel, 8), s.center_freq_hz as f64 / 1_000_000.0)),
-                        Line::from(format!(" Input: {} Hz   Output: {} Hz", s.input_rate_hz, s.output_rate_hz)),
+                        Line::from(format!(
+                            " Source: {}",
+                            one_line(&s.source, inner.saturating_sub(9))
+                        )),
+                        Line::from(format!(
+                            " Channel: {}   Freq: {:.3} MHz",
+                            one_line(&s.channel, 8),
+                            s.center_freq_hz as f64 / 1_000_000.0
+                        )),
+                        Line::from(format!(
+                            " Input: {} Hz   Output: {} Hz",
+                            s.input_rate_hz, s.output_rate_hz
+                        )),
                         Line::from(""),
-                        Line::from(format!(" OFDM frames: {}   FIBs: {}   MSC frames: {}", s.ofdm_frames, s.fibs, s.msc_frames)),
-                        Line::from(format!(" Service: {}", one_line(&s.service, inner.saturating_sub(10)))),
-                        Line::from(format!(" DLS: {}", one_line(&s.dls, inner.saturating_sub(6)))),
-                        Line::from(format!(" MOT: {}   {}", s.mot_count, one_line(&s.mot_info, inner.saturating_sub(15)))),
+                        Line::from(format!(
+                            " OFDM frames: {}   FIBs: {}   MSC frames: {}",
+                            s.ofdm_frames, s.fibs, s.msc_frames
+                        )),
+                        Line::from(format!(
+                            " Service: {}",
+                            one_line(&s.service, inner.saturating_sub(10))
+                        )),
+                        Line::from(format!(
+                            " DLS: {}",
+                            one_line(&s.dls, inner.saturating_sub(6))
+                        )),
+                        Line::from(format!(
+                            " MOT: {}   {}",
+                            s.mot_count,
+                            one_line(&s.mot_info, inner.saturating_sub(15))
+                        )),
                         Line::from(format!(" Audio queue: {} samples", s.audio_q_fill)),
                         Line::from(""),
-                        Line::from(format!(" Status: {}", one_line(&s.status, inner.saturating_sub(9)))),
+                        Line::from(format!(
+                            " Status: {}",
+                            one_line(&s.status, inner.saturating_sub(9))
+                        )),
                         Line::from(""),
                         Line::from(controls),
                     ];
@@ -196,7 +222,10 @@ fn spawn_dab_tui(
 
                     let right_lines = vec![
                         Line::from(format!(" MOT count: {}", s.mot_count)),
-                        Line::from(format!(" {}", one_line(&s.mot_info, right.width.saturating_sub(4) as usize))),
+                        Line::from(format!(
+                            " {}",
+                            one_line(&s.mot_info, right.width.saturating_sub(4) as usize)
+                        )),
                         Line::from(""),
                     ];
 
@@ -207,9 +236,7 @@ fn spawn_dab_tui(
                     );
                     f.render_widget(right_panel, right);
 
-                    if inline_image_support
-                        && let Some(path) = &s.mot_preview_path
-                    {
+                    if inline_image_support && let Some(path) = &s.mot_preview_path {
                         draw_tui_image(path, right);
                     }
                 });
@@ -237,7 +264,7 @@ fn spawn_dab_tui(
         let _ = terminal.clear();
         let _ = terminal.show_cursor();
         let _ = disable_raw_mode();
-        
+
         // Clear Kitty graphics protocol images before exiting
         if inline_image_support {
             let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
@@ -456,7 +483,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cfg!(debug_assertions) && is_device_uri(source) && !cli.no_audio {
-        warn!("Debug build is not real-time for live SDR; use --release for valid audio underrun/hiccup checks");
+        warn!(
+            "Debug build is not real-time for live SDR; use --release for valid audio underrun/hiccup checks"
+        );
     }
 
     // Resolve center frequency
@@ -541,10 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_rate = constants::SAMPLE_RATE,
             "Enabling DAB-optimized I/Q resampler"
         );
-        Some(
-            DabResampler::new(input_sample_rate)
-                .map_err(std::io::Error::other)?,
-        )
+        Some(DabResampler::new(input_sample_rate).map_err(std::io::Error::other)?)
     } else {
         None
     };
@@ -580,7 +606,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_state = Arc::new(Mutex::new(TuiState {
         source: cli.source.clone().unwrap_or_default(),
-        channel: cli.channel.clone().unwrap_or_else(|| "(custom)".to_string()),
+        channel: cli
+            .channel
+            .clone()
+            .unwrap_or_else(|| "(custom)".to_string()),
         center_freq_hz: center_freq,
         input_rate_hz: input_sample_rate,
         output_rate_hz: constants::SAMPLE_RATE,
@@ -613,9 +642,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut iq_rotator = if cli.freq_shift_hz != 0 {
-        let angle =
-            -2.0f32 * std::f32::consts::PI * (cli.freq_shift_hz as f32) / (input_sample_rate as f32);
-        info!(shift_hz = cli.freq_shift_hz, "Applying input frequency shift");
+        let angle = -2.0f32 * std::f32::consts::PI * (cli.freq_shift_hz as f32)
+            / (input_sample_rate as f32);
+        info!(
+            shift_hz = cli.freq_shift_hz,
+            "Applying input frequency shift"
+        );
         Some(Rotate::new(angle))
     } else {
         None
@@ -878,9 +910,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             );
                                             if tui_enabled {
                                                 let mut path = std::env::temp_dir();
-                                                path.push(format!("dabradio_tui_mot_preview.{}", ext));
+                                                path.push(format!(
+                                                    "dabradio_tui_mot_preview.{}",
+                                                    ext
+                                                ));
                                                 if std::fs::write(&path, &mot.data).is_ok() {
-                                                    s.mot_preview_path = Some(path.to_string_lossy().to_string());
+                                                    s.mot_preview_path =
+                                                        Some(path.to_string_lossy().to_string());
                                                 }
                                             }
                                         }
@@ -943,7 +979,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if audio_last_dbg.elapsed() >= Duration::from_secs(1) {
                                     let underruns = audio_underruns.load(Ordering::Relaxed);
-                                    let delta_underruns = underruns.saturating_sub(audio_last_underruns);
+                                    let delta_underruns =
+                                        underruns.saturating_sub(audio_last_underruns);
                                     let dropped = audio_dropped.load(Ordering::Relaxed);
                                     let delta_dropped = dropped.saturating_sub(audio_last_dropped);
                                     debug!(target: "dabradio::audio_pipeline",

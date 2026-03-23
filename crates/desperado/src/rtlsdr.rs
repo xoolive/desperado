@@ -491,7 +491,9 @@ impl AsyncRtlSdrReader {
             }
             Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto)?,
             Gain::Elements(_) => {
-                eprintln!("Warning: RTL-SDR does not support element-based gain control, using auto gain");
+                eprintln!(
+                    "Warning: RTL-SDR does not support element-based gain control, using auto gain"
+                );
                 rtl.set_tuner_gain(TunerGain::Auto)?
             }
         };
@@ -504,14 +506,13 @@ impl AsyncRtlSdrReader {
 
         // Create channels
         let (adjust_tx, adjust_rx) = tokio::sync::mpsc::unbounded_channel::<RtlSdrMessage>();
-        let (samples_tx, samples_rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(ASYNC_QUEUE_CHUNKS);
+        let (samples_tx, samples_rx) =
+            tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(ASYNC_QUEUE_CHUNKS);
 
         // Spawn task for sample reading and control message handling
         // No explicit thread spawning - this is a tokio task managed by the executor
         let rtl_clone = rtl.clone();
-        tokio::spawn(async move {
-            Self::reader_task(rtl_clone, adjust_rx, samples_tx).await
-        });
+        tokio::spawn(async move { Self::reader_task(rtl_clone, adjust_rx, samples_tx).await });
 
         Ok(Self {
             adjust_tx,
@@ -618,7 +619,8 @@ impl AsyncRtlSdrReader {
     ///
     /// This is non-blocking - the message is queued and processed by the reader task.
     pub fn adjust(&self, message: RtlSdrMessage) -> error::Result<()> {
-        self.adjust_tx.send(message)
+        self.adjust_tx
+            .send(message)
             .map_err(|_| error::Error::device("AsyncRtlSdrReader task closed".to_string()))
     }
 

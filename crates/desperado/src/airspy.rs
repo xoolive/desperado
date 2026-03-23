@@ -40,7 +40,7 @@ use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
 
-use crate::{error, Gain, GainElementName};
+use crate::{Gain, GainElementName, error};
 
 /// Device selector for Airspy devices
 #[derive(Debug, Clone, PartialEq)]

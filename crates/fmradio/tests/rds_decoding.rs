@@ -18,7 +18,7 @@
 //! cargo test --release -p fmradio -- --include-ignored
 //! ```
 
-use desperado::dsp::{decimator::Decimator, filters::LowPassFir, rotate::Rotate, DspBlock};
+use desperado::dsp::{DspBlock, decimator::Decimator, filters::LowPassFir, rotate::Rotate};
 use fmradio::fm::PhaseExtractor;
 use fmradio::rds::{RdsDecoder, RdsGroupJson, RdsResamplerCustom, StereoDecoderPLL};
 use std::f32::consts::PI;
