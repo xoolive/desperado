@@ -7,7 +7,7 @@
 
 use futures::Stream;
 use num_complex::Complex;
-use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain};
+use rtl_sdr_rs::{DEFAULT_BUF_LENGTH, RtlSdr, TunerGain, error::RtlsdrError};
 
 use crate::{Gain, IqFormat, error};
 
@@ -204,6 +204,22 @@ impl RtlSdrConfig {
     }
 }
 
+/// Control message for dynamic RTL-SDR parameter adjustment
+///
+/// These messages are sent to the async reader task to adjust device parameters
+/// in real-time without restarting the reader.
+#[derive(Debug, Clone)]
+pub enum RtlSdrMessage {
+    /// Retune to center frequency (Hz)
+    Frequency(u32),
+    /// Change sample rate (Hz)
+    SampleRate(u32),
+    /// Change tuner gain
+    Gain(Gain),
+    /// Change frequency correction (PPM)
+    FreqCorrection(i32),
+}
+
 /// Device information for RTL-SDR devices
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtlSdrDeviceInfo {
@@ -303,6 +319,7 @@ pub struct RtlSdrReader {
 
 fn configure_rtlsdr(rtlsdr: &mut RtlSdr, config: &RtlSdrConfig) -> error::Result<()> {
     rtlsdr.set_sample_rate(config.sample_rate)?;
+    let _ = rtlsdr.set_tuner_bandwidth(config.sample_rate);
     let _ = rtlsdr.set_freq_correction(config.freq_correction_ppm);
     rtlsdr.set_center_freq(config.center_freq)?;
     match config.gain {
@@ -439,86 +456,177 @@ impl Iterator for RtlSdrReader {
     }
 }
 
-/**
- * Asynchronous RTL-SDR I/Q Reader
- */
+/// Asynchronous RTL-SDR I/Q Reader
+///
+/// Pure async implementation using `tokio::task::block_in_place()` for blocking USB I/O.
+/// No spawned threads - tokio manages the execution.
+///
+/// This reader accepts control messages to adjust device parameters (frequency, sample rate,
+/// gain, PPM) in real-time without restarting the reader.
 pub struct AsyncRtlSdrReader {
-    rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
-    _handle: std::thread::JoinHandle<()>,
+    /// Channel to send control messages (frequency, sample_rate, gain, etc)
+    adjust_tx: tokio::sync::mpsc::UnboundedSender<RtlSdrMessage>,
+    /// Channel to receive sample data
+    samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
 }
 
 impl AsyncRtlSdrReader {
+    /// Create new async RTL-SDR reader
+    ///
+    /// Sets up the device and wraps it in Arc<Mutex> for shared access between
+    /// the async context and the spawned task. Uses `block_in_place()` for
+    /// blocking USB operations without blocking the executor.
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(ASYNC_QUEUE_CHUNKS);
-        let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
-        let cfg = config.clone();
+        // Setup phase: configure device
+        let mut rtl = open_device_with_selector(&config.device)?;
+        rtl.set_sample_rate(config.sample_rate)?;
+        let _ = rtl.set_tuner_bandwidth(config.sample_rate);
+        let _ = rtl.set_freq_correction(config.freq_correction_ppm);
+        rtl.set_center_freq(config.center_freq)?;
 
-        let handle = std::thread::spawn(move || {
-            let init_res = (|| -> error::Result<RtlSdr> {
-                let mut rtl = open_device_with_selector(&cfg.device)?;
-                rtl.set_sample_rate(cfg.sample_rate)?;
-                let _ = rtl.set_freq_correction(cfg.freq_correction_ppm);
-                rtl.set_center_freq(cfg.center_freq)?;
-                match cfg.gain {
-                    Gain::Manual(gain_db) => {
-                        // Convert dB to rtl-sdr units (gain * 10)
-                        let gain_tenths = (gain_db * 10.0) as i32;
-                        rtl.set_tuner_gain(TunerGain::Manual(gain_tenths))?
-                    }
-                    Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto)?,
-                    Gain::Elements(_) => {
-                        eprintln!(
-                            "Warning: RTL-SDR does not support element-based gain control, using auto gain"
-                        );
-                        rtl.set_tuner_gain(TunerGain::Auto)?
-                    }
-                };
-                let _ = rtl.set_bias_tee(cfg.bias_tee);
-                rtl.reset_buffer()?;
-                Ok(rtl)
-            })();
+        match config.gain {
+            Gain::Manual(gain_db) => {
+                let gain_tenths = (gain_db * 10.0) as i32;
+                rtl.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+            }
+            Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto)?,
+            Gain::Elements(_) => {
+                eprintln!("Warning: RTL-SDR does not support element-based gain control, using auto gain");
+                rtl.set_tuner_gain(TunerGain::Auto)?
+            }
+        };
 
-            match init_res {
-                Ok(rtl) => {
-                    let _ = tx_init.send(Ok(()));
-                    let mut buffer = vec![0u8; DEFAULT_BUF_LENGTH];
-                    loop {
-                        match rtl.read_sync(&mut buffer) {
-                            Ok(bytes_read) => {
-                                if bytes_read == 0 {
-                                    let _ = tx.blocking_send(Ok(Vec::new()));
-                                    return;
-                                }
-                                let samples = crate::convert_bytes_to_complex(
-                                    IqFormat::Cu8,
-                                    &buffer[..bytes_read],
-                                );
-                                if tx.blocking_send(Ok(samples)).is_err() {
+        let _ = rtl.set_bias_tee(config.bias_tee);
+        rtl.reset_buffer()?;
+
+        // Wrap device in Arc<Mutex> for thread-safe shared access
+        let rtl = std::sync::Arc::new(std::sync::Mutex::new(rtl));
+
+        // Create channels
+        let (adjust_tx, adjust_rx) = tokio::sync::mpsc::unbounded_channel::<RtlSdrMessage>();
+        let (samples_tx, samples_rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(ASYNC_QUEUE_CHUNKS);
+
+        // Spawn task for sample reading and control message handling
+        // No explicit thread spawning - this is a tokio task managed by the executor
+        let rtl_clone = rtl.clone();
+        tokio::spawn(async move {
+            Self::reader_task(rtl_clone, adjust_rx, samples_tx).await
+        });
+
+        Ok(Self {
+            adjust_tx,
+            samples_rx,
+        })
+    }
+
+    /// Async task that handles sample reading and control messages
+    ///
+    /// - Reads USB data in blocking context via `block_in_place`
+    /// - Handles control messages (frequency, gain, etc) non-blockingly
+    /// - Uses `tokio::select!` to multiplex both operations
+    /// - Device is wrapped in Arc<Mutex> so both reads and control access it safely
+    async fn reader_task(
+        rtl: std::sync::Arc<std::sync::Mutex<RtlSdr>>,
+        mut adjust_rx: tokio::sync::mpsc::UnboundedReceiver<RtlSdrMessage>,
+        samples_tx: tokio::sync::mpsc::Sender<error::Result<Vec<Complex<f32>>>>,
+    ) {
+        let mut buf = vec![0u8; DEFAULT_BUF_LENGTH];
+
+        loop {
+            tokio::select! {
+                // Continuously try to read samples from device
+                result = async {
+                    tokio::task::block_in_place(|| {
+                        let rtl = match rtl.lock() {
+                            Ok(guard) => guard,
+                            Err(_poisoned) => {
+                                tracing::error!("RTL-SDR device mutex was poisoned");
+                                return Err(RtlsdrError::RtlsdrErr(
+                                    "Device mutex poisoned".to_string(),
+                                ));
+                            }
+                        };
+                        rtl.read_sync(&mut buf)
+                    })
+                } => {
+                    match result {
+                        Ok(n) => {
+                            if n > 0 {
+                                // Convert USB bytes to complex samples
+                                let samples = crate::convert_bytes_to_complex(IqFormat::Cu8, &buf[..n]);
+                                if samples_tx.send(Ok(samples)).await.is_err() {
+                                    // Receiver dropped, exit task
                                     return;
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.blocking_send(Err(e.into()));
-                                return;
-                            }
+                            // n == 0: No data read, shouldn't happen but continue
+                        }
+                        Err(e) => {
+                            let _ = samples_tx.send(Err(e.into())).await;
+                            return;
                         }
                     }
                 }
-                Err(e) => {
-                    let _ = tx_init.send(Err(e));
+
+                // Handle incoming control messages
+                Some(msg) = adjust_rx.recv() => {
+                    let result = tokio::task::block_in_place(|| {
+                        let mut rtl = match rtl.lock() {
+                            Ok(guard) => guard,
+                            Err(_poisoned) => {
+                                tracing::error!("RTL-SDR device mutex was poisoned");
+                                return Err(RtlsdrError::RtlsdrErr(
+                                    "Device mutex poisoned".to_string(),
+                                ));
+                            }
+                        };
+                        match msg {
+                            RtlSdrMessage::Frequency(freq) => {
+                                rtl.set_center_freq(freq)
+                            }
+                            RtlSdrMessage::SampleRate(sr) => {
+                                rtl.set_sample_rate(sr)
+                            }
+                            RtlSdrMessage::Gain(gain) => {
+                                match gain {
+                                    Gain::Manual(gain_db) => {
+                                        let gain_tenths = (gain_db * 10.0) as i32;
+                                        rtl.set_tuner_gain(TunerGain::Manual(gain_tenths))
+                                    }
+                                    Gain::Auto => rtl.set_tuner_gain(TunerGain::Auto),
+                                    Gain::Elements(_) => {
+                                        // Not supported on RTL-SDR, silently ignore
+                                        Ok(())
+                                    }
+                                }
+                            }
+                            RtlSdrMessage::FreqCorrection(ppm) => {
+                                rtl.set_freq_correction(ppm)
+                            }
+                        }
+                    });
+
+                    if let Err(e) = result {
+                        tracing::warn!("Failed to adjust RTL-SDR parameter: {}", e);
+                    }
                 }
             }
-        });
-
-        match rx_init.recv() {
-            Ok(Ok(())) => Ok(Self {
-                rx,
-                _handle: handle,
-            }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(error::Error::device("Failed to initialize RTL-SDR device")),
         }
+    }
+
+    /// Send a control message to adjust device parameters
+    ///
+    /// This is non-blocking - the message is queued and processed by the reader task.
+    pub fn adjust(&self, message: RtlSdrMessage) -> error::Result<()> {
+        self.adjust_tx.send(message)
+            .map_err(|_| error::Error::device("AsyncRtlSdrReader task closed".to_string()))
+    }
+
+    /// Retune to a specific center frequency
+    ///
+    /// Convenience method that sends a Frequency control message.
+    pub fn tune(&self, center_freq: u32) -> error::Result<()> {
+        self.adjust(RtlSdrMessage::Frequency(center_freq))
     }
 }
 
@@ -530,11 +638,7 @@ impl Stream for AsyncRtlSdrReader {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
-        match this.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        this.samples_rx.poll_recv(cx)
     }
 }
 

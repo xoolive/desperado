@@ -12,7 +12,7 @@
 //! - redsea (<https://github.com/windytan/redsea>)
 
 use serde::Serialize;
-use std::fmt;
+use std::fmt::{self, Display};
 use tracing::{debug, trace};
 
 use super::constants::*;
@@ -322,6 +322,16 @@ pub struct ClockTimeInfo {
     pub minute: u8,
     /// Local time offset in half-hours (-14.0 to +14.0)
     pub local_offset: f32,
+}
+
+impl Display for ClockTimeInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04}-{:02}-{:02} {:02}:{:02} UTC{:+.1}h",
+            self.year, self.month, self.day, self.hour, self.minute, self.local_offset
+        )
+    }
 }
 
 /// Enhanced Other Network (EON) info from Group 14A

@@ -40,7 +40,7 @@ use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
 
-use crate::{Gain, GainElementName, error};
+use crate::{error, Gain, GainElementName};
 
 /// Device selector for Airspy devices
 #[derive(Debug, Clone, PartialEq)]
@@ -236,27 +236,6 @@ fn open_device_with_selector(selector: &DeviceSelector) -> error::Result<Airspy>
     }
 }
 
-/// Find sample rate index for a given sample rate value
-fn find_sample_rate_index(device: &Airspy, target_rate: u32) -> error::Result<u8> {
-    let rates = device
-        .supported_sample_rates()
-        .map_err(|e| error::Error::device(format!("Failed to get sample rates: {}", e)))?;
-
-    for (index, rate) in rates.iter().enumerate() {
-        if *rate == target_rate {
-            return Ok(index as u8);
-        }
-    }
-
-    // If exact match not found, return error with available rates
-    let rate_strs: Vec<String> = rates.iter().map(|r| format!("{} Hz", r)).collect();
-    Err(error::Error::device(format!(
-        "Unsupported sample rate {} Hz. Available rates: {}",
-        target_rate,
-        rate_strs.join(", ")
-    )))
-}
-
 /// Configure gain on Airspy device based on Gain enum
 fn configure_gain(
     device: &Airspy,
@@ -388,6 +367,53 @@ pub struct AirspySdrReader {
     float_buf: Vec<f32>,
     iq_converter: IqConverter,
     packing: bool,
+    sample_layout: Option<AirspySampleLayout>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AirspySampleLayout {
+    Upper12,
+    Lower12,
+}
+
+fn convert_airspy_real_to_f32(
+    bytes: &[u8],
+    out: &mut [f32],
+    layout_hint: Option<AirspySampleLayout>,
+) -> (usize, AirspySampleLayout) {
+    let num_samples = bytes.len() / 2;
+    let layout = if let Some(layout) = layout_hint {
+        layout
+    } else {
+        // Auto-detect layout from first chunk.
+        // Some paths expose the 12-bit sample in upper bits, others in lower bits.
+        let mut sum_upper = 0.0f32;
+        let mut sum_lower = 0.0f32;
+        let check_n = num_samples.min(4096);
+        for chunk in bytes.chunks_exact(2).take(check_n) {
+            let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+            let upper = ((raw >> 4) as f32 - 2048.0) / 2048.0;
+            let lower = ((raw & 0x0FFF) as f32 - 2048.0) / 2048.0;
+            sum_upper += upper.abs();
+            sum_lower += lower.abs();
+        }
+        if sum_upper >= sum_lower {
+            AirspySampleLayout::Upper12
+        } else {
+            AirspySampleLayout::Lower12
+        }
+    };
+
+    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+        let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let sample_u12 = match layout {
+            AirspySampleLayout::Upper12 => raw >> 4,
+            AirspySampleLayout::Lower12 => raw & 0x0FFF,
+        };
+        out[i] = (sample_u12 as f32 - 2048.0) / 2048.0;
+    }
+
+    (num_samples, layout)
 }
 
 impl AirspySdrReader {
@@ -397,9 +423,6 @@ impl AirspySdrReader {
     /// and starts streaming.
     pub fn new(config: &AirspyConfig) -> error::Result<Self> {
         let device = open_device_with_selector(&config.device)?;
-
-        // Find sample rate index before starting (for validation)
-        let rate_index = find_sample_rate_index(&device, config.sample_rate)?;
 
         // Set frequency directly - no offset needed!
         // The IqConverter performs Fs/4 translation which brings the IF signal to baseband.
@@ -426,20 +449,16 @@ impl AirspySdrReader {
             .set_packing(config.packing)
             .map_err(|e| error::Error::device(format!("Failed to set packing: {}", e)))?;
 
-        // Set sample rate BEFORE starting RX if not the default (index 0)
-        // Note: Sample rate setting may fail on some firmware versions before streaming starts.
-        // If it fails, we try again after start_rx().
+        // Set requested sample rate BEFORE starting RX.
+        // Note: sample rate setting may fail on some firmware versions before streaming starts;
+        // if it fails here, we retry after start_rx().
         let mut sample_rate_set = false;
-        if rate_index != 0 {
-            match device.set_sample_rate(rate_index) {
-                Ok(()) => sample_rate_set = true,
-                Err(_e) => {
-                    // Will try again after start_rx
-                    // Some firmware versions require streaming to be active first
-                }
+        match device.set_sample_rate_hz(config.sample_rate, true) {
+            Ok(()) => sample_rate_set = true,
+            Err(_e) => {
+                // Will try again after start_rx
+                // Some firmware versions require streaming to be active first
             }
-        } else {
-            sample_rate_set = true; // Index 0 is the default
         }
 
         // Start streaming
@@ -449,15 +468,15 @@ impl AirspySdrReader {
 
         // If sample rate wasn't set before, try now after start_rx
         if !sample_rate_set {
-            match device.set_sample_rate(rate_index) {
+            match device.set_sample_rate_hz(config.sample_rate, true) {
                 Ok(()) => {}
                 Err(e) => {
                     let supported = device.supported_sample_rates().unwrap_or_default();
                     return Err(error::Error::device(format!(
                         "Failed to set sample rate after start_rx: {}. \
                         Supported rates: {:?}. \
-                        Requested: {} Hz (index {})",
-                        e, supported, config.sample_rate, rate_index
+                        Requested: {} Hz",
+                        e, supported, config.sample_rate
                     )));
                 }
             }
@@ -473,6 +492,7 @@ impl AirspySdrReader {
             float_buf: vec![0.0f32; max_samples],
             iq_converter: IqConverter::new(),
             packing: config.packing,
+            sample_layout: None,
         })
     }
 
@@ -523,16 +543,12 @@ impl Iterator for AirspySdrReader {
                     );
                 }
 
-                // Convert raw bytes to f32 samples for IqConverter
-                // Airspy outputs unsigned 12-bit samples (0-4095 range) stored in u16
-                // We normalize to [-1.0, 1.0] centered around 2048
-                let num_samples = bytes_read / 2;
-
-                // Convert u16 bytes to f32 samples
-                for (i, chunk) in self.buf[..bytes_read].chunks_exact(2).enumerate() {
-                    let sample = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    self.float_buf[i] = (sample as f32 - 2048.0) / 2048.0;
-                }
+                let (num_samples, layout) = convert_airspy_real_to_f32(
+                    &self.buf[..bytes_read],
+                    &mut self.float_buf,
+                    self.sample_layout,
+                );
+                self.sample_layout = Some(layout);
 
                 // Process through IqConverter (Fs/4 translation)
                 // This converts real samples to interleaved I/Q
@@ -580,6 +596,7 @@ impl Drop for AirspySdrReader {
 /// ```
 pub struct AsyncAirspySdrReader {
     rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
+    ctrl: rs_spy::transport::AsyncReadControlHandle,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -590,132 +607,97 @@ impl AsyncAirspySdrReader {
     /// an async channel.
     pub fn new(config: &AirspyConfig) -> error::Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
-        let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
+        let device = open_device_with_selector(&cfg.device)?;
+
+        device
+            .set_freq(cfg.center_freq)
+            .map_err(|e| error::Error::device(format!("Failed to set frequency: {}", e)))?;
+
+        configure_gain(
+            &device,
+            &cfg.gain,
+            cfg.lna_gain,
+            cfg.mixer_gain,
+            cfg.vga_gain,
+        )?;
+
+        device
+            .set_rf_bias(cfg.bias_tee)
+            .map_err(|e| error::Error::device(format!("Failed to set RF bias: {}", e)))?;
+
+        device
+            .set_packing(cfg.packing)
+            .map_err(|e| error::Error::device(format!("Failed to set packing: {}", e)))?;
+
+        let mut sample_rate_set = false;
+        if device.set_sample_rate_hz(cfg.sample_rate, true).is_ok() {
+            sample_rate_set = true;
+        }
+
+        device
+            .start_rx()
+            .map_err(|e| error::Error::device(format!("Failed to start RX: {}", e)))?;
+
+        if !sample_rate_set {
+            device
+                .set_sample_rate_hz(cfg.sample_rate, true)
+                .map_err(|e| error::Error::device(format!("Failed to set sample rate: {}", e)))?;
+        }
+
+        let async_reader = device
+            .into_async_reader(32, RECOMMENDED_BUFFER_SIZE)
+            .map_err(|e| error::Error::device(format!("Failed to start async reader: {}", e)))?;
+        let ctrl = async_reader.control_handle();
+
         let handle = std::thread::spawn(move || {
-            let init_res = (|| -> error::Result<(Airspy, bool)> {
-                let device = open_device_with_selector(&cfg.device)?;
+            let reader = async_reader;
+            let max_samples = RECOMMENDED_BUFFER_SIZE / 2;
+            let mut float_buf = vec![0.0f32; max_samples];
+            let mut iq_converter = IqConverter::new();
+            let mut sample_layout: Option<AirspySampleLayout> = None;
 
-                // Find sample rate index before starting (for validation)
-                let rate_index = find_sample_rate_index(&device, cfg.sample_rate)?;
+            while let Some(chunk_res) = reader.recv() {
+                match chunk_res {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
 
-                // Set frequency directly - no offset needed!
-                // The IqConverter performs Fs/4 translation which brings the IF signal to baseband.
-                device
-                    .set_freq(cfg.center_freq)
-                    .map_err(|e| error::Error::device(format!("Failed to set frequency: {}", e)))?;
+                        if cfg.packing {
+                            eprintln!("Warning: 12-bit unpacking not yet implemented");
+                        }
 
-                // Configure gain
-                configure_gain(
-                    &device,
-                    &cfg.gain,
-                    cfg.lna_gain,
-                    cfg.mixer_gain,
-                    cfg.vga_gain,
-                )?;
-
-                // Set RF bias
-                device
-                    .set_rf_bias(cfg.bias_tee)
-                    .map_err(|e| error::Error::device(format!("Failed to set RF bias: {}", e)))?;
-
-                // Set packing mode
-                device
-                    .set_packing(cfg.packing)
-                    .map_err(|e| error::Error::device(format!("Failed to set packing: {}", e)))?;
-
-                // Set sample rate BEFORE starting RX if not the default (index 0)
-                let mut sample_rate_set = false;
-                if rate_index != 0 {
-                    if device.set_sample_rate(rate_index).is_ok() {
-                        sample_rate_set = true;
-                    }
-                } else {
-                    sample_rate_set = true;
-                }
-
-                // Start streaming
-                device
-                    .start_rx()
-                    .map_err(|e| error::Error::device(format!("Failed to start RX: {}", e)))?;
-
-                // If sample rate wasn't set before, try now after start_rx
-                if !sample_rate_set {
-                    device.set_sample_rate(rate_index).map_err(|e| {
-                        error::Error::device(format!("Failed to set sample rate: {}", e))
-                    })?;
-                }
-
-                Ok((device, cfg.packing))
-            })();
-
-            match init_res {
-                Ok((device, packing)) => {
-                    let _ = tx_init.send(Ok(()));
-                    let mut buffer = vec![0u8; RECOMMENDED_BUFFER_SIZE];
-                    let max_samples = RECOMMENDED_BUFFER_SIZE / 2;
-                    let mut float_buf = vec![0.0f32; max_samples];
-                    let mut iq_converter = IqConverter::new();
-
-                    loop {
-                        match device.read_sync(&mut buffer) {
-                            Ok(bytes_read) => {
-                                if bytes_read == 0 {
-                                    let _ = tx.blocking_send(Ok(Vec::new()));
-                                    break;
-                                }
-
-                                if packing {
-                                    // TODO: Implement 12-bit unpacking for packed mode
-                                    eprintln!("Warning: 12-bit unpacking not yet implemented");
-                                }
-
-                                // Convert raw bytes to f32 samples
-                                let num_samples = bytes_read / 2;
-                                for (i, chunk) in buffer[..bytes_read].chunks_exact(2).enumerate() {
-                                    let sample = u16::from_le_bytes([chunk[0], chunk[1]]);
-                                    float_buf[i] = (sample as f32 - 2048.0) / 2048.0;
-                                }
-
-                                // Process through IqConverter (Fs/4 translation)
-                                let samples =
-                                    iq_converter.process_to_complex(&mut float_buf[..num_samples]);
-
-                                if tx.blocking_send(Ok(samples)).is_err() {
-                                    // Receiver dropped, stop streaming
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.blocking_send(Err(error::Error::device(format!(
-                                    "Read error: {}",
-                                    e
-                                ))));
-                                break;
-                            }
+                        let (num_samples, layout) =
+                            convert_airspy_real_to_f32(&bytes, &mut float_buf, sample_layout);
+                        sample_layout = Some(layout);
+                        let samples =
+                            iq_converter.process_to_complex(&mut float_buf[..num_samples]);
+                        if tx.blocking_send(Ok(samples)).is_err() {
+                            break;
                         }
                     }
-
-                    // Stop streaming on exit
-                    let _ = device.stop_rx();
-                }
-                Err(e) => {
-                    let _ = tx_init.send(Err(e));
+                    Err(e) => {
+                        let _ = tx
+                            .blocking_send(Err(error::Error::device(format!("Read error: {}", e))));
+                        break;
+                    }
                 }
             }
         });
 
-        match rx_init.recv() {
-            Ok(Ok(())) => Ok(Self {
-                rx,
-                _handle: handle,
-            }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(error::Error::device(
-                "Failed to initialize Airspy device: channel closed",
-            )),
-        }
+        Ok(Self {
+            rx,
+            ctrl,
+            _handle: handle,
+        })
+    }
+
+    pub fn tune(&self, center_freq: u32) -> error::Result<()> {
+        self.ctrl
+            .tune(center_freq)
+            .map_err(|e| error::Error::device(format!("Airspy async tune failed: {}", e)))
     }
 }
 

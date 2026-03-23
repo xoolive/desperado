@@ -12,18 +12,39 @@ mod ofdm;
 mod pad;
 
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossbeam_channel as channel;
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use desperado::DeviceConfig;
+use desperado::dsp::rotate::Rotate;
+use desperado::dsp::DspBlock;
+#[cfg(feature = "resampler")]
+use desperado::dsp::dab_resampler::DabResampler;
 use desperado::{IqFormat, IqSource};
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+use desperado::IqAsyncSource;
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+use futures::StreamExt;
 use num_complex::Complex;
 use pad::PadData;
 use std::collections::hash_map::DefaultHasher;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Seek, SeekFrom, Write};
 #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    text::Line,
+    widgets::{Block, Borders, Paragraph},
+};
 use tinyaudio::prelude::*;
 use tracing::Level;
 use tracing::{debug, info, warn};
@@ -32,19 +53,16 @@ use tracing_subscriber::prelude::*;
 /// Unified IQ chunk iterator that works with both sync and async sources.
 ///
 /// For file/stdin sources, uses synchronous `IqSource` (simple, no threading).
-/// For live SDR sources, uses sync `IqSource` inside a dedicated reader thread,
-/// then consumes IQ chunks through an async channel.
+/// For live SDR sources, uses `IqAsyncSource` directly.
 enum IqChunkSource {
     Sync(Box<IqSource>),
     #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-    Threaded(tokio::sync::mpsc::Receiver<desperado::error::Result<Vec<Complex<f32>>>>),
+    Async {
+        source: IqAsyncSource,
+        chunk_size: usize,
+        pending: Vec<Complex<f32>>,
+    },
 }
-
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-type IqChunkResult = desperado::error::Result<Vec<Complex<f32>>>;
-
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-type IqChunkRx = tokio::sync::mpsc::Receiver<IqChunkResult>;
 
 impl IqChunkSource {
     /// Get the next chunk of IQ samples.
@@ -54,50 +72,264 @@ impl IqChunkSource {
         match self {
             IqChunkSource::Sync(source) => source.next(),
             #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-            IqChunkSource::Threaded(rx) => rx.recv().await,
-        }
-    }
-}
+            IqChunkSource::Async {
+                source,
+                chunk_size,
+                pending,
+            } => {
+                while pending.len() < *chunk_size {
+                    match source.next().await {
+                        Some(Ok(mut samples)) => pending.append(&mut samples),
+                        Some(Err(e)) => return Some(Err(e)),
+                        None => {
+                            if pending.is_empty() {
+                                return None;
+                            }
+                            return Some(Ok(std::mem::take(pending)));
+                        }
+                    }
+                }
 
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
-fn spawn_sync_reader_thread(
-    configured_uri: String,
-    queue_chunks: usize,
-) -> Result<IqChunkRx, Box<dyn std::error::Error>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(queue_chunks);
-    let (tx_init, rx_init) = std::sync::mpsc::channel::<Result<(), String>>();
-    std::thread::spawn(move || {
-        let source_res = (|| -> Result<IqSource, String> {
-            let config = DeviceConfig::from_str(&configured_uri).map_err(|e| e.to_string())?;
-            IqSource::from_device_config(config).map_err(|e| e.to_string())
-        })();
-
-        let source = match source_res {
-            Ok(source) => {
-                let _ = tx_init.send(Ok(()));
-                source
-            }
-            Err(e) => {
-                let _ = tx_init.send(Err(e));
-                return;
-            }
-        };
-
-        for chunk in source {
-            if tx.blocking_send(chunk).is_err() {
-                break;
+                let out: Vec<Complex<f32>> = pending.drain(..*chunk_size).collect();
+                Some(Ok(out))
             }
         }
-    });
-
-    match rx_init.recv() {
-        Ok(Ok(())) => Ok(rx),
-        Ok(Err(e)) => Err(std::io::Error::other(e).into()),
-        Err(_) => Err(std::io::Error::other("Reader thread failed to initialize").into()),
     }
 }
 
 const AUDIO_RATE: usize = 48_000;
+
+#[derive(Default, Clone)]
+struct TuiState {
+    source: String,
+    channel: String,
+    center_freq_hz: u32,
+    input_rate_hz: u32,
+    output_rate_hz: u32,
+    ofdm_frames: usize,
+    fibs: usize,
+    msc_frames: usize,
+    service: String,
+    dls: String,
+    mot_count: usize,
+    mot_info: String,
+    mot_preview_path: Option<String>,
+    audio_q_fill: usize,
+    status: String,
+}
+
+struct TuiGuard {
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_dab_tui(
+    state: Arc<Mutex<TuiState>>,
+    running: Arc<AtomicBool>,
+    keyboard_available: bool,
+    inline_image_support: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = enable_raw_mode();
+        let backend = CrosstermBackend::new(std::io::stdout());
+        let mut terminal = match Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(18),
+            },
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = disable_raw_mode();
+                eprintln!("dabradio: failed to initialize TUI terminal backend");
+                return;
+            }
+        };
+
+        while running.load(Ordering::Relaxed) {
+            if let Ok(s) = state.lock() {
+                let _ = terminal.draw(|f| {
+                    let area = f.area();
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+                        .split(area);
+                    let left = cols[0];
+                    let right = cols[1];
+                    let inner = left.width.saturating_sub(4) as usize;
+                    let controls = if keyboard_available {
+                        " Controls: q/Esc/Ctrl-C quit"
+                    } else {
+                        " Controls: Ctrl-C quit (stdin is piped)"
+                    };
+                    let left_lines = vec![
+                        Line::from(format!(" Source: {}", one_line(&s.source, inner.saturating_sub(9)))),
+                        Line::from(format!(" Channel: {}   Freq: {:.3} MHz", one_line(&s.channel, 8), s.center_freq_hz as f64 / 1_000_000.0)),
+                        Line::from(format!(" Input: {} Hz   Output: {} Hz", s.input_rate_hz, s.output_rate_hz)),
+                        Line::from(""),
+                        Line::from(format!(" OFDM frames: {}   FIBs: {}   MSC frames: {}", s.ofdm_frames, s.fibs, s.msc_frames)),
+                        Line::from(format!(" Service: {}", one_line(&s.service, inner.saturating_sub(10)))),
+                        Line::from(format!(" DLS: {}", one_line(&s.dls, inner.saturating_sub(6)))),
+                        Line::from(format!(" MOT: {}   {}", s.mot_count, one_line(&s.mot_info, inner.saturating_sub(15)))),
+                        Line::from(format!(" Audio queue: {} samples", s.audio_q_fill)),
+                        Line::from(""),
+                        Line::from(format!(" Status: {}", one_line(&s.status, inner.saturating_sub(9)))),
+                        Line::from(""),
+                        Line::from(controls),
+                    ];
+
+                    let left_panel = Paragraph::new(left_lines).block(
+                        Block::default()
+                            .title(" DAB Radio Dashboard ")
+                            .borders(Borders::ALL),
+                    );
+                    f.render_widget(left_panel, left);
+
+                    let right_lines = vec![
+                        Line::from(format!(" MOT count: {}", s.mot_count)),
+                        Line::from(format!(" {}", one_line(&s.mot_info, right.width.saturating_sub(4) as usize))),
+                        Line::from(""),
+                    ];
+
+                    let right_panel = Paragraph::new(right_lines).block(
+                        Block::default()
+                            .title(" MOT Preview ")
+                            .borders(Borders::ALL),
+                    );
+                    f.render_widget(right_panel, right);
+
+                    if inline_image_support
+                        && let Some(path) = &s.mot_preview_path
+                    {
+                        draw_tui_image(path, right);
+                    }
+                });
+            }
+
+            if keyboard_available && event::poll(Duration::from_millis(1)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Resize(_, _)) => {
+                        let _ = terminal.autoresize();
+                        let _ = terminal.clear();
+                    }
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                            running.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let _ = terminal.clear();
+        let _ = terminal.show_cursor();
+        let _ = disable_raw_mode();
+        
+        // Clear Kitty graphics protocol images before exiting
+        if inline_image_support {
+            let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
+            let _ = std::io::stdout().flush();
+        }
+    })
+}
+
+fn draw_tui_image(path: &str, area: Rect) {
+    let cfg = viuer::Config {
+        absolute_offset: true,
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(4) as i16,
+        restore_cursor: false,
+        width: Some(area.width.saturating_sub(2) as u32),
+        height: Some(area.height.saturating_sub(5) as u32),
+        transparent: true,
+        premultiplied_alpha: false,
+        truecolor: true,
+        use_kitty: true,
+        use_iterm: false,
+    };
+    let _ = viuer::print_from_file(path, &cfg);
+}
+
+fn one_line(input: &str, max_len: usize) -> String {
+    let mut s = input.replace(['\n', '\r', '\t'], " ");
+    if s.len() > max_len {
+        s.truncate(max_len.saturating_sub(3));
+        s.push_str("...");
+    }
+    s
+}
+
+struct WavWriter {
+    file: File,
+    data_bytes: u32,
+}
+
+impl WavWriter {
+    fn create(path: &str, sample_rate: u32, channels: u16) -> std::io::Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(&[0u8; 44])?;
+        let mut writer = Self {
+            file,
+            data_bytes: 0,
+        };
+        writer.write_header(sample_rate, channels)?;
+        Ok(writer)
+    }
+
+    fn write_samples_f32(&mut self, pcm: &[f32]) -> std::io::Result<()> {
+        for &s in pcm {
+            let clamped = s.clamp(-1.0, 1.0);
+            let q = (clamped * i16::MAX as f32) as i16;
+            self.file.write_all(&q.to_le_bytes())?;
+        }
+        self.data_bytes = self
+            .data_bytes
+            .saturating_add((pcm.len() * std::mem::size_of::<i16>()) as u32);
+        Ok(())
+    }
+
+    fn finalize(&mut self, sample_rate: u32, channels: u16) -> std::io::Result<()> {
+        self.write_header(sample_rate, channels)
+    }
+
+    fn write_header(&mut self, sample_rate: u32, channels: u16) -> std::io::Result<()> {
+        let bits_per_sample: u16 = 16;
+        let bytes_per_sample = (bits_per_sample / 8) as u32;
+        let byte_rate = sample_rate * channels as u32 * bytes_per_sample;
+        let block_align = channels * (bits_per_sample / 8);
+        let riff_size = 36u32.saturating_add(self.data_bytes);
+
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(b"RIFF")?;
+        self.file.write_all(&riff_size.to_le_bytes())?;
+        self.file.write_all(b"WAVE")?;
+        self.file.write_all(b"fmt ")?;
+        self.file.write_all(&16u32.to_le_bytes())?;
+        self.file.write_all(&1u16.to_le_bytes())?;
+        self.file.write_all(&channels.to_le_bytes())?;
+        self.file.write_all(&sample_rate.to_le_bytes())?;
+        self.file.write_all(&byte_rate.to_le_bytes())?;
+        self.file.write_all(&block_align.to_le_bytes())?;
+        self.file.write_all(&bits_per_sample.to_le_bytes())?;
+        self.file.write_all(b"data")?;
+        self.file.write_all(&self.data_bytes.to_le_bytes())?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "dabradio", about = "DAB/DAB+ digital radio decoder")]
@@ -116,6 +348,14 @@ struct Cli {
     /// IQ format for file sources: cu8, cs8, cs16, cf32
     #[arg(long, default_value = "cu8")]
     format: String,
+
+    /// Input sample rate in samples/s (needed for non-2.048MS/s file/stdin sources)
+    #[arg(long)]
+    sample_rate: Option<u32>,
+
+    /// Shift input IQ by this frequency before demodulation (Hz)
+    #[arg(long, default_value = "0")]
+    freq_shift_hz: i32,
 
     /// List services and exit (no audio)
     #[arg(long)]
@@ -141,6 +381,10 @@ struct Cli {
     #[arg(short, long)]
     output: Option<String>,
 
+    /// Output decoded PCM audio to WAV file
+    #[arg(long)]
+    wav: Option<String>,
+
     /// Disable audio output
     #[arg(long)]
     no_audio: bool,
@@ -156,21 +400,42 @@ struct Cli {
     /// MOT inline image height in terminal cells (0 = auto)
     #[arg(long, default_value = "0")]
     mot_height: u32,
+
+    /// Show inline TUI dashboard (non-fullscreen)
+    #[arg(long, default_value_t = false)]
+    tui: bool,
+
+    /// Enable debug logs for audio pipeline queue/underrun tracking
+    #[arg(long, default_value_t = false)]
+    debug_audio: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_filter = tracing_subscriber::filter::Targets::new()
-        .with_target("dabradio", Level::INFO)
-        .with_target("desperado", Level::INFO)
+    let cli = Cli::parse();
+
+    let source_is_stdin = cli.source.as_deref() == Some("-");
+    let tui_enabled = cli.tui && !source_is_stdin;
+
+    let app_level = if tui_enabled {
+        Level::WARN
+    } else {
+        Level::INFO
+    };
+    let mut log_filter = tracing_subscriber::filter::Targets::new()
+        .with_target("dabradio", app_level)
+        .with_target("desperado", app_level)
         .with_target("rtl_sdr_rs", Level::WARN)
         .with_default(Level::WARN);
+    if cli.debug_audio {
+        log_filter = log_filter
+            .with_target("dabradio::audio", Level::DEBUG)
+            .with_target("dabradio::audio_pipeline", Level::DEBUG);
+    }
     tracing_subscriber::registry()
         .with(log_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    let cli = Cli::parse();
 
     if cli.list_channels {
         print_channels(cli.json);
@@ -185,6 +450,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .source
         .as_ref()
         .ok_or("Source path or SDR URI is required unless --list-channels is used")?;
+
+    if cli.tui && source_is_stdin {
+        warn!("Ignoring --tui because input is piped stdin ('-')");
+    }
+
+    if cfg!(debug_assertions) && is_device_uri(source) && !cli.no_audio {
+        warn!("Debug build is not real-time for live SDR; use --release for valid audio underrun/hiccup checks");
+    }
 
     // Resolve center frequency
     let center_freq = if let Some(channel) = &cli.channel {
@@ -234,15 +507,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Open IQ source (file or live SDR URI)
+    // - stdin/file: use --sample-rate when provided
+    // - airspy:// default: 6.0 MS/s (then resample to 2.048 MS/s)
+    // - others default: 2.048 MS/s
+    let default_input_rate = cli.sample_rate.unwrap_or_else(|| {
+        if source.starts_with("airspy://") {
+            6_000_000
+        } else {
+            constants::SAMPLE_RATE
+        }
+    });
+    let is_rtlsdr_uri = source.starts_with("rtlsdr://");
+
     let chunk_size = constants::T_F; // One frame's worth of samples
-    let (mut source, is_file_source) = open_iq_source(
+    let (mut source, is_file_source, input_sample_rate) = open_iq_source(
         source,
         center_freq,
-        constants::SAMPLE_RATE,
+        default_input_rate,
         chunk_size,
         iq_format,
     )
     .await?;
+    let mut startup_discard_samples = if is_rtlsdr_uri {
+        input_sample_rate as usize
+    } else {
+        0usize
+    };
+
+    #[cfg(feature = "resampler")]
+    let mut iq_resampler = if input_sample_rate != constants::SAMPLE_RATE {
+        info!(
+            input_rate = input_sample_rate,
+            output_rate = constants::SAMPLE_RATE,
+            "Enabling DAB-optimized I/Q resampler"
+        );
+        Some(
+            DabResampler::new(input_sample_rate)
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "resampler"))]
+    if input_sample_rate != constants::SAMPLE_RATE {
+        return Err(format!(
+            "Input sample rate is {} but DAB requires {}; rebuild with --features resampler (or airspy)",
+            input_sample_rate,
+            constants::SAMPLE_RATE
+        )
+        .into());
+    }
 
     let mut ofdm_processor = ofdm::processor::OfdmProcessor::new();
     let mut ensemble = fic::fib::EnsembleInfo::new();
@@ -258,14 +573,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut announced_service_label = false;
     let mut mot_image_count = 0usize;
     let mut last_mot_hash: Option<u64> = None;
-    let term_image_support = terminal_supports_inline_images();
+    let keyboard_available = std::io::stdin().is_terminal();
+    let inline_image_support = terminal_supports_inline_images();
+    let term_image_support = inline_image_support && !tui_enabled;
+
+    let app_running = Arc::new(AtomicBool::new(true));
+    let tui_state = Arc::new(Mutex::new(TuiState {
+        source: cli.source.clone().unwrap_or_default(),
+        channel: cli.channel.clone().unwrap_or_else(|| "(custom)".to_string()),
+        center_freq_hz: center_freq,
+        input_rate_hz: input_sample_rate,
+        output_rate_hz: constants::SAMPLE_RATE,
+        status: if tui_enabled && !keyboard_available {
+            "stdin piped: q/esc disabled; use Ctrl-C".to_string()
+        } else {
+            "starting".to_string()
+        },
+        ..Default::default()
+    }));
+    let _tui_guard = if tui_enabled {
+        Some(TuiGuard {
+            running: app_running.clone(),
+            handle: Some(spawn_dab_tui(
+                tui_state.clone(),
+                app_running.clone(),
+                keyboard_available,
+                inline_image_support,
+            )),
+        })
+    } else {
+        None
+    };
+
+    let sig_running = app_running.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            sig_running.store(false, Ordering::Relaxed);
+        }
+    });
+
+    let mut iq_rotator = if cli.freq_shift_hz != 0 {
+        let angle =
+            -2.0f32 * std::f32::consts::PI * (cli.freq_shift_hz as f32) / (input_sample_rate as f32);
+        info!(shift_hz = cli.freq_shift_hz, "Applying input frequency shift");
+        Some(Rotate::new(angle))
+    } else {
+        None
+    };
 
     // Audio output setup (tinyaudio + crossbeam channel)
     // Buffer sizing:
     // - File/stdin: blocking sender naturally paces to playback.
     // - Live SDR: larger queue absorbs decode jitter without stalling RF processing.
-    let audio_queue_seconds = if is_file_source { 4 } else { 8 };
+    let audio_queue_seconds = 4;
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * audio_queue_seconds);
+    let audio_underruns = Arc::new(AtomicU64::new(0));
+    let audio_dropped = Arc::new(AtomicU64::new(0));
+    let audio_primed = Arc::new(AtomicBool::new(false));
+    let audio_measure_active = Arc::new(AtomicBool::new(true));
+    let audio_prebuffer_samples = AUDIO_RATE * 2 * if is_file_source { 1 } else { 2 };
+    let mut audio_last_dbg = Instant::now();
+    let mut audio_last_underruns = 0u64;
+    let mut audio_last_dropped = 0u64;
 
     let _device = if decoding_service && !cli.no_audio {
         let config = OutputDeviceParameters {
@@ -273,10 +642,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_rate: AUDIO_RATE,
             channel_sample_count: 1024,
         };
+        let audio_underruns_cb = Arc::clone(&audio_underruns);
+        let audio_primed_cb = Arc::clone(&audio_primed);
+        let audio_measure_active_cb = Arc::clone(&audio_measure_active);
         Some(
             run_output_device(config, move |data| {
+                if !audio_measure_active_cb.load(Ordering::Relaxed) {
+                    data.fill(0.0);
+                    return;
+                }
+
+                if !audio_primed_cb.load(Ordering::Relaxed) {
+                    if rx.len() < audio_prebuffer_samples {
+                        data.fill(0.0);
+                        return;
+                    }
+                    audio_primed_cb.store(true, Ordering::Relaxed);
+                }
+
                 for sample in data.iter_mut() {
-                    *sample = rx.try_recv().unwrap_or(0.0);
+                    match rx.try_recv() {
+                        Ok(v) => *sample = v,
+                        Err(_) => {
+                            *sample = 0.0;
+                            audio_underruns_cb.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             })
             .expect("Failed to open audio output device"),
@@ -285,12 +676,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    while let Some(chunk) = source.next_chunk().await {
-        let samples = chunk?;
+    let mut wav_writer = if decoding_service {
+        if let Some(path) = &cli.wav {
+            Some(WavWriter::create(path, AUDIO_RATE as u32, 2)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    while app_running.load(Ordering::Relaxed) {
+        let Some(chunk) = source.next_chunk().await else {
+            break;
+        };
+        let mut samples = chunk?;
+        if startup_discard_samples > 0 {
+            if samples.len() <= startup_discard_samples {
+                startup_discard_samples -= samples.len();
+                continue;
+            }
+            let keep_from = startup_discard_samples;
+            startup_discard_samples = 0;
+            samples = samples.split_off(keep_from);
+        }
+        let samples = if let Some(ref mut rotator) = iq_rotator {
+            rotator.process(&samples)
+        } else {
+            samples
+        };
+        #[cfg(feature = "resampler")]
+        let samples = {
+            let mut samples = samples;
+            if let Some(ref mut resampler) = iq_resampler {
+                samples = resampler.process(&samples);
+                if samples.is_empty() {
+                    continue;
+                }
+            }
+            samples
+        };
         let frames = ofdm_processor.process(&samples);
 
         for frame in &frames {
+            if !app_running.load(Ordering::Relaxed) {
+                break;
+            }
             frame_count += 1;
+            if let Ok(mut s) = tui_state.lock() {
+                s.ofdm_frames = frame_count;
+            }
 
             // DQPSK decode all symbols
             let soft_bits = ofdm::decoder::dqpsk_decode(&frame.symbols);
@@ -333,6 +768,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fib_count += 1;
                     ensemble.parse_fib(fib);
                 }
+                if let Ok(mut s) = tui_state.lock() {
+                    s.fibs = fib_count;
+                    s.status = if fib_count > 0 {
+                        "sync + FIC OK".to_string()
+                    } else {
+                        "OFDM sync only".to_string()
+                    };
+                }
             }
 
             if msc_handler.is_some()
@@ -346,6 +789,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 info!(label = %label.trim(), "Resolved service label");
                 announced_service_label = true;
+                if let Ok(mut s) = tui_state.lock() {
+                    s.service = label.trim().to_string();
+                }
             }
 
             // Check if we have enough info to list services
@@ -372,6 +818,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     msc_handler = Some(handler);
                     dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
+                    if let Ok(mut s) = tui_state.lock() {
+                        s.status = format!("decoding @ {} kbps", bitrate);
+                        if s.service.is_empty() {
+                            s.service = service_arg.clone();
+                        }
+                    }
                 }
             }
 
@@ -381,6 +833,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let msc_end = soft_bits.len().min(75); // 75 data symbols total
                 for sym in &soft_bits[msc_start..msc_end] {
                     if let Some(decoded) = handler.feed_symbol(sym) {
+                        if let Ok(mut s) = tui_state.lock() {
+                            s.msc_frames = handler.frames_decoded;
+                        }
                         debug!(
                             "MSC frame {}: {} bytes, first 8: {:02X?}",
                             handler.frames_decoded,
@@ -397,6 +852,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match item {
                                     PadData::Dls(dls) => {
                                         info!(text = %dls.text, "DLS");
+                                        if let Ok(mut s) = tui_state.lock() {
+                                            s.dls = dls.text.clone();
+                                        }
                                     }
                                     PadData::Mot(mot) => {
                                         mot_image_count += 1;
@@ -411,6 +869,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             content_name = ?mot.content_name,
                                             "MOT"
                                         );
+                                        if let Ok(mut s) = tui_state.lock() {
+                                            s.mot_count = mot_image_count;
+                                            s.mot_info = format!(
+                                                "{} bytes {}",
+                                                mot.data.len(),
+                                                mot.content_type
+                                            );
+                                            if tui_enabled {
+                                                let mut path = std::env::temp_dir();
+                                                path.push(format!("dabradio_tui_mot_preview.{}", ext));
+                                                if std::fs::write(&path, &mot.data).is_ok() {
+                                                    s.mot_preview_path = Some(path.to_string_lossy().to_string());
+                                                }
+                                            }
+                                        }
                                         // Save to slideshow directory if specified
                                         if let Some(ref dir) = cli.slideshow {
                                             let filename = format!(
@@ -450,23 +923,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if !decoded_out.pcm.is_empty() && _device.is_some() {
-                                if is_file_source {
-                                    for sample in &decoded_out.pcm {
+                                for sample in &decoded_out.pcm {
+                                    if is_file_source {
                                         if tx.send(*sample).is_err() {
                                             break;
                                         }
-                                    }
-                                } else {
-                                    for sample in &decoded_out.pcm {
-                                        if tx.try_send(*sample).is_err()
-                                            && tx
-                                                .send_timeout(*sample, Duration::from_millis(1))
-                                                .is_err()
-                                        {
-                                            break;
+                                    } else {
+                                        match tx.try_send(*sample) {
+                                            Ok(()) => {}
+                                            Err(channel::TrySendError::Full(_)) => {
+                                                audio_dropped.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            Err(channel::TrySendError::Disconnected(_)) => break,
                                         }
                                     }
                                 }
+                                if let Ok(mut s) = tui_state.lock() {
+                                    s.audio_q_fill = tx.len();
+                                }
+                                if audio_last_dbg.elapsed() >= Duration::from_secs(1) {
+                                    let underruns = audio_underruns.load(Ordering::Relaxed);
+                                    let delta_underruns = underruns.saturating_sub(audio_last_underruns);
+                                    let dropped = audio_dropped.load(Ordering::Relaxed);
+                                    let delta_dropped = dropped.saturating_sub(audio_last_dropped);
+                                    debug!(target: "dabradio::audio_pipeline",
+                                        queue_fill = tx.len(),
+                                        queue_capacity = tx.capacity().unwrap_or(0),
+                                        primed = audio_primed.load(Ordering::Relaxed),
+                                        underruns_total = underruns,
+                                        underruns_delta = delta_underruns,
+                                        dropped_total = dropped,
+                                        dropped_delta = delta_dropped,
+                                        rs_errors_total = dab_dec.superframe.rs_errors,
+                                        au_crc_errors_total = dab_dec.superframe.au_crc_errors,
+                                        "Audio pipeline status"
+                                    );
+                                    audio_last_dbg = Instant::now();
+                                    audio_last_underruns = underruns;
+                                    audio_last_dropped = dropped;
+                                }
+                            }
+
+                            if let Some(writer) = wav_writer.as_mut()
+                                && !decoded_out.pcm.is_empty()
+                            {
+                                writer.write_samples_f32(&decoded_out.pcm)?;
                             }
                         }
 
@@ -487,6 +988,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
+
+    audio_measure_active.store(false, Ordering::Relaxed);
 
     // Print ensemble info
     ensemble.resolve_services();
@@ -520,6 +1023,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("MSC handler never initialized (service not found?)");
         }
 
+        let underruns = audio_underruns.load(Ordering::Relaxed);
+        if underruns > 0 {
+            warn!(underruns, "Audio callback underruns detected");
+        }
+
+        let dropped = audio_dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            warn!(dropped, "Dropped audio samples to avoid SDR backpressure");
+        }
+
         // Write raw frames to output file if specified
         if let Some(ref output_path) = cli.output
             && !msc_output.is_empty()
@@ -531,6 +1044,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             std::fs::write(output_path, &all_bytes)?;
             info!(bytes = all_bytes.len(), path = %output_path, "Wrote decoded MSC output");
+        }
+
+        if let Some(writer) = wav_writer.as_mut() {
+            writer.finalize(AUDIO_RATE as u32, 2)?;
+            if let Some(path) = &cli.wav {
+                info!(path = %path, "Wrote decoded WAV audio");
+            }
         }
     } else {
         // Just print service listing
@@ -566,16 +1086,16 @@ async fn open_iq_source(
     sample_rate: u32,
     chunk_size: usize,
     iq_format: IqFormat,
-) -> Result<(IqChunkSource, bool), Box<dyn std::error::Error>> {
+) -> Result<(IqChunkSource, bool, u32), Box<dyn std::error::Error>> {
     // File and stdin: use synchronous IqSource (simple, reliable)
     if input == "-" {
         let source = IqSource::from_stdin(center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(Box::new(source)), true));
+        return Ok((IqChunkSource::Sync(Box::new(source)), true, sample_rate));
     }
 
     if !is_device_uri(input) {
         let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(Box::new(source)), true));
+        return Ok((IqChunkSource::Sync(Box::new(source)), true, sample_rate));
     }
 
     // Live SDR: use sync IqSource in a dedicated reader thread.
@@ -603,13 +1123,21 @@ async fn open_iq_source(
 
     let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
     info!("Opening live SDR source: {}", configured_uri);
+    let input_rate = detect_device_sample_rate(&configured_uri)?;
 
     #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
     {
-        const LIVE_QUEUE_CHUNKS: usize = 512;
-
-        let rx = spawn_sync_reader_thread(configured_uri.clone(), LIVE_QUEUE_CHUNKS)?;
-        Ok((IqChunkSource::Threaded(rx), false))
+        let config = DeviceConfig::from_str(&configured_uri)?;
+        let source = IqAsyncSource::from_device_config(&config).await?;
+        Ok((
+            IqChunkSource::Async {
+                source,
+                chunk_size,
+                pending: Vec::with_capacity(chunk_size * 2),
+            },
+            false,
+            input_rate,
+        ))
     }
 
     #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
@@ -617,6 +1145,33 @@ async fn open_iq_source(
         format!("No SDR backend enabled for URI: {configured_uri}. Rebuild with --features rtlsdr")
             .into(),
     )
+}
+
+#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+fn detect_device_sample_rate(configured_uri: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let config = DeviceConfig::from_str(configured_uri)?;
+    #[cfg(feature = "rtlsdr")]
+    if let DeviceConfig::RtlSdr(cfg) = &config {
+        return Ok(cfg.sample_rate);
+    }
+    #[cfg(feature = "soapy")]
+    if let DeviceConfig::Soapy(cfg) = &config {
+        return Ok(cfg.sample_rate as u32);
+    }
+    #[cfg(feature = "airspy")]
+    if let DeviceConfig::Airspy(cfg) = &config {
+        return Ok(cfg.sample_rate);
+    }
+
+    Err(std::io::Error::other(format!(
+        "Unsupported SDR backend for sample-rate detection: {configured_uri}"
+    ))
+    .into())
+}
+
+#[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+fn detect_device_sample_rate(_configured_uri: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    Err(std::io::Error::other("No SDR backend enabled").into())
 }
 
 fn is_device_uri(input: &str) -> bool {
@@ -729,10 +1284,10 @@ fn show_image_in_terminal(
         width: (mot_width > 0).then_some(mot_width),
         height: (mot_height > 0).then_some(mot_height),
         transparent: true,
+        premultiplied_alpha: false,
         truecolor: true,
         use_kitty: true,
         use_iterm: false,
-        ..Default::default()
     };
 
     viuer::print_from_file(&path, &cfg)?;

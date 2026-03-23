@@ -3,6 +3,9 @@
 use crate::error::{Error, Result};
 use crate::{AIRSPY_PID, AIRSPY_VID};
 use rusb::{Context, Device, DeviceHandle, UsbContext};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 /// Default timeout for USB control transfers (milliseconds).
@@ -66,6 +69,66 @@ pub const RECOMMENDED_BUFFER_SIZE: usize = 262144;
 /// Number of samples per buffer at 16-bit sample size.
 /// For 256 KB buffer: 262144 / 2 = 131072 samples.
 pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
+
+pub const DEFAULT_ASYNC_QUEUE_LEN: usize = 16;
+
+pub struct AsyncReadHandle {
+    rx: mpsc::Receiver<Result<Vec<u8>>>,
+    ctrl_tx: mpsc::Sender<AsyncReadControl>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct AsyncReadControlHandle {
+    ctrl_tx: mpsc::Sender<AsyncReadControl>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+}
+
+enum AsyncReadControl {
+    Tune(u32),
+}
+
+impl AsyncReadHandle {
+    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
+        self.rx.recv().ok()
+    }
+
+    pub fn control_handle(&self) -> AsyncReadControlHandle {
+        AsyncReadControlHandle {
+            ctrl_tx: self.ctrl_tx.clone(),
+            stop: self.stop.clone(),
+            dropped: self.dropped.clone(),
+        }
+    }
+}
+
+impl Drop for AsyncReadHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl AsyncReadControlHandle {
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn tune(&self, center_freq: u32) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::Tune(center_freq))
+            .map_err(|_| Error::StreamingError("async control channel closed".to_string()))
+    }
+}
 
 // GPIO port/pin for Bias-T (RF bias) - GPIO_PORT1, GPIO_PIN13
 const GPIO_PORT1: u8 = 1;
@@ -924,6 +987,80 @@ impl Airspy {
                 Err(Error::StreamingError(e.to_string()))
             }
         }
+    }
+
+    /// Start a callback-like async reader loop in a dedicated thread.
+    ///
+    /// This keeps USB reads off the caller thread and publishes chunks through
+    /// a bounded queue with backpressure.
+    pub fn into_async_reader(self, queue_len: usize, buf_len: usize) -> Result<AsyncReadHandle> {
+        let qlen = if queue_len == 0 {
+            DEFAULT_ASYNC_QUEUE_LEN
+        } else {
+            queue_len
+        };
+        let read_len = if buf_len == 0 {
+            RECOMMENDED_BUFFER_SIZE
+        } else {
+            buf_len
+        };
+
+        if !read_len.is_multiple_of(512) {
+            return Err(Error::StreamingError(format!(
+                "Invalid async buffer length {} (must be multiple of 512)",
+                read_len
+            )));
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(qlen);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<AsyncReadControl>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let stop_thread = stop.clone();
+
+        let thread = thread::spawn(move || {
+            let dev = self;
+            let mut buf = vec![0u8; read_len];
+
+            while !stop_thread.load(Ordering::Relaxed) {
+                while let Ok(cmd) = ctrl_rx.try_recv() {
+                    match cmd {
+                        AsyncReadControl::Tune(center_freq) => {
+                            if let Err(e) = dev.set_freq(center_freq) {
+                                let _ = tx.try_send(Err(e));
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                match dev.read_sync(&mut buf) {
+                    Ok(n) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let chunk = buf[..n].to_vec();
+                        if tx.send(Ok(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+
+            let _ = dev.stop_rx();
+        });
+
+        Ok(AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop,
+            dropped,
+            thread: Some(thread),
+        })
     }
 
     /// Set the receiver mode (internal command).

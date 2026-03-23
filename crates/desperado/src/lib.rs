@@ -10,7 +10,7 @@
 
 pub use error::{Error, Result};
 use futures::Stream;
-pub use metrics::{RfMetrics, RfMetricsCalculator};
+pub use metrics::{RfMetrics, RfMetricsCalculator, iq_level_dbfs};
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -637,7 +637,7 @@ impl std::str::FromStr for DeviceConfig {
             }
             #[cfg(feature = "airspy")]
             "airspy" => {
-                // Parse: airspy://[device_index]?freq=...&rate=...&gain=...
+                // Parse: airspy://[device_index]?freq=...&rate=...&gain=...&lna=...&mix=...&if=...
                 let (device_part, query) = if let Some(q_pos) = rest.find('?') {
                     (&rest[..q_pos], &rest[q_pos + 1..])
                 } else {
@@ -656,6 +656,9 @@ impl std::str::FromStr for DeviceConfig {
                 let mut center_freq: Option<u32> = None;
                 let mut sample_rate: Option<u32> = None;
                 let mut gain = Gain::Auto;
+                let mut lna_gain: Option<u8> = None;
+                let mut mixer_gain: Option<u8> = None;
+                let mut vga_gain: Option<u8> = None;
 
                 for param in query.split('&') {
                     if param.is_empty() {
@@ -682,6 +685,24 @@ impl std::str::FromStr for DeviceConfig {
                                 gain = Gain::Manual(gain_db);
                             }
                         }
+                        "lna" | "lna_gain" => {
+                            let v: u8 = kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid lna gain: {}", kv[1]))
+                            })?;
+                            lna_gain = Some(v);
+                        }
+                        "mix" | "mixer" | "mixer_gain" => {
+                            let v: u8 = kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid mixer gain: {}", kv[1]))
+                            })?;
+                            mixer_gain = Some(v);
+                        }
+                        "if" | "if_gain" | "vga" | "vga_gain" => {
+                            let v: u8 = kv[1].parse().map_err(|_| {
+                                Error::other(format!("Invalid IF/VGA gain: {}", kv[1]))
+                            })?;
+                            vga_gain = Some(v);
+                        }
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -691,12 +712,12 @@ impl std::str::FromStr for DeviceConfig {
                 let sample_rate = sample_rate
                     .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
 
-                Ok(DeviceConfig::Airspy(airspy::AirspyConfig::new(
-                    device_index,
-                    center_freq,
-                    sample_rate,
-                    gain,
-                )))
+                let mut cfg =
+                    airspy::AirspyConfig::new(device_index, center_freq, sample_rate, gain);
+                cfg.lna_gain = lna_gain;
+                cfg.mixer_gain = mixer_gain;
+                cfg.vga_gain = vga_gain;
+                Ok(DeviceConfig::Airspy(cfg))
             }
             _ => Err(Error::other(format!("Unknown device scheme: {}", scheme))),
         }
@@ -975,6 +996,19 @@ pub enum IqAsyncSource {
 }
 
 impl IqAsyncSource {
+    /// Retune center frequency on supported live SDR sources.
+    pub fn tune(&self, _center_freq: u32) -> error::Result<()> {
+        match self {
+            #[cfg(feature = "rtlsdr")]
+            IqAsyncSource::RtlSdr(source) => source.tune(_center_freq),
+            #[cfg(feature = "airspy")]
+            IqAsyncSource::Airspy(source) => source.tune(_center_freq),
+            _ => Err(error::Error::other(
+                "Retune is only supported for RTL-SDR/Airspy async sources".to_string(),
+            )),
+        }
+    }
+
     /// Create a new file-based asynchronous I/Q source
     ///
     /// # Example
@@ -1158,7 +1192,7 @@ impl IqAsyncSource {
     ///
     /// This is a convenience method that dispatches to the appropriate device-specific
     /// constructor based on the DeviceConfig variant.
-    #[cfg(any(feature = "rtlsdr", feature = "pluto", feature = "soapy"))]
+    #[cfg(any(feature = "rtlsdr", feature = "pluto", feature = "soapy", feature = "airspy"))]
     pub async fn from_device_config(config: &DeviceConfig) -> error::Result<Self> {
         match config {
             #[cfg(feature = "rtlsdr")]
@@ -1177,9 +1211,10 @@ impl IqAsyncSource {
                 Ok(IqAsyncSource::SoapySdr(async_reader))
             }
             #[cfg(feature = "airspy")]
-            DeviceConfig::Airspy(_) => Err(error::Error::other(
-                "Airspy is only supported via IqSource (sync), not IqAsyncSource".to_string(),
-            )),
+            DeviceConfig::Airspy(cfg) => {
+                let async_reader = airspy::AsyncAirspySdrReader::new(cfg)?;
+                Ok(IqAsyncSource::Airspy(async_reader))
+            }
         }
     }
 }

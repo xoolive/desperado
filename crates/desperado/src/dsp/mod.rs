@@ -84,10 +84,14 @@ use num_complex::Complex;
 
 pub mod afc;
 pub mod agc;
+#[cfg(feature = "resampler")]
+pub mod dab_resampler;
 pub mod decimator;
 pub mod filters;
 pub mod iir;
 pub mod nco;
+#[cfg(feature = "resampler")]
+pub mod resampler;
 pub mod rotate;
 pub mod symsync;
 

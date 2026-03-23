@@ -1009,6 +1009,18 @@ impl RdsDecoder {
         self.print_json_output = enabled;
     }
 
+    pub fn clock_time(&self) -> Option<super::ClockTimeInfo> {
+        self.rds_parser.station_info().clock_time.clone()
+    }
+
+    pub fn program_type(&self) -> String {
+        self.rds_parser.program_type_name().to_string()
+    }
+
+    pub fn language(&self) -> Option<String> {
+        self.rds_parser.language_name().map(|s| s.to_string())
+    }
+
     pub fn station_name(&self) -> Option<String> {
         self.rds_parser.station_name()
     }
@@ -1019,6 +1031,18 @@ impl RdsDecoder {
 
     pub fn stats(&self) -> (u64, u32, u32) {
         self.rds_parser.stats()
+    }
+
+    /// Get the first alternative frequency (if available) in Hz
+    /// Returns None if no valid alternative frequencies are decoded yet
+    pub fn alt_frequency(&self) -> Option<u32> {
+        let af_list = &self.rds_parser.station_info().af_list;
+        // Valid AF frequencies are 1-204 (in 10kHz units)
+        // 225-249 are special codes, 0 is filler
+        af_list
+            .iter()
+            .find(|&&f| (1..=204).contains(&f))
+            .map(|&f| u32::from(f) * 10_000) // Convert to Hz
     }
 
     /// Process accumulated bits through the RDS parser and display results

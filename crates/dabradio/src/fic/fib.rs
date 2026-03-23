@@ -344,8 +344,8 @@ impl EnsembleInfo {
         }
         // Every service with a subchannel must have a label and bitrate
         self.services.values().all(|s| {
-            if s.subchannel_id.is_some() {
-                s.label.is_some() && self.subchannels.contains_key(&s.subchannel_id.unwrap())
+            if let Some(sid) = s.subchannel_id {
+                s.label.is_some() && self.subchannels.contains_key(&sid)
             } else {
                 // Services without subchannel (data services) — just need a label
                 s.label.is_some()

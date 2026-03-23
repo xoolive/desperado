@@ -27,6 +27,10 @@ const RS_PARITY: usize = 10;
 /// RS data bytes per codeword.
 const RS_DATA: usize = RS_BLOCK_LEN - RS_PARITY; // 110
 
+/// Maximum number of consecutive superframes we conceal by replaying audio.
+/// After this, emit silence instead of repeating stale program content.
+const MAX_REPLAYED_SUPERFRAMES: usize = 6;
+
 // ---------------------------------------------------------------------------
 // Fire Code CRC-16 (polynomial 0x782F)
 // ---------------------------------------------------------------------------
@@ -591,13 +595,11 @@ impl AacDecoder {
             }
         }
 
-        // Decode one frame
-        match self.decoder.decode_frame(&mut self.pcm_buf) {
-            Ok(()) => {}
-            Err(e) => {
-                debug!("fdk-aac decode error: {:?}", e);
-                return None;
-            }
+        // Decode one frame.
+        // FDK-AAC can report non-OK statuses while still producing valid concealment
+        // output. So we do not immediately drop on error; we check output size below.
+        if let Err(e) = self.decoder.decode_frame(&mut self.pcm_buf) {
+            debug!("fdk-aac decode status: {:?}", e);
         }
 
         // Get actual output size
@@ -639,6 +641,16 @@ pub struct DabPlusDecoder {
     /// Whether AAC decoder has been configured with ASC.
     aac_configured: bool,
     pad: PadExtractor,
+    /// Last successfully decoded AU samples for simple concealment.
+    last_good_au: Vec<f32>,
+    /// Expected PCM samples per AU (interleaved).
+    expected_au_samples: usize,
+    /// Last successfully decoded superframe PCM for coarse concealment.
+    last_good_superframe: Vec<f32>,
+    /// Expected PCM samples per superframe.
+    expected_superframe_samples: usize,
+    /// Number of consecutive superframes concealed due to decode loss.
+    consecutive_superframe_concealments: usize,
 }
 
 impl DabPlusDecoder {
@@ -649,6 +661,11 @@ impl DabPlusDecoder {
             aac: AacDecoder::new(),
             aac_configured: false,
             pad: PadExtractor::new(),
+            last_good_au: Vec::new(),
+            expected_au_samples: 0,
+            last_good_superframe: Vec::new(),
+            expected_superframe_samples: 0,
+            consecutive_superframe_concealments: 0,
         }
     }
 
@@ -666,9 +683,32 @@ impl DabPlusDecoder {
         let mut pcm_out = Vec::new();
         let mut metadata = Vec::new();
 
+        let rs_before = self.superframe.rs_errors;
         let aus = match self.superframe.feed_frame(frame) {
             Some(aus) => aus,
             None => {
+                if self.superframe.rs_errors > rs_before {
+                    self.consecutive_superframe_concealments += 1;
+                    if !self.last_good_superframe.is_empty()
+                        && self.consecutive_superframe_concealments <= MAX_REPLAYED_SUPERFRAMES
+                    {
+                        pcm_out.extend_from_slice(&self.last_good_superframe);
+                        debug!(
+                            pcm_samples = pcm_out.len(),
+                            rs_errors_total = self.superframe.rs_errors,
+                            conceal_count = self.consecutive_superframe_concealments,
+                            "Concealing lost superframe with last good PCM"
+                        );
+                    } else if self.expected_superframe_samples > 0 {
+                        pcm_out.resize(self.expected_superframe_samples, 0.0);
+                        debug!(
+                            pcm_samples = pcm_out.len(),
+                            rs_errors_total = self.superframe.rs_errors,
+                            conceal_count = self.consecutive_superframe_concealments,
+                            "Concealing lost superframe with silence"
+                        );
+                    }
+                }
                 return DabPlusDecodeOutput {
                     pcm: pcm_out,
                     metadata,
@@ -708,11 +748,44 @@ impl DabPlusDecoder {
         }
 
         // Decode each AU
+        let mut decoded_aus = 0usize;
+        let mut concealed_aus = 0usize;
         for au in &aus {
             metadata.extend(self.pad.extract_all_from_au(au));
             if let Some(samples) = self.aac.decode_au(au) {
+                decoded_aus += 1;
+                self.expected_au_samples = samples.len();
+                self.last_good_au = samples.clone();
                 pcm_out.extend_from_slice(&samples);
+            } else {
+                let conceal_len = if !self.last_good_au.is_empty() {
+                    pcm_out.extend_from_slice(&self.last_good_au);
+                    self.last_good_au.len()
+                } else if self.expected_au_samples > 0 {
+                    pcm_out.resize(pcm_out.len() + self.expected_au_samples, 0.0);
+                    self.expected_au_samples
+                } else {
+                    0
+                };
+                if conceal_len > 0 {
+                    concealed_aus += 1;
+                }
             }
+        }
+
+        debug!(
+            aus_total = aus.len(),
+            aus_decoded = decoded_aus,
+            aus_concealed = concealed_aus,
+            pcm_samples = pcm_out.len(),
+            metadata_items = metadata.len(),
+            "DAB+ superframe output"
+        );
+
+        if !pcm_out.is_empty() {
+            self.expected_superframe_samples = pcm_out.len();
+            self.last_good_superframe = pcm_out.clone();
+            self.consecutive_superframe_concealments = 0;
         }
 
         DabPlusDecodeOutput {

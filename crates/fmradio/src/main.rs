@@ -43,13 +43,14 @@ use desperado::dsp::{
 use fmradio::fm::{DeemphasisFilter, PhaseExtractor};
 use fmradio::rds::{RdsDecoder, RdsResamplerCustom};
 use futures::StreamExt;
+use ratatui::style::{Color, Modifier, Style};
 use std::f32::consts::PI;
 use std::io::{stderr, stdout, Write};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{Level, debug, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -57,6 +58,7 @@ use clap::{ArgAction, Parser};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use desperado::{DeviceConfig, IqAsyncSource, IqFormat, iq_level_dbfs};
+use desperado::rtlsdr::RtlSdrMessage;
 
 use rubato::{
     Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
@@ -64,6 +66,7 @@ use rubato::{
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
+    layout::{Constraint, Layout},
     text::Line,
     widgets::{Block, Borders, Paragraph},
 };
@@ -139,6 +142,7 @@ struct TuiState {
     mode: &'static str,
     source: String,
     center_freq_hz: u32,
+    alt_freq_hz: Option<u32>,
     sample_rate_hz: u32,
     mpx_rate_hz: f32,
     iq_level_dbfs: f32,
@@ -148,13 +152,16 @@ struct TuiState {
     rds_total_blocks: u64,
     rds_valid_blocks: u64,
     rds_groups: u64,
+    rds_language: String,
+    rds_ct: String,
+    program_type: String,
 }
 
 fn spawn_inline_tui(
     state: Arc<Mutex<TuiState>>,
     running: Arc<AtomicBool>,
     stereo_enabled: Arc<AtomicBool>,
-    requested_center_hz: Arc<AtomicU32>,
+    adjust_tx: tokio::sync::mpsc::UnboundedSender<RtlSdrMessage>,
     can_hard_retune: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -182,38 +189,63 @@ fn spawn_inline_tui(
                 };
 
                 let bar = level_bar(s.iq_level_dbfs);
-                let title = format!(" FM Radio Dashboard ({}) ", s.mode);
+                let title = format!(" fmradio, tuned on {} MHz: {} ",s.center_freq_hz as f32 / 1_000_000.0,  s.rds_ps);
                 let _ = terminal.draw(|f| {
                     let area = f.area();
-                    let inner = area.width.saturating_sub(4) as usize;
+                    let chunks = Layout::vertical([
+                        Constraint::Min(5),
+                        Constraint::Length(1),
+                    ])
+                    .split(area);
+
+                    let body = chunks[0];
+                    let footer = chunks[1];
+                    let inner = body.width.saturating_sub(4) as usize;
                     let src = one_line(&s.source, inner.saturating_sub(9));
                     let ps = one_line(&s.rds_ps, inner.saturating_sub(10));
                     let rt = one_line(&s.rds_rt, inner.saturating_sub(10));
-                    let lines = vec![
-                        Line::from(format!(" Source: {}", src)),
-                        Line::from(format!(
-                            " Tune: {:.3} MHz   In: {} Hz   MPX: {:.0} Hz",
-                            s.center_freq_hz as f32 / 1_000_000.0,
-                            s.sample_rate_hz,
-                            s.mpx_rate_hz
-                        )),
+                    let time = one_line(&s.rds_ct, inner.saturating_sub(10));
+                    let language = one_line(&s.rds_language, inner.saturating_sub(10));
+                   let program_type = one_line(&s.program_type, inner.saturating_sub(10)) ;
+                     let alt_freq_str = s.alt_freq_hz
+                         .map(|f| format!("{:.1} MHz", f as f64 / 1_000_000.0))
+                         .unwrap_or_else(|| "—".to_string());
+                     let lines = vec![
+                         Line::from(format!(" Source: {}", src)),
+                         Line::from(format!(
+                             " In: {} Hz   MPX: {:.0} Hz",
+                             s.sample_rate_hz,
+                             s.mpx_rate_hz
+                         )),
+                         Line::from(""),
+                         Line::from(format!(" RDS PS: {}", ps)),
+                         Line::from(format!(" RDS RT: {}", rt)),
+                         Line::from(format!(" RDS Clock: {}", time)),
+                         Line::from(format!(" RDS Program Type: {}", program_type)),
+                         Line::from(format!(" RDS Language: {}", language)),
+                         Line::from(format!(" RDS Alt Freq: {}", alt_freq_str)),
+                         Line::from(format!(" Audio: {}", s.mode)),
                         Line::from(""),
+                        Line::from(" Metrics:"),
                         Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
                         Line::from(format!(" Audio Buffer: {} samples", s.audio_buf_fill)),
-                        Line::from(""),
-                        Line::from(format!(" RDS PS: {}", ps)),
-                        Line::from(format!(" RDS RT: {}", rt)),
                         Line::from(format!(
                             " RDS Blocks: valid={} total={}  BLER={:5.1}%",
                             s.rds_valid_blocks, s.rds_total_blocks, rds_bler
                         )),
                         Line::from(format!(" RDS Groups: {}", s.rds_groups)),
-                        Line::from(""),
-                        Line::from(" Controls: <-/-> 100kHz, ^/v 1MHz, S stereo, q/Esc quit"),
                     ];
                     let p = Paragraph::new(lines)
-                        .block(Block::default().title(title).borders(Borders::ALL));
-                    f.render_widget(p, area);
+                        .block(Block::default().title(title).title_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)).borders(Borders::ALL));
+                    f.render_widget(p, body);
+
+                    let controls = if can_hard_retune {
+                        "(Esc/Q) quit | (←/→) 100kHz | (↑/↓) 1MHz | (S) stereo"
+                    } else {
+                        "(Esc/Q) quit | (S) stereo"
+                    };
+                    let footer_widget = Paragraph::new(Line::from(controls)).centered();
+                    f.render_widget(footer_widget, footer);
                 });
             }
 
@@ -233,41 +265,43 @@ fn spawn_inline_tui(
                             stereo_enabled.store(!now, Ordering::Relaxed);
                         }
                         KeyCode::Left if can_hard_retune => {
-                            let next = requested_center_hz
-                                .load(Ordering::Relaxed)
-                                .saturating_sub(100_000)
-                                .max(100_000);
-                            requested_center_hz.store(next, Ordering::Relaxed);
-                            if let Ok(mut s) = state.lock() {
-                                s.center_freq_hz = next;
+                            if let Ok(s) = state.lock() {
+                                let next = s.center_freq_hz.saturating_sub(100_000).max(100_000);
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
                         }
                         KeyCode::Right if can_hard_retune => {
-                            let next = requested_center_hz
-                                .load(Ordering::Relaxed)
-                                .saturating_add(100_000);
-                            requested_center_hz.store(next, Ordering::Relaxed);
-                            if let Ok(mut s) = state.lock() {
-                                s.center_freq_hz = next;
+                            if let Ok(s) = state.lock() {
+                                let next = s.center_freq_hz.saturating_add(100_000);
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
                         }
                         KeyCode::Up if can_hard_retune => {
-                            let next = requested_center_hz
-                                .load(Ordering::Relaxed)
-                                .saturating_add(1_000_000);
-                            requested_center_hz.store(next, Ordering::Relaxed);
-                            if let Ok(mut s) = state.lock() {
-                                s.center_freq_hz = next;
+                            if let Ok(s) = state.lock() {
+                                let next = s.center_freq_hz.saturating_add(1_000_000);
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
                         }
                         KeyCode::Down if can_hard_retune => {
-                            let next = requested_center_hz
-                                .load(Ordering::Relaxed)
-                                .saturating_sub(1_000_000)
-                                .max(100_000);
-                            requested_center_hz.store(next, Ordering::Relaxed);
-                            if let Ok(mut s) = state.lock() {
-                                s.center_freq_hz = next;
+                            if let Ok(s) = state.lock() {
+                                let next = s.center_freq_hz.saturating_sub(1_000_000).max(100_000);
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
                         }
                         _ => {}
@@ -347,9 +381,9 @@ async fn main() -> desperado::Result<()> {
     let mut current_center_hz = args.center_freq.0;
     let mut iq_source = build_iq_source(&args, tuning_freq_from_center(current_center_hz, args.offset_freq)).await?;
 
-    let initial_stereo = !args.mono;
+     let initial_stereo = !args.mono;
     let stereo_enabled = Arc::new(AtomicBool::new(initial_stereo));
-    let requested_center_hz = Arc::new(AtomicU32::new(current_center_hz));
+    let (adjust_tx, mut adjust_rx) = tokio::sync::mpsc::unbounded_channel::<RtlSdrMessage>();
 
     info!(
         "FM demodulator: {} mode, source: {}",
@@ -391,6 +425,7 @@ async fn main() -> desperado::Result<()> {
         mode: if initial_stereo { "stereo" } else { "mono" },
         source: args.source.clone(),
         center_freq_hz: args.center_freq.0,
+        alt_freq_hz: None,
         sample_rate_hz: args.sample_rate,
         mpx_rate_hz: 0.0,
         iq_level_dbfs: -120.0,
@@ -400,15 +435,18 @@ async fn main() -> desperado::Result<()> {
         rds_total_blocks: 0,
         rds_valid_blocks: 0,
         rds_groups: 0,
+        program_type: String::new(),
+        rds_ct: String::new(),
+        rds_language: String::new(),
     }));
     let app_running = Arc::new(AtomicBool::new(true));
-    let tui_thread = if args.tui {
+     let tui_thread = if args.tui {
         let can_hard_retune = args.source.starts_with("rtlsdr://");
         Some(spawn_inline_tui(
             tui_state.clone(),
             app_running.clone(),
             stereo_enabled.clone(),
-            requested_center_hz.clone(),
+            adjust_tx.clone(),
             can_hard_retune,
         ))
     } else {
@@ -459,7 +497,7 @@ async fn main() -> desperado::Result<()> {
             if args.tui { Some(tui_state.clone()) } else { None },
             args.tui,
             stereo_enabled.clone(),
-            requested_center_hz.clone(),
+            &mut adjust_rx,
             &mut current_center_hz,
             app_running.clone(),
         )
@@ -478,12 +516,20 @@ async fn main() -> desperado::Result<()> {
             tx.clone(),
             if args.tui { Some(tui_state.clone()) } else { None },
             args.tui,
-            requested_center_hz.clone(),
+            &mut adjust_rx,
             &mut current_center_hz,
             app_running.clone(),
         )
         .await
     };
+
+    if is_file_source && !args.no_audio && app_running.load(Ordering::Relaxed) {
+        let drain_start = Instant::now();
+        let max_drain = Duration::from_secs(10);
+        while !tx.is_empty() && drain_start.elapsed() < max_drain {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     // Always restore TUI terminal state, including on I/O errors.
     app_running.store(false, Ordering::Relaxed);
@@ -517,24 +563,7 @@ async fn build_iq_source(args: &Args, tuning_freq: u32) -> desperado::Result<IqA
     let config = DeviceConfig::from_str(&configured_uri)
         .map_err(|e| std::io::Error::other(format!("Invalid SDR URI: {}", e)))?;
 
-    match &config {
-        DeviceConfig::Airspy(cfg) => {
-            IqAsyncSource::from_airspy(
-                match cfg.device {
-                    desperado::airspy::DeviceSelector::Index(i) => Some(i),
-                    desperado::airspy::DeviceSelector::Serial(_) => None,
-                },
-                cfg.center_freq,
-                cfg.sample_rate,
-                cfg.gain.clone(),
-                cfg.lna_gain,
-                cfg.mixer_gain,
-                cfg.vga_gain,
-            )
-            .await
-        }
-        _ => IqAsyncSource::from_device_config(&config).await,
-    }
+    IqAsyncSource::from_device_config(&config).await
 }
 
 fn is_device_uri(input: &str) -> bool {
@@ -600,7 +629,7 @@ async fn run_mono(
     tx: channel::Sender<f32>,
     tui_state: Option<Arc<Mutex<TuiState>>>,
     tui_mode: bool,
-    requested_center_hz: Arc<AtomicU32>,
+    adjust_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RtlSdrMessage>,
     current_center_hz: &mut u32,
     running: Arc<AtomicBool>,
 ) -> desperado::Result<()> {
@@ -613,44 +642,47 @@ async fn run_mono(
     const AGC_ATTACK: f32 = 0.999;
     const AGC_RELEASE: f32 = 0.9999;
 
-    // Real-time pacing for file playback - track absolute time to prevent drift
     let is_file_source = is_file_like_source(&args.source);
-    while let Some(chunk) = iq_source.next().await {
+     while let Some(chunk) = iq_source.next().await {
         if !running.load(Ordering::Relaxed) {
             break;
         }
-        let desired_center = requested_center_hz.load(Ordering::Relaxed);
-        if desired_center != *current_center_hz {
-            let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
-            match iq_source.tune(tuning_freq) {
-                Ok(()) => {
-                    *current_center_hz = desired_center;
-                    // Reset DSP state so demod/RDS reacquires on the new station.
-                    *rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
-                    phase_extractor.reset();
-                    decimator.reset();
-                    deemphasis.reset();
-                    audio_resample = AudioAdaptiveResampler::new(
-                        AUDIO_RATE as f64 / mpx_sample_rate as f64,
-                        1,
-                        1,
-                        !tui_mode,
-                    );
-                    agc_gain = 0.5;
-                    if let Some(state) = &tui_state
-                        && let Ok(mut s) = state.lock()
-                    {
-                        s.center_freq_hz = desired_center;
+        
+        // Check for control messages (non-blocking)
+        while let Ok(msg) = adjust_rx.try_recv() {
+            if let RtlSdrMessage::Frequency(desired_center) = msg
+                && desired_center != *current_center_hz
+            {
+                let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
+                match iq_source.tune(tuning_freq) {
+                    Ok(()) => {
+                        *current_center_hz = desired_center;
+                        // Reset DSP state so demod/RDS reacquires on the new station.
+                        *rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
+                        phase_extractor.reset();
+                        decimator.reset();
+                        deemphasis.reset();
+                        audio_resample = AudioAdaptiveResampler::new(
+                            AUDIO_RATE as f64 / mpx_sample_rate as f64,
+                            1,
+                            1,
+                            !tui_mode,
+                        );
+                        agc_gain = 0.5;
+                        if let Some(state) = &tui_state
+                            && let Ok(mut s) = state.lock()
+                        {
+                            s.center_freq_hz = desired_center;
+                        }
+                        settle_drop_chunks = 4;
                     }
-                    settle_drop_chunks = 4;
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Retune failed: {}", e);
-                    requested_center_hz.store(*current_center_hz, Ordering::Relaxed);
+                    Err(e) => {
+                        warn!("Retune failed: {}", e);
+                    }
                 }
             }
         }
+        
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
 
         if settle_drop_chunks > 0 {
@@ -736,6 +768,7 @@ async fn run_mono(
                 }
             }
         }
+
     }
 
     Ok(())
@@ -755,7 +788,7 @@ async fn run_stereo(
     tui_state: Option<Arc<Mutex<TuiState>>>,
     tui_mode: bool,
     stereo_enabled: Arc<AtomicBool>,
-    requested_center_hz: Arc<AtomicU32>,
+    adjust_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RtlSdrMessage>,
     current_center_hz: &mut u32,
     running: Arc<AtomicBool>,
 ) -> desperado::Result<()> {
@@ -778,7 +811,6 @@ async fn run_stereo(
         AudioAdaptiveResampler::new(AUDIO_RATE as f64 / mpx_sample_rate as f64, 5, 2, !tui_mode);
     let mut settle_drop_chunks = 0usize;
 
-    // Real-time pacing for file playback - track absolute time to prevent drift
     let is_file_source = is_file_like_source(&args.source);
 
     // Raw output mode: write MPX samples to stdout for piping to redsea
@@ -818,53 +850,57 @@ async fn run_stereo(
     };
     let mut raw_leftover: Vec<f32> = Vec::new();
 
-    while let Some(chunk) = iq_source.next().await {
+     while let Some(chunk) = iq_source.next().await {
         if !running.load(Ordering::Relaxed) {
             break;
         }
-        let desired_center = requested_center_hz.load(Ordering::Relaxed);
-        if desired_center != *current_center_hz {
-            let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
-            match iq_source.tune(tuning_freq) {
-                Ok(()) => {
-                    *current_center_hz = desired_center;
-                    // Reset DSP state so stereo/RDS lock is reacquired for new station.
-                    *rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
-                    phase_extractor.reset();
-                    decimator.reset();
-                    stereo = StereoDecoderPLL::new(mpx_sample_rate);
-                    deemphasis_l = DeemphasisFilter::new(mpx_sample_rate, 50e-6);
-                    deemphasis_r = DeemphasisFilter::new(mpx_sample_rate, 50e-6);
-                    rds_resampler = RdsResamplerCustom::new(mpx_sample_rate, rds_target_rate);
-                    rds = RdsDecoder::new(rds_target_rate, args.verbose >= 2);
-                    if tui_mode {
-                        rds.set_print_json_output(false);
+        
+        // Check for control messages (non-blocking)
+        while let Ok(msg) = adjust_rx.try_recv() {
+            if let RtlSdrMessage::Frequency(desired_center) = msg
+                && desired_center != *current_center_hz
+            {
+                let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
+                match iq_source.tune(tuning_freq) {
+                    Ok(()) => {
+                        *current_center_hz = desired_center;
+                        // Reset DSP state so stereo/RDS lock is reacquired for new station.
+                        *rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
+                        phase_extractor.reset();
+                        decimator.reset();
+                        stereo = StereoDecoderPLL::new(mpx_sample_rate);
+                        deemphasis_l = DeemphasisFilter::new(mpx_sample_rate, 50e-6);
+                        deemphasis_r = DeemphasisFilter::new(mpx_sample_rate, 50e-6);
+                        rds_resampler = RdsResamplerCustom::new(mpx_sample_rate, rds_target_rate);
+                        rds = RdsDecoder::new(rds_target_rate, args.verbose >= 2);
+                        if tui_mode {
+                            rds.set_print_json_output(false);
+                        }
+                        audio_resample = AudioAdaptiveResampler::new(
+                            AUDIO_RATE as f64 / mpx_sample_rate as f64,
+                            5,
+                            2,
+                            !tui_mode,
+                        );
+                        if let Some(state) = &tui_state
+                            && let Ok(mut s) = state.lock()
+                        {
+                            s.center_freq_hz = desired_center;
+                            s.rds_ps.clear();
+                            s.rds_rt.clear();
+                            s.rds_total_blocks = 0;
+                            s.rds_valid_blocks = 0;
+                            s.rds_groups = 0;
+                        }
+                        settle_drop_chunks = 12;
                     }
-                    audio_resample = AudioAdaptiveResampler::new(
-                        AUDIO_RATE as f64 / mpx_sample_rate as f64,
-                        5,
-                        2,
-                        !tui_mode,
-                    );
-                    if let Some(state) = &tui_state
-                        && let Ok(mut s) = state.lock()
-                    {
-                        s.center_freq_hz = desired_center;
-                        s.rds_ps.clear();
-                        s.rds_rt.clear();
-                        s.rds_total_blocks = 0;
-                        s.rds_valid_blocks = 0;
-                        s.rds_groups = 0;
+                    Err(e) => {
+                        warn!("Retune failed: {}", e);
                     }
-                    settle_drop_chunks = 12;
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Retune failed: {}", e);
-                    requested_center_hz.store(*current_center_hz, Ordering::Relaxed);
                 }
             }
         }
+        
         let chunk = chunk.map_err(|e| std::io::Error::other(format!("{}", e)))?;
 
         if settle_drop_chunks > 0 {
@@ -976,6 +1012,10 @@ async fn run_stereo(
                 s.rds_groups = u64::from(groups);
                 s.rds_ps = rds.station_name().unwrap_or_default();
                 s.rds_rt = rds.radio_text().unwrap_or_default();
+                s.rds_ct = rds.clock_time().map(|t| format!("{:}", t)).unwrap_or_default();
+                s.rds_language = rds.language().unwrap_or_default();
+                s.program_type = rds.program_type();
+                s.alt_freq_hz = rds.alt_frequency();
                 s.mode = if stereo_on { "stereo" } else { "mono" };
             }
         }
@@ -1019,6 +1059,7 @@ async fn run_stereo(
                 }
             }
         }
+
     }
 
     Ok(())

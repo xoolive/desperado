@@ -7,6 +7,22 @@ const DEFAULT_WINDOW_SECONDS: f64 = 3.0;
 const DEFAULT_EMIT_RATE_HZ: f64 = 2.0;
 const EPSILON: f64 = 1e-12;
 
+/// Compute chunk-level IQ RMS level in dBFS.
+///
+/// This is equivalent to `10 * log10(mean(I^2 + Q^2))` and also to
+/// `20 * log10(rms_amplitude)`.
+pub fn iq_level_dbfs(samples: &[Complex<f32>]) -> f64 {
+    if samples.is_empty() {
+        return -120.0;
+    }
+    let avg_power = samples
+        .iter()
+        .map(|s| f64::from(s.re) * f64::from(s.re) + f64::from(s.im) * f64::from(s.im))
+        .sum::<f64>()
+        / samples.len() as f64;
+    10.0 * avg_power.max(EPSILON).log10()
+}
+
 /// RF quality metrics computed from IQ samples.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RfMetrics {
@@ -187,6 +203,19 @@ impl RfMetricsCalculator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iq_level_dbfs_empty_is_floor() {
+        let s: Vec<Complex<f32>> = Vec::new();
+        assert_eq!(iq_level_dbfs(&s), -120.0);
+    }
+
+    #[test]
+    fn iq_level_dbfs_unit_tone_is_zero_dbfs() {
+        let s = vec![Complex::new(1.0, 0.0); 1024];
+        let v = iq_level_dbfs(&s);
+        assert!(v.abs() < 1e-9);
+    }
 
     #[test]
     fn computes_clipping_ratio() {
