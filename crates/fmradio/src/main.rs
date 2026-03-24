@@ -55,7 +55,7 @@ use tracing::{Level, debug, info, warn};
 use tracing_subscriber::prelude::*;
 
 use clap::{ArgAction, Parser};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use desperado::rtlsdr::RtlSdrMessage;
 use desperado::{DeviceConfig, IqAsyncSource, IqFormat, iq_level_dbfs};
@@ -179,6 +179,17 @@ fn spawn_inline_tui(
             }
         };
 
+        // Scanning state machine
+        enum ScanMode {
+            Idle,
+            ScanForward,
+            ScanBackward,
+        }
+        let mut scan_mode = ScanMode::Idle;
+        let mut scan_settle_count = 0i32;
+        const SIGNAL_STRENGTH_THRESHOLD: f32 = -45.0; // dBFS threshold to consider "good signal" (more lenient)
+        const MIN_SETTLE_BEFORE_STOP: i32 = 1; // Need at least 1 settle interval of good signal
+
         while running.load(Ordering::Relaxed) {
             if let Ok(s) = state.lock() {
                 let rds_bler = if s.rds_total_blocks > 0 {
@@ -214,8 +225,8 @@ fn spawn_inline_tui(
                     let lines = vec![
                         Line::from(format!(" Source: {}", src)),
                         Line::from(format!(
-                            " In: {} Hz   MPX: {:.0} Hz",
-                            s.sample_rate_hz, s.mpx_rate_hz
+                            " In: {} Hz   MPX: {:.0} Hz   ({})",
+                            s.sample_rate_hz, s.mpx_rate_hz, s.mode
                         )),
                         Line::from(""),
                         Line::from(format!(" RDS PS: {}", ps)),
@@ -224,7 +235,6 @@ fn spawn_inline_tui(
                         Line::from(format!(" RDS Program Type: {}", program_type)),
                         Line::from(format!(" RDS Language: {}", language)),
                         Line::from(format!(" RDS Alt Freq: {}", alt_freq_str)),
-                        Line::from(format!(" Audio: {}", s.mode)),
                         Line::from(""),
                         Line::from(" Metrics:"),
                         Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
@@ -244,7 +254,7 @@ fn spawn_inline_tui(
                     f.render_widget(p, body);
 
                     let controls = if can_hard_retune {
-                        "(Esc/Q) quit | (←/→) 100kHz | (↑/↓) 1MHz | (S) stereo"
+                        "(Esc/Q) quit | (←/→) 100kHz | (↑/↓) 1MHz | (⤒/⤓) scan | (S) stereo"
                     } else {
                         "(Esc/Q) quit | (S) stereo"
                     };
@@ -259,58 +269,151 @@ fn spawn_inline_tui(
                         let _ = terminal.autoresize();
                         let _ = terminal.clear();
                     }
-                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            running.store(false, Ordering::Relaxed);
-                            break;
-                        }
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
-                            let now = stereo_enabled.load(Ordering::Relaxed);
-                            stereo_enabled.store(!now, Ordering::Relaxed);
-                        }
-                        KeyCode::Left if can_hard_retune => {
-                            if let Ok(s) = state.lock() {
-                                let next = s.center_freq_hz.saturating_sub(100_000).max(100_000);
-                                drop(s);
-                                if let Ok(mut s) = state.lock() {
-                                    s.center_freq_hz = next;
-                                }
-                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                running.store(false, Ordering::Relaxed);
+                                break;
                             }
-                        }
-                        KeyCode::Right if can_hard_retune => {
-                            if let Ok(s) = state.lock() {
-                                let next = s.center_freq_hz.saturating_add(100_000);
-                                drop(s);
-                                if let Ok(mut s) = state.lock() {
-                                    s.center_freq_hz = next;
-                                }
-                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                let now = stereo_enabled.load(Ordering::Relaxed);
+                                stereo_enabled.store(!now, Ordering::Relaxed);
                             }
-                        }
-                        KeyCode::Up if can_hard_retune => {
-                            if let Ok(s) = state.lock() {
-                                let next = s.center_freq_hz.saturating_add(1_000_000);
-                                drop(s);
-                                if let Ok(mut s) = state.lock() {
-                                    s.center_freq_hz = next;
+                            KeyCode::Left if can_hard_retune => {
+                                if let Ok(s) = state.lock() {
+                                    let next = s.center_freq_hz.saturating_sub(100_000).max(100_000);
+                                    drop(s);
+                                    if let Ok(mut s) = state.lock() {
+                                        s.center_freq_hz = next;
+                                    }
+                                    let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                                 }
-                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
-                        }
-                        KeyCode::Down if can_hard_retune => {
-                            if let Ok(s) = state.lock() {
-                                let next = s.center_freq_hz.saturating_sub(1_000_000).max(100_000);
-                                drop(s);
-                                if let Ok(mut s) = state.lock() {
-                                    s.center_freq_hz = next;
+                            KeyCode::Right if can_hard_retune => {
+                                if let Ok(s) = state.lock() {
+                                    let next = s.center_freq_hz.saturating_add(100_000);
+                                    drop(s);
+                                    if let Ok(mut s) = state.lock() {
+                                        s.center_freq_hz = next;
+                                    }
+                                    let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                                 }
-                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                             }
+                            KeyCode::Up | KeyCode::PageUp if can_hard_retune && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) => {
+                                if key.modifiers == KeyModifiers::CONTROL {
+                                    // Ctrl+Up or PageUp: start scan
+                                    scan_mode = ScanMode::ScanForward;
+                                    scan_settle_count = 0;
+                                } else {
+                                    // Up: coarse tune +1MHz
+                                    if let Ok(s) = state.lock() {
+                                        let next = s.center_freq_hz.saturating_add(1_000_000);
+                                        drop(s);
+                                        if let Ok(mut s) = state.lock() {
+                                            s.center_freq_hz = next;
+                                        }
+                                        let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
+                                    }
+                                }
+                            }
+                            KeyCode::Down | KeyCode::PageDown if can_hard_retune && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) => {
+                                if key.modifiers == KeyModifiers::CONTROL {
+                                    // Ctrl+Down or PageDown: start scan
+                                    scan_mode = ScanMode::ScanBackward;
+                                    scan_settle_count = 0;
+                                } else {
+                                    // Down: coarse tune -1MHz
+                                    if let Ok(s) = state.lock() {
+                                        let next = s.center_freq_hz.saturating_sub(1_000_000).max(100_000);
+                                        drop(s);
+                                        if let Ok(mut s) = state.lock() {
+                                            s.center_freq_hz = next;
+                                        }
+                                        let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     },
                     _ => {}
+                }
+            }
+
+            // Handle auto-scanning mode
+            match &scan_mode {
+                ScanMode::Idle => {
+                    // Normal mode, no scanning
+                }
+                ScanMode::ScanForward => {
+                    if let Ok(s) = state.lock() {
+                        // Check signal strength first
+                        if s.iq_level_dbfs > SIGNAL_STRENGTH_THRESHOLD {
+                            // Good signal detected
+                            scan_settle_count += 1;
+                            if scan_settle_count >= MIN_SETTLE_BEFORE_STOP {
+                                // Confirmed good signal, stop scanning
+                                scan_mode = ScanMode::Idle;
+                                scan_settle_count = 0;
+                            }
+                        } else {
+                            // Weak signal, move to next frequency
+                            scan_settle_count = 0;
+                            let next_freq = s.center_freq_hz.saturating_add(100_000);
+                            if next_freq > 108_000_000 {
+                                // Wrap around to band start
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = 88_100_000;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(88_100_000));
+                                scan_mode = ScanMode::ScanForward;
+                            } else {
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next_freq;
+                                    s.rds_ps.clear(); // Clear to detect new station
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next_freq));
+                                scan_mode = ScanMode::ScanForward;
+                            }
+                        }
+                    }
+                }
+                ScanMode::ScanBackward => {
+                    if let Ok(s) = state.lock() {
+                        // Check signal strength first
+                        if s.iq_level_dbfs > SIGNAL_STRENGTH_THRESHOLD {
+                            // Good signal detected
+                            scan_settle_count += 1;
+                            if scan_settle_count >= MIN_SETTLE_BEFORE_STOP {
+                                // Confirmed good signal, stop scanning
+                                scan_mode = ScanMode::Idle;
+                                scan_settle_count = 0;
+                            }
+                        } else {
+                            // Weak signal, move to previous frequency
+                            scan_settle_count = 0;
+                            let next_freq = s.center_freq_hz.saturating_sub(100_000).max(88_100_000);
+                            if next_freq < 88_100_000 {
+                                // Wrap around to band end
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = 108_000_000;
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(108_000_000));
+                                scan_mode = ScanMode::ScanBackward;
+                            } else {
+                                drop(s);
+                                if let Ok(mut s) = state.lock() {
+                                    s.center_freq_hz = next_freq;
+                                    s.rds_ps.clear(); // Clear to detect new station
+                                }
+                                let _ = adjust_tx.send(RtlSdrMessage::Frequency(next_freq));
+                                scan_mode = ScanMode::ScanBackward;
+                            }
+                        }
+                    }
                 }
             }
 
