@@ -1,30 +1,60 @@
 //! VOR (VHF Omnidirectional Range) decoder.
 //!
-//! VOR (VHF Omnidirectional Range) demodulation and radial calculation.
-//! - Signal demodulation (frequency shift, filtering, subcarrier extraction)
-//! - 30 Hz reference and variable signal extraction
-//! - Radial calculation (bearing to station)
+//! VOR is a radio navigation system providing bearing information to VOR ground stations.
+//! This module demodulates VOR signals to extract:
+//! - **30 Hz reference signal**: FM-modulated on a 9960 Hz subcarrier, provides phase reference
+//! - **30 Hz variable signal**: AM-modulated on the same 9960 Hz subcarrier, rotates with station's
+//!   mechanical or electronic phase shifter
+//! - **Radial bearing**: Phase difference between variable and reference signals (0–360°)
+//! - **Morse ident**: 4-letter station identifier on 1020 Hz tone
+//!
+//! ## Demodulation Process
+//!
+//! The [`VorDemodulator`] performs the following steps on each I/Q chunk:
+//!
+//! 1. **Frequency shifting**: Translates RF carrier to baseband (DC)
+//! 2. **Baseband filtering**: 200 kHz lowpass removes out-of-band RF noise
+//! 3. **AM demodulation**: Extracts baseband envelope via magnitude (|I² + Q²|)
+//! 4. **Audio filtering**: 20 kHz lowpass removes RF artifacts
+//! 5. **Decimation**: Reduces sample rate from 1.8 MSps to 48 kHz for efficient processing
+//! 6. **Subcarrier extraction**:
+//!    - Variable subcarrier: 9–11 kHz bandpass, then AM demodulation via Hilbert envelope
+//!    - Reference subcarrier: 9.5–10.5 kHz bandpass, then FM demodulation via phase tracking
+//! 7. **30 Hz extraction**: 100 Hz lowpass filters both signals to isolate the 30 Hz modulation
+//!
+//! ## Radial Calculation
+//!
+//! Two algorithms are provided:
+//! - [`calculate_radial`]: FFT-based phase estimation at 30 Hz frequency bin (robust, requires ~1 sec data)
+//! - [`calculate_radial_vortrack`]: Vortrack algorithm (reference implementation, real-time capable)
+//!
+//! ## Filter Design
+//!
+//! All filter parameters (cutoff frequencies, orders) are defined in [`filter_config`](crate::filter_config).
+//! Key design choices:
+//! - Butterworth IIR filters chosen for phase linearity and stability
+//! - Higher filter orders (4–5) for sharp roll-off in congested VHF band
+//! - 30 Hz lowpass cutoff set to 100 Hz to account for filter group delay and capture transients
 //!
 //! Morse ident decoding is handled by the generic [`super::morse`] module.
 //!
-//! VOR stations transmit on 108-117.95 MHz with:
-//! - Carrier with voice/ident modulation
-//! - 30 Hz reference signal (FM modulated on 9960 Hz subcarrier)
-//! - 30 Hz variable signal (AM modulated, rotates mechanically or electronically)
+//! ## References
 //!
-//! The bearing (radial) to the station is determined by the phase difference
-//! between the 30 Hz variable and reference signals.
+//! - VOR stations transmit on 108–117.95 MHz (odd tenth-MHz channels)
+//! - 30 Hz reference/variable subcarriers derived from ICAO Annex 10 standard
+//! - Vortrack algorithm based on [Junzi Sun's Mode S decoder](https://github.com/junzis/pyModeS)
 
 use num_complex::Complex;
-use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 use super::morse;
+use crate::dsp::{envelope, hilbert_transform};
+use crate::filter_config::*;
 use desperado::dsp::filters::ButterworthFilter;
 use desperado::dsp::iir::filtfilt_lowpass;
 
-pub const VOR_SAMPLE_RATE_1_8M: u32 = 1_800_000;
+pub use crate::filter_config::VOR_SAMPLE_RATE_1_8M;
 
 pub struct VorDemodulator {
     pub sample_rate: f64,
@@ -46,8 +76,7 @@ pub struct VorDemodulator {
 impl VorDemodulator {
     pub fn new(sample_rate: u32) -> Self {
         let sample_rate_f = sample_rate as f64;
-        let audio_target = 48_000.0;
-        let decim_factor = ((sample_rate_f / audio_target).round() as usize).max(1);
+        let decim_factor = ((sample_rate_f / VOR_DECIMATION_TARGET_RATE).round() as usize).max(1);
         let audio_rate = sample_rate_f / decim_factor as f64;
 
         Self {
@@ -55,21 +84,42 @@ impl VorDemodulator {
             audio_rate,
             decim_factor,
 
-            // Baseband filter (200 kHz)
-            baseband_lpf: ButterworthFilter::lowpass(200_000.0, sample_rate_f, 5),
+            baseband_lpf: ButterworthFilter::lowpass(
+                VOR_BASEBAND_LPF_CUTOFF,
+                sample_rate_f,
+                VOR_BASEBAND_LPF_ORDER,
+            ),
 
-            // Audio filter (20 kHz)
-            audio_lpf: ButterworthFilter::lowpass(20_000.0, sample_rate_f, 5),
+            audio_lpf: ButterworthFilter::lowpass(
+                VOR_AUDIO_LPF_CUTOFF,
+                sample_rate_f,
+                VOR_AUDIO_LPF_ORDER,
+            ),
 
-            // Variable subcarrier
-            var_sub_bpf: ButterworthFilter::bandpass(9_000.0, 11_000.0, audio_rate, 4),
+            var_sub_bpf: ButterworthFilter::bandpass(
+                VOR_VAR_SUB_BPF_LOW,
+                VOR_VAR_SUB_BPF_HIGH,
+                audio_rate,
+                VOR_VAR_SUB_BPF_ORDER,
+            ),
 
-            // Reference subcarrier (9.5-10.5 kHz)
-            ref_sub_bpf: ButterworthFilter::bandpass(9_500.0, 10_500.0, audio_rate, 4),
+            ref_sub_bpf: ButterworthFilter::bandpass(
+                VOR_REF_SUB_BPF_LOW,
+                VOR_REF_SUB_BPF_HIGH,
+                audio_rate,
+                VOR_REF_SUB_BPF_ORDER,
+            ),
 
-            // 30 Hz lowpass filters - wider for better capture
-            var_30_lpf: ButterworthFilter::lowpass(100.0, audio_rate, 5),
-            ref_30_lpf: ButterworthFilter::lowpass(100.0, audio_rate, 5),
+            var_30_lpf: ButterworthFilter::lowpass(
+                VOR_30HZ_LPF_CUTOFF,
+                audio_rate,
+                VOR_30HZ_LPF_ORDER,
+            ),
+            ref_30_lpf: ButterworthFilter::lowpass(
+                VOR_30HZ_LPF_CUTOFF,
+                audio_rate,
+                VOR_30HZ_LPF_ORDER,
+            ),
 
             last_ref_phase: None,
         }
@@ -79,8 +129,26 @@ impl VorDemodulator {
         self.audio_rate
     }
 
-    /// Demodulate VOR signal and extract 30 Hz components
-    /// Returns (variable_30hz, reference_30hz, audio_samples)
+    /// Demodulate VOR signal and extract 30 Hz components.
+    ///
+    /// Performs the full demodulation pipeline on a chunk of I/Q samples:
+    /// frequency shift → baseband/audio filtering → AM demodulation →
+    /// decimation → subcarrier extraction → 30 Hz envelope extraction.
+    ///
+    /// # Arguments
+    ///
+    /// - `iq_samples`: Raw I/Q samples at the configured input sample rate
+    /// - `freq_offset`: Frequency shift to apply before baseband filtering (Hz)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `variable_30hz`: Envelope of the 30 Hz variable signal (AM subcarrier)
+    /// - `reference_30hz`: Phase signal from the 30 Hz reference (FM subcarrier)
+    /// - `audio_samples`: Full AM envelope decimated to audio rate
+    ///
+    /// All outputs are at the audio rate (see [`audio_rate`](Self::audio_rate)).
+    /// Returns empty vectors if input is empty.
     pub fn demodulate(
         &mut self,
         iq_samples: &[Complex<f32>],
@@ -191,57 +259,10 @@ fn decimate(input: &[f64], factor: usize) -> Vec<f64> {
     input.iter().step_by(factor).copied().collect()
 }
 
-fn hilbert_transform(signal: &[f64]) -> Vec<Complex<f64>> {
-    let n = signal.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let mut planner = FftPlanner::<f64>::new();
-    let fft = planner.plan_fft_forward(n);
-    let ifft = planner.plan_fft_inverse(n);
-
-    let mut spectrum: Vec<Complex<f64>> = signal
-        .iter()
-        .map(|&x| Complex::<f64>::new(x, 0.0))
-        .collect();
-
-    fft.process(&mut spectrum);
-
-    if n.is_multiple_of(2) {
-        for x in spectrum.iter_mut().take(n / 2).skip(1) {
-            *x *= 2.0;
-        }
-        for x in spectrum.iter_mut().skip(n / 2 + 1) {
-            *x = Complex::new(0.0, 0.0);
-        }
-    } else {
-        for x in spectrum.iter_mut().take(n.div_ceil(2)).skip(1) {
-            *x *= 2.0;
-        }
-        for x in spectrum.iter_mut().skip(n.div_ceil(2)) {
-            *x = Complex::new(0.0, 0.0);
-        }
-    }
-
-    ifft.process(&mut spectrum);
-
-    let scale = 1.0 / n as f64;
-    for x in &mut spectrum {
-        *x *= scale;
-    }
-
-    spectrum
-}
-
-fn envelope(signal: &[Complex<f64>]) -> Vec<f64> {
-    signal.iter().map(|c| c.norm()).collect()
-}
-
 /// Calculate VOR radial from phase difference using FFT
 pub fn calculate_radial(var_30: &[f64], ref_30: &[f64], sample_rate: f64) -> Option<f64> {
     let n = var_30.len().min(ref_30.len());
-    let min_samples = (sample_rate * 1.0) as usize;
+    let min_samples = (sample_rate * VOR_MIN_SAMPLES_FOR_RADIAL) as usize;
     if n < min_samples {
         return None;
     }
@@ -270,9 +291,9 @@ pub fn calculate_radial_vortrack(signal: &[f64], sample_rate: f64) -> Option<f64
     let mut prev_fmcar = Complex::new(0.0, 0.0);
     let mut n: isize = -((sample_rate / 10.0) as isize);
 
-    let w30 = 2.0 * PI * 30.0 / sample_rate;
+    let w30 = 2.0 * PI * VOR_REFERENCE_FREQ / sample_rate;
     let f_limit = 2.0 * PI * 510.0 / sample_rate;
-    let phase_bias = 26.0 * 2.0 * PI * 30.0 / sample_rate;
+    let phase_bias = 26.0 * 2.0 * PI * VOR_REFERENCE_FREQ / sample_rate;
 
     for &s in signal {
         phase += w30;
@@ -282,10 +303,10 @@ pub fn calculate_radial_vortrack(signal: &[f64], sample_rate: f64) -> Option<f64
 
         let ref30 = flt_r.filterlow(Complex::from_polar(s, -phase));
 
-        let phase9960 = -(9960.0 / 30.0) * phase;
+        let phase9960 = -(VOR_REFERENCE_SUBCARRIER_FREQ / VOR_REFERENCE_FREQ) * phase;
         let fmcar = flt_f.filter510(Complex::from_polar(s, phase9960));
 
-        let mut f = if prev_fmcar.norm_sqr() > 1e-12 {
+        let mut f = if prev_fmcar.norm_sqr() > FFT_BIN_MIN {
             (fmcar * prev_fmcar.conj()).arg()
         } else {
             0.0
@@ -331,7 +352,7 @@ fn normalize_signal(signal: &[f64]) -> Vec<f64> {
 
     let rms = (centered.iter().map(|x| x * x).sum::<f64>() / centered.len() as f64).sqrt();
 
-    if rms > 1e-10 {
+    if rms > VOR_RMS_MIN {
         centered.iter().map(|x| x / rms).collect()
     } else {
         centered
@@ -489,13 +510,23 @@ pub fn decode_morse_ident(
     // VOR-specific processing: bandpass + Hilbert envelope + lowpass
     // Python-proven path: bandpass + Hilbert envelope + aggressive lowpass around 1020 Hz
     // Use FIR bandpass (reliable) + IIR lowpass with zero-phase filtering for envelope
-    let mut bpf = ButterworthFilter::bandpass(900.0, 1100.0, sample_rate, 4);
+    let mut bpf = ButterworthFilter::bandpass(
+        VOR_MORSE_BPF_LOW,
+        VOR_MORSE_BPF_HIGH,
+        sample_rate,
+        VOR_MORSE_BPF_ORDER,
+    );
     let tone = bpf.filter(audio);
     let analytic = hilbert_transform(&tone);
     let env_raw = envelope(&analytic);
 
     // Use proper IIR Butterworth lowpass with zero-phase filtering (filtfilt) via biquad crate
-    let env = filtfilt_lowpass(&env_raw, 40.0, sample_rate, 4);
+    let env = filtfilt_lowpass(
+        &env_raw,
+        VOR_MORSE_ENV_LPF_CUTOFF,
+        sample_rate,
+        VOR_MORSE_ENV_LPF_ORDER,
+    );
 
     // Delegate to generic Morse decoding
     morse::decode_morse_ident(&env, sample_rate)

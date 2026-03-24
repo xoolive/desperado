@@ -5,16 +5,21 @@
 //!
 //! ## Currently Implemented
 //! - [`vor`]: VOR (VHF Omnidirectional Range) decoder
+//! - [`ils`]: ILS (Instrument Landing System) localizer decoder
 //! - [`morse`]: Generic Morse code parsing (reusable for VOR, NDB, ILS, DME)
 //!
 //! ## Future Decoders
-//! - ILS (Instrument Landing System) localizer decoder
 //! - DME (Distance Measuring Equipment) decoder
 
+pub mod ils;
 pub mod morse;
 pub mod vor;
 
 // Re-export public types and functions for convenient access
+pub use ils::{
+    ILS_AUDIO_RATE, ILS_SAMPLE_RATE_1_8M, IlsDemodulator, IlsFrame, IlsMorseCandidate,
+    IlsMorseDebugInfo, IlsSide, compute_ddm,
+};
 pub use morse::MorseDecodeAttempt;
 pub use vor::{
     MorseCandidate, MorseDebugInfo, SignalQualityMetrics, VOR_SAMPLE_RATE_1_8M, VorDemodulator,

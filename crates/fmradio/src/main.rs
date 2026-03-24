@@ -281,7 +281,8 @@ fn spawn_inline_tui(
                             }
                             KeyCode::Left if can_hard_retune => {
                                 if let Ok(s) = state.lock() {
-                                    let next = s.center_freq_hz.saturating_sub(100_000).max(100_000);
+                                    let next =
+                                        s.center_freq_hz.saturating_sub(100_000).max(100_000);
                                     drop(s);
                                     if let Ok(mut s) = state.lock() {
                                         s.center_freq_hz = next;
@@ -299,7 +300,11 @@ fn spawn_inline_tui(
                                     let _ = adjust_tx.send(RtlSdrMessage::Frequency(next));
                                 }
                             }
-                            KeyCode::Up | KeyCode::PageUp if can_hard_retune && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) => {
+                            KeyCode::Up | KeyCode::PageUp
+                                if can_hard_retune
+                                    && (key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::CONTROL) =>
+                            {
                                 if key.modifiers == KeyModifiers::CONTROL {
                                     // Ctrl+Up or PageUp: start scan
                                     scan_mode = ScanMode::ScanForward;
@@ -316,7 +321,11 @@ fn spawn_inline_tui(
                                     }
                                 }
                             }
-                            KeyCode::Down | KeyCode::PageDown if can_hard_retune && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) => {
+                            KeyCode::Down | KeyCode::PageDown
+                                if can_hard_retune
+                                    && (key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::CONTROL) =>
+                            {
                                 if key.modifiers == KeyModifiers::CONTROL {
                                     // Ctrl+Down or PageDown: start scan
                                     scan_mode = ScanMode::ScanBackward;
@@ -324,7 +333,8 @@ fn spawn_inline_tui(
                                 } else {
                                     // Down: coarse tune -1MHz
                                     if let Ok(s) = state.lock() {
-                                        let next = s.center_freq_hz.saturating_sub(1_000_000).max(100_000);
+                                        let next =
+                                            s.center_freq_hz.saturating_sub(1_000_000).max(100_000);
                                         drop(s);
                                         if let Ok(mut s) = state.lock() {
                                             s.center_freq_hz = next;
@@ -335,7 +345,7 @@ fn spawn_inline_tui(
                             }
                             _ => {}
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -394,7 +404,8 @@ fn spawn_inline_tui(
                         } else {
                             // Weak signal, move to previous frequency
                             scan_settle_count = 0;
-                            let next_freq = s.center_freq_hz.saturating_sub(100_000).max(88_100_000);
+                            let next_freq =
+                                s.center_freq_hz.saturating_sub(100_000).max(88_100_000);
                             if next_freq < 88_100_000 {
                                 // Wrap around to band end
                                 drop(s);

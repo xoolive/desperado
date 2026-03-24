@@ -1369,6 +1369,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3142,14 +3148,17 @@ dependencies = [
  "biquad",
  "chrono",
  "clap 4.5.60",
+ "crossbeam-channel",
  "desperado",
  "futures",
+ "hound",
  "num-complex",
  "rtl-sdr-rs 0.2.1",
  "rustfft",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tinyaudio",
  "tokio",
 ]
 

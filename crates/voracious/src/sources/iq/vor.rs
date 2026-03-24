@@ -5,7 +5,7 @@
 //!
 //! # Overview
 //!
-//! The `IqSource` struct wraps synchronous file I/O or device access
+//! The `VorSource` struct wraps synchronous file I/O or device access
 //! (e.g., Airspy, RTL-SDR, SoapySDR)
 //!
 //! # Input Sources
@@ -45,6 +45,7 @@ use chrono::NaiveDateTime;
 use desperado::Gain;
 use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
 
+use crate::audio::AudioOutput;
 use crate::decoders::{
     MorseCandidate, MorseDebugInfo, VorDemodulator, VorRadial, calculate_radial_vortrack,
     decode_morse_ident,
@@ -58,7 +59,7 @@ enum TimestampBase {
     LiveWallClock,
 }
 
-pub struct IqSource {
+pub struct VorSource {
     source: BaseIqSource,
     demodulator: VorDemodulator,
     vor_frequency: f64,
@@ -79,9 +80,10 @@ pub struct IqSource {
     debug_morse: bool,
     all_tokens_history: Vec<String>,
     timestamp_base: TimestampBase,
+    audio_output: Option<AudioOutput>,
 }
 
-impl IqSource {
+impl VorSource {
     #[allow(clippy::too_many_arguments)]
     pub fn new<P: AsRef<Path>>(
         path: P,
@@ -141,11 +143,17 @@ impl IqSource {
             debug_morse,
             all_tokens_history: Vec::new(),
             timestamp_base,
+            audio_output: None,
         })
+    }
+
+    /// Set audio output for morse ident playback.
+    pub fn set_audio_output(&mut self, audio: AudioOutput) {
+        self.audio_output = Some(audio);
     }
 }
 
-impl Iterator for IqSource {
+impl Iterator for VorSource {
     type Item = Result<VorRadial, io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -171,6 +179,17 @@ impl Iterator for IqSource {
             self.var_30_buffer.extend(&var_30);
             self.ref_30_buffer.extend(&ref_30);
             self.morse_audio_buffer.extend(&audio);
+
+            // Stream audio samples to soundcard if audio output is enabled
+            if let Some(ref audio_out) = self.audio_output {
+                // Normalize to f32 range [-1.0, 1.0] and send to audio output
+                // Normalize based on typical signal envelope (mean ~0.5)
+                for sample in &audio {
+                    let normalized = (sample / 0.5).clamp(-1.0, 1.0) as f32;
+                    let _ = audio_out.send(normalized);
+                }
+            }
+
             self.sample_count += samples.len();
 
             // Check if we have enough for a radial calculation window
