@@ -1,4 +1,4 @@
-//! Shared DSP utilities for radio navigation decoders.
+//! Shared DSP utilities for radio navigation decoders (voracious).
 //!
 //! This module provides common signal processing functions used across
 //! VOR, ILS, and other radio beacon decoders to avoid code duplication.

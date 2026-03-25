@@ -30,9 +30,11 @@ use std::str::FromStr;
 
 use crate::audio::AudioOutput;
 use crate::decoders::ils::{
-    IlsDemodulator, IlsFrame, IlsMorseCandidate, IlsMorseDebugInfo, compute_ddm,
+    ILS_MORSE_AUDIO_BPF_HIGH, ILS_MORSE_AUDIO_BPF_LOW, ILS_MORSE_AUDIO_BPF_ORDER, IlsDemodulator,
+    IlsFrame, IlsMorseCandidate, IlsMorseDebugInfo, compute_ddm,
 };
-use crate::metrics;
+use crate::decoders::metrics;
+use desperado::dsp::filters::ButterworthFilter;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
 
@@ -62,6 +64,7 @@ pub struct IlsSource {
     current_ident: Option<String>,
     debug_morse: bool,
     all_tokens_history: Vec<String>,
+    morse_bpf: ButterworthFilter,
     audio_output: Option<AudioOutput>,
 }
 
@@ -120,6 +123,13 @@ impl IlsSource {
         let window_samples = (window_seconds * audio_rate).round() as usize;
         let morse_window_samples = (morse_window_seconds * audio_rate).round() as usize;
 
+        let morse_bpf = ButterworthFilter::bandpass(
+            ILS_MORSE_AUDIO_BPF_LOW,
+            ILS_MORSE_AUDIO_BPF_HIGH,
+            audio_rate,
+            ILS_MORSE_AUDIO_BPF_ORDER,
+        );
+
         Ok(Self {
             source,
             demodulator,
@@ -136,6 +146,7 @@ impl IlsSource {
             current_ident: None,
             debug_morse,
             all_tokens_history: Vec::new(),
+            morse_bpf,
             audio_output: None,
         })
     }
@@ -168,11 +179,12 @@ impl Iterator for IlsSource {
             self.audio_buf.extend(&audio);
             self.morse_audio_buf.extend(&audio);
 
-            // Stream audio samples to soundcard if audio output is enabled
+            // Stream filtered audio samples to soundcard if audio output is enabled
             if let Some(ref audio_out) = self.audio_output {
+                let filtered_audio = self.morse_bpf.filter(&audio);
                 // Normalize to f32 range [-1.0, 1.0] and send to audio output
                 // Normalize based on typical signal envelope (mean ~0.5)
-                for sample in &audio {
+                for sample in filtered_audio {
                     let normalized = (sample / 0.5).clamp(-1.0, 1.0) as f32;
                     let _ = audio_out.send(normalized);
                 }

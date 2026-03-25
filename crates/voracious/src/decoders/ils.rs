@@ -58,16 +58,139 @@
 
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
+
+// ── ILS Filter & Processing Constants ────────────────────────────────────────
+
+/// ILS baseband lowpass filter cutoff frequency (Hz).
+///
+/// Pre-decimation filter removes out-of-band RF noise.
+/// Typical range: 250–1000 Hz at full rate (1.8 MSps).
+/// At post-decimation Nyquist of 4500 Hz (9 kHz rate), 500 Hz cutoff
+/// preserves DC envelope and low-frequency modulation.
+pub const ILS_BASEBAND_LPF_CUTOFF: f64 = 500.0;
+
+/// ILS baseband lowpass filter order.
+pub const ILS_BASEBAND_LPF_ORDER: usize = 5;
+
+/// ILS 90 Hz tone bandpass filter low cutoff (Hz).
+///
+/// ILS 90 Hz localizer tone: deeper on the left of runway centreline.
+/// Bandpass range: 80–100 Hz captures the tone with sidebands.
+pub const ILS_90HZ_BPF_LOW: f64 = 80.0;
+
+/// ILS 90 Hz tone bandpass filter high cutoff (Hz).
+pub const ILS_90HZ_BPF_HIGH: f64 = 100.0;
+
+/// ILS 90 Hz tone bandpass filter order.
+pub const ILS_90HZ_BPF_ORDER: usize = 4;
+
+/// ILS 150 Hz tone bandpass filter low cutoff (Hz).
+///
+/// ILS 150 Hz localizer tone: deeper on the right of runway centreline.
+/// Bandpass range: 140–160 Hz captures the tone with sidebands.
+pub const ILS_150HZ_BPF_LOW: f64 = 140.0;
+
+/// ILS 150 Hz tone bandpass filter high cutoff (Hz).
+pub const ILS_150HZ_BPF_HIGH: f64 = 160.0;
+
+/// ILS 150 Hz tone bandpass filter order.
+pub const ILS_150HZ_BPF_ORDER: usize = 4;
+
+/// ILS Morse ident bandpass filter low cutoff (Hz).
+///
+/// Isolates the 1020 Hz Morse ident tone from the AM-modulated carrier.
+/// Bandpass range: 900–1100 Hz.
+pub const ILS_MORSE_BPF_LOW: f64 = 900.0;
+
+/// ILS Morse ident bandpass filter high cutoff (Hz).
+pub const ILS_MORSE_BPF_HIGH: f64 = 1_100.0;
+
+/// ILS Morse ident bandpass filter order (IIR).
+///
+/// ILS uses zero-phase IIR filtfilt for sharper, better-normalized
+/// bandpass response compared to FIR. Order 2 with filtfilt (4 biquads total,
+/// 2 forward + 2 backward) provides Q ≈ 5 at 1020 Hz center.
+pub const ILS_MORSE_BPF_ORDER: usize = 2;
+
+/// ILS Morse audio output bandpass filter low cutoff (Hz).
+///
+/// Matches analysis filter band (980-1060 Hz) for consistent audio output.
+/// Uses stateful FIR implementation for streaming audio compatibility.
+pub const ILS_MORSE_AUDIO_BPF_LOW: f64 = 980.0;
+
+/// ILS Morse audio output bandpass filter high cutoff (Hz).
+pub const ILS_MORSE_AUDIO_BPF_HIGH: f64 = 1_060.0;
+
+/// ILS Morse audio output bandpass filter order.
+///
+/// Order 4 (65 taps FIR) provides smooth passband for audio output.
+/// Applied to audio output only, not to signal measurements.
+pub const ILS_MORSE_AUDIO_BPF_ORDER: usize = 4;
+
+/// ILS Morse ident lowpass filter cutoff frequency (Hz).
+///
+/// Applied to the envelope of the 1020 Hz Morse tone.
+/// The Hilbert envelope of a narrow-band 1020 Hz tone has residual
+/// oscillation at ~36 Hz (from noise beating). 16 Hz stated cutoff
+/// applied via cascaded-biquad filtfilt with order=4 has an effective
+/// -3 dB at ~0.5 × stated = ~8 Hz, which suppresses the 36 Hz ripple
+/// while resolving 100 ms dots at 9 kHz audio rate.
+pub const ILS_MORSE_ENV_LPF_CUTOFF: f64 = 16.0;
+
+/// ILS Morse ident lowpass filter order (IIR).
+///
+/// Applied via cascaded-biquad filtfilt; order 4 means 2 biquads
+/// each direction (4 total) for sharper roll-off.
+pub const ILS_MORSE_ENV_LPF_ORDER: usize = 4;
+
+/// ILS DDM threshold for on-course (Hz).
+///
+/// |DDM| ≤ 0.015 → on centreline
+/// |DDM| > 0.015 → off centreline (left or right)
+pub const ILS_DDM_ON_COURSE_THRESHOLD: f64 = 0.015;
+
+/// ILS DDM computation threshold (minimum sum of 90 + 150 Hz).
+///
+/// If (mean_90 + mean_150) < this value, both tones are near zero
+/// (noise floor) and DDM computation is unreliable. Fail gracefully.
+pub const ILS_DDM_SUM_MIN: f64 = 1e-9;
+
+/// ILS signal strength normalization factor.
+///
+/// Carrier strength = mean_envelope / this factor, clamped to [0, 1].
+/// Typical normalized envelope magnitude is ~0.5, so dividing by 0.5
+/// maps 0.5 → 1.0 (nominal), <0.1 → <0.2 (weak), >1.0 → 1.0 (clipped).
+pub const ILS_CARRIER_NORMALIZATION: f64 = 0.5;
+
+/// ILS baseband downsampling target audio rate (Hz).
+///
+/// Decimation factor from I/Q rate is calculated as
+/// ceil(input_rate / this_value).
+pub const ILS_DECIMATION_TARGET_RATE: f64 = 9_000.0;
+
+/// Minimum RMS value before signal is considered noise.
+///
+/// Used in signal normalization across both VOR and ILS.
+/// Below this threshold, RMS-based normalization is skipped
+/// to avoid amplifying noise floor.
+pub const SIGNAL_RMS_MIN: f64 = 1e-10;
+
+/// Minimum sum of modulation depths for ILS DDM calculation.
+///
+/// If both 90 Hz and 150 Hz tones are below noise floor,
+/// DDM is undefined. This threshold gates the calculation.
+pub const MODULATION_DEPTH_MIN: f64 = 1e-9;
 use std::f64::consts::PI;
 
+use super::error::{Error, IlsDdmResult, Result};
 use super::morse;
-use crate::dsp::{envelope, hilbert_transform};
-use crate::error::{Error, IlsDdmResult, Result};
-use crate::filter_config::*;
 use desperado::dsp::filters::ButterworthFilter;
 use desperado::dsp::iir::{filtfilt_bandpass, filtfilt_lowpass};
+use desperado::dsp::voracious::{envelope, hilbert_transform};
 
-pub use crate::filter_config::{ILS_AUDIO_RATE, ILS_SAMPLE_RATE_1_8M};
+/// Sample rate constants for ILS decoding
+pub const ILS_SAMPLE_RATE_1_8M: u32 = 1_800_000;
+pub const ILS_AUDIO_RATE: f64 = 9_000.0;
 
 /// ILS side-of-centreline indication derived from DDM.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

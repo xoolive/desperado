@@ -480,8 +480,8 @@ impl AsyncRtlSdrReader {
         // Setup phase: configure device
         let mut rtl = open_device_with_selector(&config.device)?;
         rtl.set_sample_rate(config.sample_rate)?;
-        let _ = rtl.set_tuner_bandwidth(config.sample_rate);
-        let _ = rtl.set_freq_correction(config.freq_correction_ppm);
+        rtl.set_tuner_bandwidth(config.sample_rate)?;
+        rtl.set_freq_correction(config.freq_correction_ppm)?;
         rtl.set_center_freq(config.center_freq)?;
 
         match config.gain {
@@ -498,7 +498,7 @@ impl AsyncRtlSdrReader {
             }
         };
 
-        let _ = rtl.set_bias_tee(config.bias_tee);
+        rtl.set_bias_tee(config.bias_tee)?;
         rtl.reset_buffer()?;
 
         // Wrap device in Arc<Mutex> for thread-safe shared access

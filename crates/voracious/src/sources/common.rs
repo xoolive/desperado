@@ -5,7 +5,7 @@
 //!
 //! All functions are designed to work with pre-demodulated audio (baseband signals).
 
-use crate::dsp::{envelope, hilbert_transform};
+use desperado::dsp::voracious::{envelope, hilbert_transform};
 use num_complex::Complex;
 
 // ──────────────────────────────────────────────────────────────────────────────

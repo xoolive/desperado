@@ -48,13 +48,160 @@ use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
+// ── VOR Filter & Processing Constants ────────────────────────────────────────
+
+/// VOR baseband lowpass filter cutoff frequency (Hz).
+///
+/// Removes out-of-band RF noise before further signal processing.
+/// Typical range: 50–250 kHz for AM-modulated signals.
+/// Value chosen to preserve the 30 Hz variable signal and voice modulation.
+pub const VOR_BASEBAND_LPF_CUTOFF: f64 = 200_000.0;
+
+/// VOR baseband lowpass filter order.
+///
+/// Higher order = steeper roll-off but more group delay.
+/// Order 5 is a good compromise for VOR (VHF band noise attenuation).
+pub const VOR_BASEBAND_LPF_ORDER: usize = 5;
+
+/// VOR audio lowpass filter cutoff frequency (Hz).
+///
+/// Applied after baseband filter to remove RF noise that survives AM demodulation.
+/// Typical range: 10–30 kHz. Chosen to preserve voice (300–3400 Hz) and Morse ident (1020 Hz).
+pub const VOR_AUDIO_LPF_CUTOFF: f64 = 20_000.0;
+
+/// VOR audio lowpass filter order.
+pub const VOR_AUDIO_LPF_ORDER: usize = 5;
+
+/// VOR variable subcarrier bandpass filter low cutoff (Hz).
+///
+/// The variable signal is AM-modulated on an ~9960 Hz subcarrier.
+/// Bandpass range captures the subcarrier with sidebands.
+pub const VOR_VAR_SUB_BPF_LOW: f64 = 9_000.0;
+
+/// VOR variable subcarrier bandpass filter high cutoff (Hz).
+pub const VOR_VAR_SUB_BPF_HIGH: f64 = 11_000.0;
+
+/// VOR variable subcarrier bandpass filter order.
+pub const VOR_VAR_SUB_BPF_ORDER: usize = 4;
+
+/// VOR reference subcarrier bandpass filter low cutoff (Hz).
+///
+/// The reference signal is FM-modulated on a 9960 Hz subcarrier.
+/// Narrower than variable to isolate pure reference tone.
+pub const VOR_REF_SUB_BPF_LOW: f64 = 9_500.0;
+
+/// VOR reference subcarrier bandpass filter high cutoff (Hz).
+pub const VOR_REF_SUB_BPF_HIGH: f64 = 10_500.0;
+
+/// VOR reference subcarrier bandpass filter order.
+pub const VOR_REF_SUB_BPF_ORDER: usize = 4;
+
+/// VOR 30 Hz lowpass filter cutoff frequency (Hz).
+///
+/// Applied after subcarrier extraction to isolate the 30 Hz modulation.
+/// Value is higher than 30 Hz to account for filter roll-off and provide
+/// good transient response to capture the underlying 30 Hz sine wave.
+pub const VOR_30HZ_LPF_CUTOFF: f64 = 100.0;
+
+/// VOR 30 Hz lowpass filter order.
+pub const VOR_30HZ_LPF_ORDER: usize = 5;
+
+/// VOR Morse ident bandpass filter low cutoff (Hz).
+///
+/// Isolates the 1020 Hz Morse ident tone before envelope extraction.
+/// Typical Morse ident is 900–1100 Hz.
+pub const VOR_MORSE_BPF_LOW: f64 = 900.0;
+
+/// VOR Morse ident bandpass filter high cutoff (Hz).
+pub const VOR_MORSE_BPF_HIGH: f64 = 1_100.0;
+
+/// VOR Morse ident bandpass filter order.
+pub const VOR_MORSE_BPF_ORDER: usize = 4;
+
+/// VOR Morse audio output bandpass filter low cutoff (Hz).
+///
+/// Matches analysis filter band (980-1060 Hz) for consistent audio output.
+/// Uses stateful FIR implementation for streaming audio compatibility.
+pub const VOR_MORSE_AUDIO_BPF_LOW: f64 = 980.0;
+
+/// VOR Morse audio output bandpass filter high cutoff (Hz).
+pub const VOR_MORSE_AUDIO_BPF_HIGH: f64 = 1_060.0;
+
+/// VOR Morse audio output bandpass filter order.
+///
+/// Order 4 (65 taps FIR) provides smooth passband for audio output.
+/// Applied to audio output only, not to signal measurements.
+pub const VOR_MORSE_AUDIO_BPF_ORDER: usize = 4;
+
+/// VOR Morse ident lowpass filter cutoff frequency (Hz).
+///
+/// Applied to the envelope of the 1020 Hz Morse tone to smooth it.
+/// Typical Morse ident transmission is ~12 WPM = ~100 ms dot duration,
+/// so 40 Hz cutoff is sufficient to resolve individual dots while
+/// suppressing carrier ripple.
+pub const VOR_MORSE_ENV_LPF_CUTOFF: f64 = 40.0;
+
+/// VOR Morse ident lowpass filter order.
+pub const VOR_MORSE_ENV_LPF_ORDER: usize = 4;
+
+/// VOR RMS threshold for signal normalization (Hz).
+///
+/// If normalized signal RMS falls below this value, it's considered
+/// too weak and normalization is skipped to avoid amplifying noise.
+pub const VOR_RMS_MIN: f64 = 1e-10;
+
+/// VOR reference signal frequency (Hz).
+///
+/// The 30 Hz reference modulation is a fundamental constant
+/// of the VOR system definition (ICAO Annex 10).
+pub const VOR_REFERENCE_FREQ: f64 = 30.0;
+
+/// VOR reference subcarrier nominal frequency (Hz).
+///
+/// The reference signal is FM-modulated on approximately 9960 Hz.
+/// Nominal design value; actual Airspy capture may vary ±10 Hz.
+pub const VOR_REFERENCE_SUBCARRIER_FREQ: f64 = 9_960.0;
+
+/// VOR baseband downsampling target audio rate (Hz).
+///
+/// Decimation factor from I/Q rate is calculated as
+/// ceil(input_rate / this_value).
+pub const VOR_DECIMATION_TARGET_RATE: f64 = 48_000.0;
+
+/// Minimum sample count for reliable radial calculation.
+///
+/// VOR radial is estimated from at least 1 second of filtered
+/// 30 Hz phase data. This constant ensures FFT-based phase
+/// estimation has enough data points for accuracy.
+pub const VOR_MIN_SAMPLES_FOR_RADIAL: f64 = 1.0; // seconds
+
+/// Minimum FFT bin magnitude before considering signal present.
+///
+/// Used when checking if a frequency component has sufficient power.
+pub const FFT_BIN_MIN: f64 = 1e-12;
+
+/// Minimum RMS value before signal is considered noise.
+///
+/// Used in signal normalization across both VOR and ILS.
+/// Below this threshold, RMS-based normalization is skipped
+/// to avoid amplifying noise floor.
+pub const SIGNAL_RMS_MIN: f64 = 1e-10;
+
+/// Minimum sum of modulation depths for ILS DDM calculation.
+///
+/// If both 90 Hz and 150 Hz tones are below noise floor,
+/// DDM is undefined. This threshold gates the calculation.
+pub const MODULATION_DEPTH_MIN: f64 = 1e-9;
+
+use super::metrics;
 use super::morse;
-use crate::dsp::{envelope, hilbert_transform};
-use crate::filter_config::*;
 use desperado::dsp::filters::ButterworthFilter;
 use desperado::dsp::iir::filtfilt_lowpass;
+use desperado::dsp::voracious::{envelope, hilbert_transform};
 
-pub use crate::filter_config::VOR_SAMPLE_RATE_1_8M;
+/// Sample rate constants for VOR decoding
+pub const VOR_SAMPLE_RATE_1_8M: u32 = 1_800_000;
+pub const VOR_AUDIO_TARGET_RATE: f64 = 48_000.0;
 
 pub struct VorDemodulator {
     pub sample_rate: f64,
@@ -530,4 +677,242 @@ pub fn decode_morse_ident(
 
     // Delegate to generic Morse decoding
     morse::decode_morse_ident(&env, sample_rate)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// VOR Window-based Processor
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Stateful processor for window-based VOR analysis.
+///
+/// This struct encapsulates the common processing logic shared between I/Q and WAV VOR sources:
+/// - Audio windowing and accumulation
+/// - Radial calculation at window boundaries
+/// - Morse ident detection and voting
+/// - Signal quality metrics
+///
+/// Both I/Q (streaming) and WAV (batch) paths use this processor to ensure identical
+/// windowing, voting, and output generation logic.
+pub struct VorProcessor {
+    // Configuration
+    window_samples: usize,
+    morse_window_samples: usize,
+    debug_morse: bool,
+
+    // Sliding windows for analysis
+    audio_buffer: Vec<f64>,
+    var_30_buffer: Vec<f64>,
+    ref_30_buffer: Vec<f64>,
+    morse_audio_buffer: Vec<f64>,
+
+    // Ident tracking state
+    ident_votes: std::collections::HashMap<String, usize>,
+    ident_hit_timestamps: std::collections::HashMap<String, Vec<f64>>,
+    all_tokens_history: Vec<String>,
+
+    // Radial tracking
+    radial_history: Vec<f64>,
+    windows_total: usize,
+}
+
+/// Output from [`VorProcessor::emit()`] containing all data needed to construct a [`VorRadial`].
+pub struct VorProcessorOutput {
+    pub radial: f64,
+    pub signal_quality: SignalQualityMetrics,
+    pub ident: Option<String>,
+    pub morse_debug: Option<MorseDebugInfo>,
+}
+
+impl VorProcessor {
+    /// Create a new processor with given window sizes.
+    ///
+    /// # Arguments
+    ///
+    /// - `window_seconds`: Window duration for radial calculation (typically 3.0 s)
+    /// - `morse_window_seconds`: Window duration for Morse ident accumulation (typically 15.0 s)
+    /// - `audio_rate`: Sample rate of audio/var_30/ref_30 signals (Hz)
+    /// - `debug_morse`: Whether to include Morse candidate list in output
+    pub fn new(
+        window_seconds: f64,
+        morse_window_seconds: f64,
+        audio_rate: f64,
+        debug_morse: bool,
+    ) -> Self {
+        let window_samples = (window_seconds * audio_rate) as usize;
+        let morse_window_samples = (morse_window_seconds * audio_rate) as usize;
+
+        Self {
+            window_samples,
+            morse_window_samples,
+            debug_morse,
+            audio_buffer: Vec::new(),
+            var_30_buffer: Vec::new(),
+            ref_30_buffer: Vec::new(),
+            morse_audio_buffer: Vec::new(),
+            ident_votes: std::collections::HashMap::new(),
+            ident_hit_timestamps: std::collections::HashMap::new(),
+            all_tokens_history: Vec::new(),
+            radial_history: Vec::new(),
+            windows_total: 0,
+        }
+    }
+
+    /// Accumulate audio and 30 Hz signals into the processor.
+    ///
+    /// Returns `true` if a radial window boundary has been reached and [`emit()`] should be called.
+    ///
+    /// [`emit()`]: Self::emit
+    pub fn accumulate(&mut self, audio: &[f64], var_30: &[f64], ref_30: &[f64]) -> bool {
+        self.audio_buffer.extend_from_slice(audio);
+        self.var_30_buffer.extend_from_slice(var_30);
+        self.ref_30_buffer.extend_from_slice(ref_30);
+        self.morse_audio_buffer.extend_from_slice(audio);
+
+        self.audio_buffer.len() >= self.window_samples
+    }
+
+    /// Emit a radial measurement if enough data has accumulated.
+    ///
+    /// Call this after [`accumulate()`] returns `true`. Returns `Some` with complete output data,
+    /// or `None` if processing should continue.
+    ///
+    /// # Arguments
+    ///
+    /// - `timestamp`: Unix timestamp (seconds) for this measurement
+    /// - `clipping_ratio`: Optional clipping ratio from I/Q signal (I/Q sources only)
+    /// - `sample_count`: Total samples processed so far (for I/Q sources)
+    /// - `audio_rate`: Sample rate of audio signals
+    ///
+    /// [`accumulate()`]: Self::accumulate
+    pub fn emit(
+        &mut self,
+        timestamp: f64,
+        clipping_ratio: Option<f64>,
+        sample_count: usize,
+        audio_rate: f64,
+    ) -> Option<VorProcessorOutput> {
+        if self.audio_buffer.len() < self.window_samples {
+            return None;
+        }
+
+        // Calculate radial from current window
+        let radial = calculate_radial_vortrack(&self.audio_buffer, audio_rate)?;
+        self.radial_history.push(radial);
+        if self.radial_history.len() > 20 {
+            self.radial_history.remove(0);
+        }
+
+        self.windows_total += 1;
+        let mut ident_detected_now: Option<String> = None;
+
+        // Try Morse decoding if we have enough accumulated audio
+        let morse_debug = if self.morse_audio_buffer.len() >= self.morse_window_samples {
+            let (candidate, tokens, attempts) =
+                decode_morse_ident(&self.morse_audio_buffer, audio_rate);
+            self.all_tokens_history.extend(tokens);
+
+            if let Some(ref id) = candidate {
+                *self.ident_votes.entry(id.clone()).or_insert(0) += 1;
+                let hits = self.ident_hit_timestamps.entry(id.clone()).or_default();
+                let is_new_cycle = hits
+                    .last()
+                    .map(|last| timestamp - *last >= 7.0)
+                    .unwrap_or(true);
+                if is_new_cycle {
+                    hits.push(timestamp);
+                    ident_detected_now = Some(id.clone());
+                }
+            }
+
+            // Keep only recent audio for Morse (sliding window)
+            let keep_samples = (self.morse_window_samples as f64 * 0.5) as usize;
+            if self.morse_audio_buffer.len() > self.morse_window_samples + keep_samples {
+                self.morse_audio_buffer.drain(0..keep_samples);
+            }
+
+            // Build debug info if requested
+            if self.debug_morse {
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for token in &self.all_tokens_history {
+                    let t = token.to_uppercase();
+                    if t.len() == 3 {
+                        *counts.entry(t).or_insert(0) += 1;
+                    }
+                }
+
+                let total_count: usize = counts.values().sum();
+                let mut candidates: Vec<MorseCandidate> = counts
+                    .into_iter()
+                    .map(|(token, count)| MorseCandidate {
+                        token,
+                        count,
+                        confidence: if total_count > 0 {
+                            count as f64 / total_count as f64
+                        } else {
+                            0.0
+                        },
+                    })
+                    .collect();
+
+                candidates
+                    .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.token.cmp(&b.token)));
+
+                // Get timestamp hits for top ident candidate
+                let top_ident = candidates.first().map(|c| c.token.clone());
+                let ident_hits_seconds = top_ident
+                    .and_then(|id| self.ident_hit_timestamps.get(&id).cloned())
+                    .unwrap_or_default();
+
+                // Estimate repeat interval and next expected time
+                let (repeat_interval_seconds, next_expected_seconds) =
+                    if ident_hits_seconds.len() >= 2 {
+                        let intervals: Vec<f64> =
+                            ident_hits_seconds.windows(2).map(|w| w[1] - w[0]).collect();
+                        let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
+                        let next_expected = ident_hits_seconds.last().map(|&t| t + avg_interval);
+                        (Some(avg_interval), next_expected)
+                    } else {
+                        (None, None)
+                    };
+
+                Some(MorseDebugInfo {
+                    candidates,
+                    total_tokens: self.all_tokens_history.len(),
+                    windows_total: self.windows_total,
+                    ident_hits_seconds,
+                    repeat_interval_seconds,
+                    next_expected_seconds,
+                    decode_attempts: attempts,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Calculate signal quality
+        let signal_quality = metrics::compute_signal_quality(
+            clipping_ratio,
+            &self.audio_buffer,
+            &self.var_30_buffer,
+            &self.ref_30_buffer,
+            audio_rate,
+            sample_count,
+            &self.radial_history,
+        );
+
+        // Clear buffers for next window
+        self.audio_buffer.clear();
+        self.var_30_buffer.clear();
+        self.ref_30_buffer.clear();
+
+        Some(VorProcessorOutput {
+            radial,
+            signal_quality,
+            ident: ident_detected_now,
+            morse_debug,
+        })
+    }
 }

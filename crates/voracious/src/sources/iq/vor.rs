@@ -34,7 +34,6 @@
 //!                          → VorRadial Output
 //! ```
 
-use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::str::FromStr;
@@ -47,10 +46,10 @@ use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
 
 use crate::audio::AudioOutput;
 use crate::decoders::{
-    MorseCandidate, MorseDebugInfo, VorDemodulator, VorRadial, calculate_radial_vortrack,
-    decode_morse_ident,
+    VOR_MORSE_AUDIO_BPF_HIGH, VOR_MORSE_AUDIO_BPF_LOW, VOR_MORSE_AUDIO_BPF_ORDER, VorDemodulator,
+    VorProcessor, VorRadial, metrics,
 };
-use crate::metrics;
+use desperado::dsp::filters::ButterworthFilter;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
 
@@ -65,22 +64,12 @@ pub struct VorSource {
     vor_frequency: f64,
     center_frequency: f64,
     sample_count: usize,
-    window_samples: usize,
-    morse_window_samples: usize,
-    audio_buffer: Vec<f64>,
-    var_30_buffer: Vec<f64>,
-    ref_30_buffer: Vec<f64>,
-    morse_audio_buffer: Vec<f64>,
-    ident_votes: HashMap<String, usize>,
-    ident_hit_timestamps: HashMap<String, Vec<f64>>,
-    radial_history: Vec<f64>,
     window_iq_count: usize,
     window_clip_count: usize,
-    windows_total: usize,
-    debug_morse: bool,
-    all_tokens_history: Vec<String>,
     timestamp_base: TimestampBase,
     audio_output: Option<AudioOutput>,
+    morse_bpf: ButterworthFilter,
+    processor: VorProcessor,
 }
 
 impl VorSource {
@@ -119,8 +108,20 @@ impl VorSource {
 
         let demodulator = VorDemodulator::new(sample_rate);
         let audio_rate = demodulator.audio_rate();
-        let window_samples = (window_seconds * audio_rate) as usize;
-        let morse_window_samples = (morse_window_seconds * audio_rate) as usize;
+
+        let morse_bpf = ButterworthFilter::bandpass(
+            VOR_MORSE_AUDIO_BPF_LOW,
+            VOR_MORSE_AUDIO_BPF_HIGH,
+            audio_rate,
+            VOR_MORSE_AUDIO_BPF_ORDER,
+        );
+
+        let processor = VorProcessor::new(
+            window_seconds,
+            morse_window_seconds,
+            audio_rate,
+            debug_morse,
+        );
 
         Ok(Self {
             source,
@@ -128,22 +129,12 @@ impl VorSource {
             vor_frequency: vor_freq_mhz * 1e6,
             center_frequency: center_freq_mhz * 1e6,
             sample_count: 0,
-            window_samples,
-            morse_window_samples,
-            audio_buffer: Vec::new(),
-            var_30_buffer: Vec::new(),
-            ref_30_buffer: Vec::new(),
-            morse_audio_buffer: Vec::new(),
-            ident_votes: HashMap::new(),
-            ident_hit_timestamps: HashMap::new(),
-            radial_history: Vec::new(),
             window_iq_count: 0,
             window_clip_count: 0,
-            windows_total: 0,
-            debug_morse,
-            all_tokens_history: Vec::new(),
             timestamp_base,
             audio_output: None,
+            morse_bpf,
+            processor,
         })
     }
 
@@ -165,6 +156,7 @@ impl Iterator for VorSource {
                 None => return None,
             };
 
+            // Count I/Q clipping for signal quality metrics
             let freq_offset = self.vor_frequency - self.center_frequency;
             for sample in &samples {
                 self.window_iq_count += 1;
@@ -173,18 +165,13 @@ impl Iterator for VorSource {
                 }
             }
 
+            // Demodulate I/Q to baseband signals
             let (var_30, ref_30, audio) = self.demodulator.demodulate(&samples, freq_offset);
 
-            self.audio_buffer.extend(&audio);
-            self.var_30_buffer.extend(&var_30);
-            self.ref_30_buffer.extend(&ref_30);
-            self.morse_audio_buffer.extend(&audio);
-
-            // Stream audio samples to soundcard if audio output is enabled
+            // Stream audio to output if enabled
             if let Some(ref audio_out) = self.audio_output {
-                // Normalize to f32 range [-1.0, 1.0] and send to audio output
-                // Normalize based on typical signal envelope (mean ~0.5)
-                for sample in &audio {
+                let filtered_audio = self.morse_bpf.filter(&audio);
+                for sample in filtered_audio {
                     let normalized = (sample / 0.5).clamp(-1.0, 1.0) as f32;
                     let _ = audio_out.send(normalized);
                 }
@@ -192,168 +179,40 @@ impl Iterator for VorSource {
 
             self.sample_count += samples.len();
 
-            // Check if we have enough for a radial calculation window
-            if self.audio_buffer.len() >= self.window_samples {
+            // Accumulate signals into processor
+            if self.processor.accumulate(&audio, &var_30, &ref_30) {
+                // Window is ready - emit radial measurement
                 let audio_rate = self.demodulator.audio_rate();
-                if let Some(radial) = calculate_radial_vortrack(&self.audio_buffer, audio_rate) {
-                    self.radial_history.push(radial);
-                    if self.radial_history.len() > 20 {
-                        self.radial_history.remove(0);
-                    }
+                let clipping_ratio = if self.window_iq_count > 0 {
+                    Some(self.window_clip_count as f64 / self.window_iq_count as f64)
+                } else {
+                    None
+                };
 
-                    self.windows_total += 1;
-                    let elapsed = self.sample_count as f64 / self.demodulator.sample_rate;
-                    let timestamp = match self.timestamp_base {
-                        TimestampBase::FileStartUnix(t0) => t0 + elapsed,
-                        TimestampBase::LiveWallClock => unix_now_seconds(),
-                    };
-                    let mut ident_detected_now: Option<String> = None;
+                let elapsed = self.sample_count as f64 / self.demodulator.sample_rate;
+                let timestamp = match self.timestamp_base {
+                    TimestampBase::FileStartUnix(t0) => t0 + elapsed,
+                    TimestampBase::LiveWallClock => unix_now_seconds(),
+                };
 
-                    // Try Morse decoding if we have enough accumulated audio
-                    let morse_debug = if self.morse_audio_buffer.len() >= self.morse_window_samples
-                    {
-                        let (candidate, tokens, attempts) =
-                            decode_morse_ident(&self.morse_audio_buffer, audio_rate);
-                        self.all_tokens_history.extend(tokens);
-
-                        if let Some(ref id) = candidate {
-                            *self.ident_votes.entry(id.clone()).or_insert(0) += 1;
-                            let hits = self.ident_hit_timestamps.entry(id.clone()).or_default();
-                            let is_new_cycle = hits
-                                .last()
-                                .map(|last| timestamp - *last >= 7.0)
-                                .unwrap_or(true);
-                            if is_new_cycle {
-                                hits.push(timestamp);
-                                ident_detected_now = Some(id.clone());
-                            }
-                        }
-
-                        // Keep only recent audio for Morse (sliding window)
-                        let keep_samples = (self.morse_window_samples as f64 * 0.5) as usize;
-                        if self.morse_audio_buffer.len() > self.morse_window_samples + keep_samples
-                        {
-                            self.morse_audio_buffer.drain(0..keep_samples);
-                        }
-
-                        // Build debug info if requested
-                        if self.debug_morse {
-                            let mut counts: HashMap<String, usize> = HashMap::new();
-                            for token in &self.all_tokens_history {
-                                let t = token.to_uppercase();
-                                if t.len() == 3 {
-                                    *counts.entry(t).or_insert(0) += 1;
-                                }
-                            }
-
-                            let total_count: usize = counts.values().sum();
-                            let mut candidates: Vec<MorseCandidate> = counts
-                                .into_iter()
-                                .map(|(token, count)| MorseCandidate {
-                                    token,
-                                    count,
-                                    confidence: if total_count > 0 {
-                                        count as f64 / total_count as f64
-                                    } else {
-                                        0.0
-                                    },
-                                })
-                                .collect();
-
-                            candidates.sort_by(|a, b| {
-                                b.count.cmp(&a.count).then_with(|| a.token.cmp(&b.token))
-                            });
-
-                            Some(MorseDebugInfo {
-                                candidates,
-                                total_tokens: self.all_tokens_history.len(),
-                                windows_total: self.windows_total,
-                                ident_hits_seconds: {
-                                    let focus_ident = self
-                                        .ident_votes
-                                        .iter()
-                                        .max_by_key(|(_, count)| **count)
-                                        .map(|(ident, _)| ident.clone());
-                                    focus_ident
-                                        .and_then(|id| self.ident_hit_timestamps.get(&id).cloned())
-                                        .unwrap_or_default()
-                                },
-                                repeat_interval_seconds: {
-                                    let focus_ident = self
-                                        .ident_votes
-                                        .iter()
-                                        .max_by_key(|(_, count)| **count)
-                                        .map(|(ident, _)| ident.clone());
-                                    focus_ident
-                                        .and_then(|id| self.ident_hit_timestamps.get(&id))
-                                        .and_then(|hits| {
-                                            metrics::estimate_repeat_interval_seconds(hits)
-                                        })
-                                },
-                                next_expected_seconds: {
-                                    let focus_ident = self
-                                        .ident_votes
-                                        .iter()
-                                        .max_by_key(|(_, count)| **count)
-                                        .map(|(ident, _)| ident.clone());
-                                    focus_ident
-                                        .and_then(|id| self.ident_hit_timestamps.get(&id))
-                                        .and_then(|hits| {
-                                            let interval =
-                                                metrics::estimate_repeat_interval_seconds(hits)?;
-                                            let last = hits.last().copied()?;
-                                            Some(last + interval)
-                                        })
-                                },
-                                decode_attempts: attempts,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let ident = ident_detected_now.clone();
-
-                    let window_clipping_ratio = if self.window_iq_count > 0 {
-                        Some(self.window_clip_count as f64 / self.window_iq_count as f64)
-                    } else {
-                        None
-                    };
-
-                    let signal_quality = metrics::compute_signal_quality(
-                        window_clipping_ratio,
-                        &self.audio_buffer,
-                        &self.var_30_buffer,
-                        &self.ref_30_buffer,
-                        audio_rate,
-                        self.window_iq_count,
-                        &self.radial_history,
-                    );
-
-                    self.audio_buffer.clear();
-                    self.var_30_buffer.clear();
-                    self.ref_30_buffer.clear();
+                if let Some(output) =
+                    self.processor
+                        .emit(timestamp, clipping_ratio, self.window_iq_count, audio_rate)
+                {
                     self.window_iq_count = 0;
                     self.window_clip_count = 0;
 
                     let vor_radial = VorRadial::new(
                         metrics::round_decimals(timestamp, 5),
-                        metrics::round_decimals(radial, 2),
+                        metrics::round_decimals(output.radial, 2),
                         self.vor_frequency / 1e6,
                     )
-                    .with_quality(signal_quality)
-                    .with_ident(ident)
-                    .with_morse_debug(morse_debug);
+                    .with_quality(output.signal_quality)
+                    .with_ident(output.ident)
+                    .with_morse_debug(output.morse_debug);
+
                     return Some(Ok(vor_radial));
                 }
-
-                self.audio_buffer.clear();
-                self.var_30_buffer.clear();
-                self.ref_30_buffer.clear();
-                self.window_iq_count = 0;
-                self.window_clip_count = 0;
             }
         }
     }

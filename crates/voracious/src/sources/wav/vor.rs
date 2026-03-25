@@ -1,4 +1,4 @@
-//! VOR WAV source using shared DSP pipeline.
+//! VOR WAV source with on-the-fly 30 Hz extraction.
 //!
 //! This module provides VOR decoding from pre-demodulated WAV audio files.
 //! Unlike the I/Q path which handles RF samples, the WAV path operates on
@@ -7,13 +7,12 @@
 //! # Processing Pipeline
 //!
 //! ```text
-//! WAV Audio (48 kHz) → Extract 30 Hz signals (shared DSP)
+//! WAV Audio (48 kHz) → Extract subcarriers → Extract 30 Hz signals (per chunk)
 //!                   ├─ Variable subcarrier (9-11 kHz) → envelope → 30 Hz lowpass
 //!                   ├─ Reference subcarrier (9.5-10.5 kHz) → phase differences → 30 Hz lowpass
 //!                   └─ 1020 Hz bandpass → Hilbert → envelope → Morse decode
 //! ```
 
-use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::io;
 use std::path::Path;
@@ -24,45 +23,47 @@ use hound::WavReader;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::decoders::vor::VorRadial;
-use crate::decoders::{MorseCandidate, MorseDebugInfo, decode_morse_ident};
-use crate::metrics;
-use crate::sources::common::{
-    extract_vor_30hz_modulation, extract_vor_reference_subcarrier_phase,
-    extract_vor_variable_subcarrier_envelope,
+use crate::audio::AudioOutput;
+use crate::decoders::{
+    VOR_30HZ_LPF_CUTOFF, VOR_30HZ_LPF_ORDER, VOR_MORSE_AUDIO_BPF_HIGH, VOR_MORSE_AUDIO_BPF_LOW,
+    VOR_MORSE_AUDIO_BPF_ORDER, VOR_REF_SUB_BPF_HIGH, VOR_REF_SUB_BPF_LOW, VOR_REF_SUB_BPF_ORDER,
+    VOR_VAR_SUB_BPF_HIGH, VOR_VAR_SUB_BPF_LOW, VOR_VAR_SUB_BPF_ORDER, VorProcessor, VorRadial,
+    metrics,
 };
+use desperado::dsp::filters::ButterworthFilter;
+use desperado::dsp::voracious::{envelope, hilbert_transform};
 
 /// Iterator that reads a WAV audio file and emits [`VorRadial`] measurements.
 ///
 /// The WAV must be mono PCM containing AM-demodulated VOR audio (typically from GQRX).
 ///
-/// # Pre-computation of 30 Hz Signals
+/// # On-the-fly 30 Hz Extraction
 ///
-/// The 30 Hz extraction uses Hilbert transforms to obtain analytic signals of the subcarriers.
-/// When applied chunk-by-chunk, phase discontinuities occur at boundaries because each chunk's
-/// FFT-based Hilbert produces phase relative to that chunk alone. Processing the full signal
-/// in one pass avoids this entirely. Thus, var_30/ref_30 are pre-computed over the entire file.
+/// Unlike pre-computing var_30/ref_30 for the entire file, this approach extracts them
+/// chunk-by-chunk using stateful Butterworth filters. This maintains phase continuity
+/// across chunks through the filter states, similar to how the I/Q demodulator works.
 pub struct WavVorSource {
     /// Raw audio samples (bipolar, normalised to −1..+1).
     samples: Vec<f64>,
-    /// Pre-computed var_30 signal for the full recording.
-    var_30: Vec<f64>,
-    /// Pre-computed ref_30 signal for the full recording.
-    ref_30: Vec<f64>,
     sample_rate: f64,
     timestamp_base: f64,
     vor_frequency: f64,
     window_samples: usize,
-    morse_window_samples: usize,
-    debug_morse: bool,
+
+    // Stateful filters for on-the-fly extraction
+    var_sub_bpf: ButterworthFilter,
+    ref_sub_bpf: ButterworthFilter,
+    var_30_lpf: ButterworthFilter,
+    ref_30_lpf: ButterworthFilter,
+    morse_bpf: ButterworthFilter,
+
+    // Phase tracking state for reference subcarrier FM demodulation
+    // Maintains continuity across chunks when unwrapping phase
+    last_ref_phase: f64,
 
     pos: usize,
-    morse_audio_buf: Vec<f64>,
-    ident_votes: HashMap<String, usize>,
-    ident_hit_timestamps: HashMap<String, Vec<f64>>,
-    radial_history: Vec<f64>,
-    windows_total: usize,
-    all_tokens_history: Vec<String>,
+    processor: VorProcessor,
+    audio_output: Option<AudioOutput>,
 }
 
 impl WavVorSource {
@@ -94,30 +95,63 @@ impl WavVorSource {
 
         let timestamp_base = parse_wav_start_unix(path_ref).unwrap_or_else(unix_now_seconds);
         let window_samples = (window_seconds * sample_rate).round() as usize;
-        let morse_window_samples = (morse_window_seconds * sample_rate).round() as usize;
 
-        // Pre-compute var_30 and ref_30 for the full file using the shared DSP pipeline.
-        // This avoids phase discontinuities from chunk-by-chunk Hilbert transforms.
-        let (var_30, ref_30) = extract_vor_30hz_signals(&samples);
+        // Create stateful filters for on-the-fly extraction
+        let var_sub_bpf = ButterworthFilter::bandpass(
+            VOR_VAR_SUB_BPF_LOW,
+            VOR_VAR_SUB_BPF_HIGH,
+            sample_rate,
+            VOR_VAR_SUB_BPF_ORDER,
+        );
+
+        let ref_sub_bpf = ButterworthFilter::bandpass(
+            VOR_REF_SUB_BPF_LOW,
+            VOR_REF_SUB_BPF_HIGH,
+            sample_rate,
+            VOR_REF_SUB_BPF_ORDER,
+        );
+
+        let var_30_lpf =
+            ButterworthFilter::lowpass(VOR_30HZ_LPF_CUTOFF, sample_rate, VOR_30HZ_LPF_ORDER);
+
+        let ref_30_lpf =
+            ButterworthFilter::lowpass(VOR_30HZ_LPF_CUTOFF, sample_rate, VOR_30HZ_LPF_ORDER);
+
+        let morse_bpf = ButterworthFilter::bandpass(
+            VOR_MORSE_AUDIO_BPF_LOW,
+            VOR_MORSE_AUDIO_BPF_HIGH,
+            sample_rate,
+            VOR_MORSE_AUDIO_BPF_ORDER,
+        );
+
+        let processor = VorProcessor::new(
+            window_seconds,
+            morse_window_seconds,
+            sample_rate,
+            debug_morse,
+        );
 
         Ok(Self {
             samples,
-            var_30,
-            ref_30,
             sample_rate,
             timestamp_base,
             vor_frequency: vor_freq_mhz,
             window_samples,
-            morse_window_samples,
-            debug_morse,
+            var_sub_bpf,
+            ref_sub_bpf,
+            var_30_lpf,
+            ref_30_lpf,
+            morse_bpf,
+            last_ref_phase: 0.0,
             pos: 0,
-            morse_audio_buf: Vec::new(),
-            ident_votes: HashMap::new(),
-            ident_hit_timestamps: HashMap::new(),
-            radial_history: Vec::new(),
-            windows_total: 0,
-            all_tokens_history: Vec::new(),
+            processor,
+            audio_output: None,
         })
+    }
+
+    /// Set audio output for real-time audio playback.
+    pub fn set_audio_output(&mut self, audio: AudioOutput) {
+        self.audio_output = Some(audio);
     }
 }
 
@@ -131,192 +165,120 @@ impl Iterator for WavVorSource {
 
         let audio_rate = self.sample_rate;
         let end = (self.pos + self.window_samples).min(self.samples.len());
-        let chunk = &self.samples[self.pos..end];
-        let var_30_win = &self.var_30[self.pos.min(self.var_30.len())..end.min(self.var_30.len())];
-        let ref_30_win = &self.ref_30[self.pos.min(self.ref_30.len())..end.min(self.ref_30.len())];
+        let chunk = self.samples[self.pos..end].to_vec(); // Clone for processing
 
-        self.morse_audio_buf.extend_from_slice(chunk);
+        // Stream filtered audio samples to output if enabled
+        if let Some(ref audio_out) = self.audio_output {
+            let filtered_audio = self.morse_bpf.filter(&chunk);
+            for sample in filtered_audio {
+                let clamped = sample.clamp(-1.0, 1.0) as f32;
+                let _ = audio_out.send(clamped);
+            }
+        }
+
         self.pos = end;
 
         if chunk.is_empty() {
             return None;
         }
 
-        // Calculate radial from the pre-computed var_30/ref_30 for this window.
-        let radial = crate::decoders::calculate_radial(var_30_win, ref_30_win, audio_rate);
+        // Extract var_30 and ref_30 on-the-fly from this chunk
+        let (var_30, ref_30) = self.extract_vor_30hz_from_chunk(&chunk);
 
-        if let Some(radial) = radial {
-            self.radial_history.push(radial);
-            if self.radial_history.len() > 20 {
-                self.radial_history.remove(0);
-            }
-        }
+        // Accumulate into processor and emit if ready
+        self.processor.accumulate(&chunk, &var_30, &ref_30);
 
-        self.windows_total += 1;
         let elapsed = self.pos as f64 / self.sample_rate;
         let timestamp = self.timestamp_base + elapsed;
 
-        let mut ident_detected_now: Option<String> = None;
-        let mut morse_debug_info: Option<MorseDebugInfo> = None;
+        if let Some(output) = self
+            .processor
+            .emit(timestamp, None, chunk.len(), audio_rate)
+        {
+            let vor_radial = VorRadial::new(
+                metrics::round_decimals(timestamp, 5),
+                metrics::round_decimals(output.radial, 2),
+                self.vor_frequency,
+            )
+            .with_quality(output.signal_quality)
+            .with_ident(output.ident)
+            .with_morse_debug(output.morse_debug);
 
-        if self.morse_audio_buf.len() >= self.morse_window_samples {
-            let (candidate, tokens, attempts) =
-                decode_morse_ident(&self.morse_audio_buf, audio_rate);
-            self.all_tokens_history.extend(tokens);
-
-            if let Some(ref id) = candidate {
-                *self.ident_votes.entry(id.clone()).or_insert(0) += 1;
-                let hits = self.ident_hit_timestamps.entry(id.clone()).or_default();
-                let is_new_cycle = hits
-                    .last()
-                    .map(|last| timestamp - *last >= 7.0)
-                    .unwrap_or(true);
-                if is_new_cycle {
-                    hits.push(timestamp);
-                    ident_detected_now = Some(id.clone());
-                }
-            }
-
-            if self.debug_morse {
-                let mut counts: HashMap<String, usize> = HashMap::new();
-                for token in &self.all_tokens_history {
-                    let t = token.to_uppercase();
-                    if t.len() == 3 {
-                        *counts.entry(t).or_insert(0) += 1;
-                    }
-                }
-                let total_count: usize = counts.values().sum();
-                let mut candidates: Vec<MorseCandidate> = counts
-                    .into_iter()
-                    .map(|(token, count)| MorseCandidate {
-                        token,
-                        count,
-                        confidence: if total_count > 0 {
-                            count as f64 / total_count as f64
-                        } else {
-                            0.0
-                        },
-                    })
-                    .collect();
-                candidates
-                    .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.token.cmp(&b.token)));
-
-                // Get timestamp hits for top ident candidate
-                let top_ident = candidates.first().map(|c| c.token.clone());
-                let ident_hits_seconds = top_ident
-                    .and_then(|id| self.ident_hit_timestamps.get(&id).cloned())
-                    .unwrap_or_default();
-
-                // Estimate repeat interval and next expected time
-                let (repeat_interval_seconds, next_expected_seconds) =
-                    if ident_hits_seconds.len() >= 2 {
-                        let intervals: Vec<f64> =
-                            ident_hits_seconds.windows(2).map(|w| w[1] - w[0]).collect();
-                        let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
-                        let next_expected = ident_hits_seconds.last().map(|&t| t + avg_interval);
-                        (Some(avg_interval), next_expected)
-                    } else {
-                        (None, None)
-                    };
-
-                morse_debug_info = Some(MorseDebugInfo {
-                    candidates,
-                    total_tokens: self.all_tokens_history.len(),
-                    windows_total: self.windows_total,
-                    ident_hits_seconds,
-                    repeat_interval_seconds,
-                    next_expected_seconds,
-                    decode_attempts: attempts,
-                });
-            }
-
-            let keep = self.morse_window_samples / 2;
-            if self.morse_audio_buf.len() > self.morse_window_samples + keep {
-                self.morse_audio_buf.drain(0..keep);
-            }
+            Some(Ok(vor_radial))
+        } else {
+            // Continue accumulating
+            self.next()
         }
-
-        let signal_quality = metrics::compute_signal_quality(
-            None,
-            chunk,
-            var_30_win,
-            ref_30_win,
-            audio_rate,
-            chunk.len(),
-            &self.radial_history,
-        );
-
-        let radial_deg = self.radial_history.last().copied().unwrap_or(0.0);
-
-        let vor_radial = VorRadial::new(
-            metrics::round_decimals(timestamp, 5),
-            metrics::round_decimals(radial_deg, 2),
-            self.vor_frequency,
-        )
-        .with_quality(signal_quality)
-        .with_ident(ident_detected_now)
-        .with_morse_debug(morse_debug_info);
-
-        Some(Ok(vor_radial))
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// VOR 30 Hz signal extraction using shared DSP
-// ──────────────────────────────────────────────────────────────────────────────
+impl WavVorSource {
+    /// Extract var_30 and ref_30 from an audio chunk using stateful filters.
+    ///
+    /// This maintains phase continuity through the filter states across chunks,
+    /// similar to how the I/Q demodulator works.
+    fn extract_vor_30hz_from_chunk(&mut self, chunk: &Vec<f64>) -> (Vec<f64>, Vec<f64>) {
+        // Decimate 48 kHz to ~9 kHz to match I/Q demodulator behavior
+        // The subcarrier extraction filters are designed for audio rate, not RF rate
+        let decim_factor = 6;
+        let decimated: Vec<f64> = chunk.iter().step_by(decim_factor).copied().collect();
 
-/// Extract var_30 and ref_30 signals from WAV audio for VOR decoding.
-///
-/// The WAV audio is the AM-demodulated baseband signal at 48 kHz, containing:
-/// - Variable signal: 30 Hz modulating the 9000-11000 Hz subcarrier (AM)
-/// - Reference signal: 30 Hz modulating the 9500-10500 Hz subcarrier (FM)
-///
-/// Uses the shared DSP functions from `sources::common` to extract subcarriers and
-/// modulation signals consistently with the I/Q path.
-///
-/// Returns (var_30, ref_30) - both at 48 kHz sample rate
-fn extract_vor_30hz_signals(audio: &[f64]) -> (Vec<f64>, Vec<f64>) {
-    // Extract variable subcarrier envelope (9000-11000 Hz, AM-modulated)
-    let var_envelope = extract_vor_variable_subcarrier_envelope(audio);
+        // Extract subcarriers using stateful filters
+        let var_sub = self.var_sub_bpf.filter(&decimated);
+        let ref_sub = self.ref_sub_bpf.filter(&decimated);
 
-    // Remove DC from variable envelope
-    let var_mean = var_envelope.iter().sum::<f64>() / var_envelope.len() as f64;
-    let var_centered: Vec<f64> = var_envelope.iter().map(|x| x - var_mean).collect();
+        // Variable: AM demodulation (envelope)
+        let var_analytic = hilbert_transform(&var_sub);
+        let var_envelope = envelope(&var_analytic);
 
-    // Extract reference subcarrier analytic signal (9500-10500 Hz, FM-modulated)
-    let ref_analytic = extract_vor_reference_subcarrier_phase(audio);
-
-    // FM demodulation: compute phase differences with unwrapping
-    let mut ref_phase_signal = Vec::with_capacity(ref_analytic.len());
-    if !ref_analytic.is_empty() {
-        let mut prev_phase = ref_analytic[0].arg();
-
-        for sample in &ref_analytic {
-            let phase = sample.arg();
-            let mut diff = phase - prev_phase;
-
-            // Unwrap: keep phase difference in [-π, π]
-            while diff > PI {
-                diff -= 2.0 * PI;
-            }
-            while diff < -PI {
-                diff += 2.0 * PI;
-            }
-
-            ref_phase_signal.push(diff);
-            prev_phase = phase;
+        // Remove DC from variable signal
+        if var_envelope.is_empty() {
+            return (Vec::new(), Vec::new());
         }
+
+        let var_envelope_mean = var_envelope.iter().sum::<f64>() / var_envelope.len() as f64;
+        let var_centered: Vec<f64> = var_envelope.iter().map(|x| x - var_envelope_mean).collect();
+        let var_30 = self.var_30_lpf.filter(&var_centered);
+
+        // Reference: FM demodulation of subcarrier
+        let ref_analytic = hilbert_transform(&ref_sub);
+
+        let mut ref_phase_signal = Vec::with_capacity(ref_analytic.len());
+        if !ref_analytic.is_empty() {
+            // Use stateful phase tracking to maintain continuity across chunks
+            let mut prev_phase = self.last_ref_phase;
+
+            for sample in &ref_analytic {
+                let phase = sample.arg();
+                let mut diff = phase - prev_phase;
+
+                // Unwrap phase
+                while diff > PI {
+                    diff -= 2.0 * PI;
+                }
+                while diff < -PI {
+                    diff += 2.0 * PI;
+                }
+
+                ref_phase_signal.push(diff);
+                prev_phase = phase;
+            }
+
+            // Save final phase for next chunk
+            self.last_ref_phase = prev_phase;
+        }
+
+        // Remove DC from reference signal
+        if ref_phase_signal.is_empty() {
+            return (var_30, Vec::new());
+        }
+
+        let ref_mean = ref_phase_signal.iter().sum::<f64>() / ref_phase_signal.len() as f64;
+        let ref_centered: Vec<f64> = ref_phase_signal.iter().map(|x| x - ref_mean).collect();
+        let ref_30 = self.ref_30_lpf.filter(&ref_centered);
+
+        (var_30, ref_30)
     }
-
-    // Remove DC from reference signal
-    let ref_mean = ref_phase_signal.iter().sum::<f64>() / ref_phase_signal.len() as f64;
-    let ref_centered: Vec<f64> = ref_phase_signal.iter().map(|x| x - ref_mean).collect();
-
-    // Apply 30 Hz lowpass to smooth (using shared DSP)
-    let var_30 = extract_vor_30hz_modulation(&var_centered);
-    let ref_30 = extract_vor_30hz_modulation(&ref_centered);
-
-    (var_30, ref_30)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

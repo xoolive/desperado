@@ -5,16 +5,12 @@
 
 pub mod audio;
 pub mod decoders;
-pub mod dsp;
-pub mod error;
-pub mod filter_config;
-pub mod metrics;
 pub mod sources;
 
-pub use error::{Error, Result};
-
-pub use decoders::VorDemodulator;
-pub use decoders::VorRadial;
+pub use decoders::{
+    VorDemodulator, VorRadial,
+    error::{Error, Result},
+};
 pub use desperado::IqFormat;
 pub use sources::iq::{IlsSource, VorSource};
 pub use sources::wav::{WavIlsSource, WavVorSource};

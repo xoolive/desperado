@@ -26,8 +26,7 @@ use num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::decoders::ils::{IlsFrame, compute_ddm};
-use crate::decoders::morse;
-use crate::metrics;
+use crate::decoders::{metrics, morse};
 use crate::sources::common::{
     extract_ils_90hz_envelope, extract_ils_150hz_envelope, extract_ils_morse_envelope,
     filter_ils_ddm_smoothing,

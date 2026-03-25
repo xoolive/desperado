@@ -94,6 +94,7 @@ pub mod nco;
 pub mod resampler;
 pub mod rotate;
 pub mod symsync;
+pub mod voracious;
 
 /// Trait for DSP blocks that process complex-valued signals.
 ///
