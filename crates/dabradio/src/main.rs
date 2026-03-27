@@ -557,8 +557,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         iq_format,
     )
     .await?;
+    // Round startup discard to the nearest whole T_F so the OFDM processor
+    // always receives its first chunk on a frame boundary. A non-multiple of
+    // T_F causes a partial first chunk that forces the null-symbol detector
+    // to search at an off-boundary position, which can degrade initial sync.
     let mut startup_discard_samples = if is_rtlsdr_uri {
-        input_sample_rate as usize
+        let t_f = constants::T_F;
+        let raw = input_sample_rate as usize;
+        raw.div_ceil(t_f) * t_f // round up to next whole T_F
     } else {
         0usize
     };
@@ -654,19 +660,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Audio output setup (tinyaudio + crossbeam channel)
-    // Buffer sizing:
-    // - File/stdin: blocking sender naturally paces to playback.
-    // - Live SDR: larger queue absorbs decode jitter without stalling RF processing.
+    // Queue is 4 seconds deep — enough to absorb decode bursts.
+    // Prebuffer is small (0.25 s for live, 1 s for file) so audio starts quickly.
+    // PCM enqueue is blocking for both paths: no samples are ever silently dropped.
+    // The IQ bridge chain (sync_channel(15) + tokio mpsc(4) ≈ 1.2 s deep) absorbs
+    // any stall while the audio queue drains to make room.
     let audio_queue_seconds = 4;
     let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * audio_queue_seconds);
     let audio_underruns = Arc::new(AtomicU64::new(0));
     let audio_dropped = Arc::new(AtomicU64::new(0));
     let audio_primed = Arc::new(AtomicBool::new(false));
     let audio_measure_active = Arc::new(AtomicBool::new(true));
-    let audio_prebuffer_samples = AUDIO_RATE * 2 * if is_file_source { 1 } else { 2 };
+    // 1 s stereo for both sources. DAB+ decodes audio in superframe bursts (~46k samples
+    // every 480 ms); the prebuffer must hold at least 2 bursts so the audio callback
+    // doesn't underrun between them. The bounded IQ queue keeps the decoder at hardware
+    // rate, so this fills in ~1 s of wall-clock time for live sources.
+    let audio_prebuffer_samples = AUDIO_RATE * 2;
     let mut audio_last_dbg = Instant::now();
     let mut audio_last_underruns = 0u64;
     let mut audio_last_dropped = 0u64;
+    let mut first_pcm_logged = false;
+    let mut audio_primed_logged = false;
 
     let _device = if decoding_service && !cli.no_audio {
         let config = OutputDeviceParameters {
@@ -692,14 +706,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     audio_primed_cb.store(true, Ordering::Relaxed);
                 }
 
+                let mut all_empty = true;
                 for sample in data.iter_mut() {
                     match rx.try_recv() {
-                        Ok(v) => *sample = v,
+                        Ok(v) => {
+                            *sample = v;
+                            all_empty = false;
+                        }
                         Err(_) => {
                             *sample = 0.0;
                             audio_underruns_cb.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                }
+                // Full underrun: queue drained completely. Un-prime so we wait
+                // for the buffer to refill before playing again, preventing
+                // permanent stutter from a single missed superframe burst.
+                if all_empty {
+                    audio_primed_cb.store(false, Ordering::Relaxed);
                 }
             })
             .expect("Failed to open audio output device"),
@@ -755,7 +779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             frame_count += 1;
-            if let Ok(mut s) = tui_state.lock() {
+            if let Ok(mut s) = tui_state.try_lock() {
                 s.ofdm_frames = frame_count;
             }
 
@@ -800,7 +824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fib_count += 1;
                     ensemble.parse_fib(fib);
                 }
-                if let Ok(mut s) = tui_state.lock() {
+                if let Ok(mut s) = tui_state.try_lock() {
                     s.fibs = fib_count;
                     s.status = if fib_count > 0 {
                         "sync + FIC OK".to_string()
@@ -821,7 +845,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 info!(label = %label.trim(), "Resolved service label");
                 announced_service_label = true;
-                if let Ok(mut s) = tui_state.lock() {
+                if let Ok(mut s) = tui_state.try_lock() {
                     s.service = label.trim().to_string();
                 }
             }
@@ -850,7 +874,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     msc_handler = Some(handler);
                     dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
-                    if let Ok(mut s) = tui_state.lock() {
+                    if let Ok(mut s) = tui_state.try_lock() {
                         s.status = format!("decoding @ {} kbps", bitrate);
                         if s.service.is_empty() {
                             s.service = service_arg.clone();
@@ -865,7 +889,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let msc_end = soft_bits.len().min(75); // 75 data symbols total
                 for sym in &soft_bits[msc_start..msc_end] {
                     if let Some(decoded) = handler.feed_symbol(sym) {
-                        if let Ok(mut s) = tui_state.lock() {
+                        if let Ok(mut s) = tui_state.try_lock() {
                             s.msc_frames = handler.frames_decoded;
                         }
                         debug!(
@@ -884,7 +908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match item {
                                     PadData::Dls(dls) => {
                                         info!(text = %dls.text, "DLS");
-                                        if let Ok(mut s) = tui_state.lock() {
+                                        if let Ok(mut s) = tui_state.try_lock() {
                                             s.dls = dls.text.clone();
                                         }
                                     }
@@ -901,7 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             content_name = ?mot.content_name,
                                             "MOT"
                                         );
-                                        if let Ok(mut s) = tui_state.lock() {
+                                        if let Ok(mut s) = tui_state.try_lock() {
                                             s.mot_count = mot_image_count;
                                             s.mot_info = format!(
                                                 "{} bytes {}",
@@ -959,22 +983,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if !decoded_out.pcm.is_empty() && _device.is_some() {
-                                for sample in &decoded_out.pcm {
-                                    if is_file_source {
+                                if !first_pcm_logged {
+                                    first_pcm_logged = true;
+                                    info!(
+                                        prebuffer_samples = audio_prebuffer_samples,
+                                        "First PCM samples from DAB+ decoder — filling prebuffer"
+                                    );
+                                }
+
+                                // Blocking send for both live and file sources: no samples are
+                                // ever silently dropped. The IQ bridge chain (~1.2 s deep) absorbs
+                                // any stall while the audio callback drains the queue.
+                                // block_in_place lets tokio know this thread will block briefly.
+                                tokio::task::block_in_place(|| {
+                                    for sample in &decoded_out.pcm {
                                         if tx.send(*sample).is_err() {
                                             break;
                                         }
-                                    } else {
-                                        match tx.try_send(*sample) {
-                                            Ok(()) => {}
-                                            Err(channel::TrySendError::Full(_)) => {
-                                                audio_dropped.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            Err(channel::TrySendError::Disconnected(_)) => break,
-                                        }
                                     }
+                                });
+
+                                if !audio_primed_logged && audio_primed.load(Ordering::Relaxed) {
+                                    audio_primed_logged = true;
+                                    info!(queue_fill = tx.len(), "Audio primed — playback started");
                                 }
-                                if let Ok(mut s) = tui_state.lock() {
+
+                                if let Ok(mut s) = tui_state.try_lock() {
                                     s.audio_q_fill = tx.len();
                                 }
                                 if audio_last_dbg.elapsed() >= Duration::from_secs(1) {
@@ -982,22 +1016,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let delta_underruns =
                                         underruns.saturating_sub(audio_last_underruns);
                                     let dropped = audio_dropped.load(Ordering::Relaxed);
-                                    let delta_dropped = dropped.saturating_sub(audio_last_dropped);
+                                    let _delta_dropped = dropped.saturating_sub(audio_last_dropped);
+                                    let sf_attempted = dab_dec.superframe.superframes_attempted;
+                                    let sf_decoded = dab_dec.superframe.superframes_decoded;
+                                    let sf_fc_fail = dab_dec.superframe.fire_code_failures;
+                                    let sf_rs_err = dab_dec.superframe.rs_errors;
+                                    let sf_ok_pct = if sf_attempted > 0 {
+                                        sf_decoded * 100 / sf_attempted
+                                    } else {
+                                        0
+                                    };
                                     debug!(target: "dabradio::audio_pipeline",
                                         queue_fill = tx.len(),
                                         queue_capacity = tx.capacity().unwrap_or(0),
                                         primed = audio_primed.load(Ordering::Relaxed),
                                         underruns_total = underruns,
                                         underruns_delta = delta_underruns,
-                                        dropped_total = dropped,
-                                        dropped_delta = delta_dropped,
-                                        rs_errors_total = dab_dec.superframe.rs_errors,
-                                        au_crc_errors_total = dab_dec.superframe.au_crc_errors,
+                                        superframes_attempted = sf_attempted,
+                                        superframes_decoded = sf_decoded,
+                                        superframe_success_pct = sf_ok_pct,
+                                        fire_code_failures = sf_fc_fail,
+                                        rs_errors = sf_rs_err,
+                                        rs_corrections = dab_dec.superframe.rs_corrections,
+                                        au_crc_errors = dab_dec.superframe.au_crc_errors,
                                         "Audio pipeline status"
                                     );
                                     audio_last_dbg = Instant::now();
                                     audio_last_underruns = underruns;
                                     audio_last_dropped = dropped;
+
+                                    // Warn at info level if superframe success rate is poor,
+                                    // so it's visible without RUST_LOG=debug.
+                                    if sf_attempted >= 5 && sf_ok_pct < 80 {
+                                        tracing::warn!(
+                                            superframes_attempted = sf_attempted,
+                                            superframes_decoded = sf_decoded,
+                                            fire_code_failures = sf_fc_fail,
+                                            rs_errors = sf_rs_err,
+                                            success_pct = sf_ok_pct,
+                                            "Poor superframe decode rate — \
+                                             high fire_code_failures = OFDM/IQ data quality; \
+                                             high rs_errors = RF/SNR"
+                                        );
+                                    }
                                 }
                             }
 
@@ -1161,6 +1222,8 @@ async fn open_iq_source(
     let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
     info!("Opening live SDR source: {}", configured_uri);
     let input_rate = detect_device_sample_rate(&configured_uri)?;
+    #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+    let _ = input_rate;
 
     #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
     {

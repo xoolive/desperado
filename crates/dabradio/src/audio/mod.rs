@@ -286,6 +286,14 @@ pub struct SuperframeDecoder {
 
     /// Number of AU CRC failures.
     pub au_crc_errors: usize,
+
+    /// Number of complete superframes that failed the Fire Code check.
+    /// High relative to superframes_decoded means corrupted MSC data
+    /// (OFDM quality/sync issues upstream, not an RF SNR problem).
+    pub fire_code_failures: usize,
+
+    /// Total superframes attempted (= decoded + fire_code_failures + rs_errors).
+    pub superframes_attempted: usize,
 }
 
 impl SuperframeDecoder {
@@ -303,6 +311,8 @@ impl SuperframeDecoder {
             rs_corrections: 0,
             rs_errors: 0,
             au_crc_errors: 0,
+            fire_code_failures: 0,
+            superframes_attempted: 0,
         }
     }
 
@@ -385,16 +395,22 @@ impl SuperframeDecoder {
         // Fire Code sync check (before RS — cheap pre-filter).
         // On a clean signal the header bytes are usually error-free,
         // so fire code passes on the raw data. RS corrects the rest.
+        self.superframes_attempted += 1;
         if !fire_code_check(&self.sf_buf) {
-            // Debug: log first few bytes of superframe header to understand why fire code fails
-            if self.superframes_decoded == 0 && self.frame_count == 0 {
-                debug!(
-                    "Fire code check failed. Header bytes: {:02X?}, stored_crc=0x{:04X}, calc_crc=0x{:04X}",
-                    &self.sf_buf[..16.min(self.sf_buf.len())],
-                    (self.sf_buf[0] as u16) << 8 | self.sf_buf[1] as u16,
+            self.fire_code_failures += 1;
+            debug!(
+                fire_code_failures = self.fire_code_failures,
+                superframes_attempted = self.superframes_attempted,
+                stored_crc = format_args!(
+                    "0x{:04X}",
+                    (self.sf_buf[0] as u16) << 8 | self.sf_buf[1] as u16
+                ),
+                calc_crc = format_args!(
+                    "0x{:04X}",
                     fire_code_crc(&self.sf_buf[2..11.min(self.sf_buf.len())])
-                );
-            }
+                ),
+                "Fire code check failed"
+            );
             return None;
         }
 

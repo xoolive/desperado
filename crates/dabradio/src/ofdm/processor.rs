@@ -249,19 +249,31 @@ impl OfdmProcessor {
                             self.prs_fail_count = 0;
                             prs_start as usize
                         } else {
-                            // PRS correlation failed — re-acquire sync immediately.
-                            // Don't try to continue with estimated timing, as even a
-                            // small timing error produces corrupted OFDM symbols that
-                            // cascade into MSC errors and audio dropouts.
+                            // PRS correlation is weak during tracking — this is common
+                            // early in a stream (before freq correction converges) and
+                            // does not mean we've lost frame sync.  Trust that the null
+                            // skip placed us at the right spot and drain exactly T_G to
+                            // reach the PRS useful start.  Only fall back to full
+                            // re-acquisition after several consecutive failures.
                             self.prs_fail_count += 1;
+                            if self.prs_fail_count >= 5 {
+                                debug!(
+                                    snr = format!("{:.1}", prs_snr),
+                                    best_lag,
+                                    consecutive = self.prs_fail_count,
+                                    "PRS lost after 5 consecutive weak correlations, re-acquiring"
+                                );
+                                self.prs_fail_count = 0;
+                                self.state = SyncState::NeedNullDetect;
+                                continue;
+                            }
                             debug!(
                                 snr = format!("{:.1}", prs_snr),
                                 best_lag,
                                 consecutive = self.prs_fail_count,
-                                "PRS lost, re-acquiring sync"
+                                "PRS weak during tracking — trusting cyclic-prefix timing"
                             );
-                            self.state = SyncState::NeedNullDetect;
-                            continue;
+                            T_G
                         }
                     };
 
