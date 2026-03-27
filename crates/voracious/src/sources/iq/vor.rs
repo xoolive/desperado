@@ -36,19 +36,16 @@
 
 use std::io;
 use std::path::Path;
-use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::NaiveDateTime;
-#[cfg(feature = "airspy")]
-use desperado::Gain;
-use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
+use desperado::{IqFormat, IqSource as BaseIqSource};
 
 use crate::audio::AudioOutput;
 use crate::decoders::{
     VOR_MORSE_AUDIO_BPF_HIGH, VOR_MORSE_AUDIO_BPF_LOW, VOR_MORSE_AUDIO_BPF_ORDER, VorDemodulator,
     VorProcessor, VorRadial, metrics,
 };
+use crate::device_uri::{build_device_source, is_device_uri};
+use crate::timestamp_helpers::{resolve_file_start_unix, unix_now_seconds};
 use desperado::dsp::filters::ButterworthFilter;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
@@ -216,167 +213,4 @@ impl Iterator for VorSource {
             }
         }
     }
-}
-
-fn is_device_uri(input: &str) -> bool {
-    input.starts_with("rtlsdr://")
-        || input.starts_with("soapy://")
-        || input.starts_with("airspy://")
-}
-
-fn build_device_source(
-    uri: &str,
-    center_freq_hz: u32,
-    sample_rate: u32,
-) -> Result<BaseIqSource, io::Error> {
-    if uri.starts_with("airspy://") {
-        return build_airspy_source(uri, center_freq_hz, sample_rate);
-    }
-
-    let configured_uri = ensure_tuning_query(uri, center_freq_hz, sample_rate);
-    let config =
-        DeviceConfig::from_str(&configured_uri).map_err(|e| io::Error::other(e.to_string()))?;
-    BaseIqSource::from_device_config(config).map_err(|e| io::Error::other(e.to_string()))
-}
-
-fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {
-    let has_query = uri.contains('?');
-    let has_freq = uri.contains("freq=") || uri.contains("frequency=");
-    let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
-
-    let mut out = uri.to_string();
-    if !has_query {
-        out.push('?');
-    }
-    if !has_freq {
-        if !out.ends_with('?') && !out.ends_with('&') {
-            out.push('&');
-        }
-        out.push_str(&format!("freq={center_freq_hz}"));
-    }
-    if !has_rate {
-        if !out.ends_with('?') && !out.ends_with('&') {
-            out.push('&');
-        }
-        out.push_str(&format!("rate={sample_rate}"));
-    }
-    out
-}
-
-#[cfg(feature = "airspy")]
-fn build_airspy_source(
-    uri: &str,
-    center_freq_hz: u32,
-    sample_rate: u32,
-) -> Result<BaseIqSource, io::Error> {
-    let rest = &uri["airspy://".len()..];
-    let (device_part, query) = if let Some(pos) = rest.find('?') {
-        (&rest[..pos], &rest[pos + 1..])
-    } else {
-        (rest, "")
-    };
-
-    let device_index = if device_part.is_empty() {
-        0
-    } else {
-        device_part
-            .parse::<usize>()
-            .map_err(|_| io::Error::other(format!("Invalid airspy device index: {device_part}")))?
-    };
-
-    let mut gain = Gain::Auto;
-
-    for param in query.split('&') {
-        if param.is_empty() {
-            continue;
-        }
-        let kv: Vec<&str> = param.splitn(2, '=').collect();
-        if kv.len() != 2 {
-            continue;
-        }
-        if kv[0] == "gain" {
-            gain = if kv[1].eq_ignore_ascii_case("auto") {
-                Gain::Auto
-            } else {
-                Gain::Manual(
-                    kv[1]
-                        .parse::<f64>()
-                        .map_err(|_| io::Error::other(format!("Invalid airspy gain: {}", kv[1])))?,
-                )
-            };
-        }
-        // Note: lna_gain, mixer_gain, vga_gain are part of AirspyConfig but
-        // currently not parsed from URI for simplicity
-    }
-
-    let config =
-        desperado::airspy::AirspyConfig::new(device_index, center_freq_hz, sample_rate, gain);
-    let source = desperado::airspy::AirspySdrReader::new(&config)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    Ok(BaseIqSource::Airspy(source))
-}
-
-#[cfg(not(feature = "airspy"))]
-fn build_airspy_source(
-    _uri: &str,
-    _center_freq_hz: u32,
-    _sample_rate: u32,
-) -> Result<BaseIqSource, io::Error> {
-    Err(io::Error::other(
-        "airspy:// is not enabled. Rebuild with --features airspy",
-    ))
-}
-
-fn unix_now_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-fn resolve_file_start_unix(path: &Path) -> Result<f64, io::Error> {
-    if let Some(ts) = parse_gqrx_start_unix(path) {
-        return Ok(ts);
-    }
-
-    let meta = std::fs::metadata(path)?;
-    if let Ok(created) = meta.created() {
-        return Ok(created
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0));
-    }
-
-    if let Ok(modified) = meta.modified() {
-        return Ok(modified
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0));
-    }
-
-    Err(io::Error::other(
-        "Could not determine absolute start time for input file",
-    ))
-}
-
-fn parse_gqrx_start_unix(path: &Path) -> Option<f64> {
-    let name = path.file_name()?.to_str()?;
-    if !name.starts_with("gqrx_") {
-        return None;
-    }
-
-    let mut parts = name.split('_');
-    if parts.next()? != "gqrx" {
-        return None;
-    }
-
-    let date = parts.next()?;
-    let time = parts.next()?;
-    if date.len() != 8 || time.len() != 6 {
-        return None;
-    }
-
-    let dt = NaiveDateTime::parse_from_str(&format!("{date}{time}"), "%Y%m%d%H%M%S").ok()?;
-    Some(dt.and_utc().timestamp() as f64)
 }

@@ -76,6 +76,13 @@ pub fn extract_vor_reference_subcarrier_phase(audio: &[f64]) -> Vec<Complex<f64>
     hilbert_transform(&filtered)
 }
 
+/// Extract the VOR reference subcarrier envelope (for 30 Hz extraction).
+pub fn extract_vor_reference_subcarrier_envelope(audio: &[f64]) -> Vec<f64> {
+    let filtered = filter_vor_reference_subcarrier(audio);
+    let analytic = hilbert_transform(&filtered);
+    envelope(&analytic)
+}
+
 /// Extract the VOR 30 Hz modulation signal from a subcarrier.
 ///
 /// Takes the envelope or phase of a subcarrier and applies a lowpass filter

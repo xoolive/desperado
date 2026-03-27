@@ -1,6 +1,6 @@
 //! I/Q source handling for ILS localizer signal processing.
 //!
-//! Mirrors the structure of the VOR module but drives [`IlsDemodulator`]
+//! Mirrors the structure of the VOR module but drives [`IlsLocalizerDemodulator`]
 //! and emits [`IlsFrame`] values instead of `VorRadial`.
 //!
 //! # Processing Pipeline
@@ -22,18 +22,17 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::NaiveDateTime;
-use desperado::{DeviceConfig, IqFormat, IqSource as BaseIqSource};
-use std::str::FromStr;
+use desperado::{IqFormat, IqSource as BaseIqSource};
 
 use crate::audio::AudioOutput;
-use crate::decoders::ils::{
-    ILS_MORSE_AUDIO_BPF_HIGH, ILS_MORSE_AUDIO_BPF_LOW, ILS_MORSE_AUDIO_BPF_ORDER, IlsDemodulator,
-    IlsFrame, IlsMorseCandidate, IlsMorseDebugInfo, compute_ddm,
+use crate::decoders::ils_loc::{
+    ILS_MORSE_AUDIO_BPF_HIGH, ILS_MORSE_AUDIO_BPF_LOW, ILS_MORSE_AUDIO_BPF_ORDER, IlsFrame,
+    IlsLocalizerDemodulator, IlsMorseCandidate, IlsMorseDebugInfo, compute_ddm,
 };
 use crate::decoders::metrics;
+use crate::device_uri::{build_device_source, is_device_uri};
+use crate::timestamp_helpers::{resolve_file_start_unix, unix_now_seconds};
 use desperado::dsp::filters::ButterworthFilter;
 
 const DEFAULT_CHUNK_SAMPLES: usize = 262_144;
@@ -44,9 +43,9 @@ enum TimestampBase {
 }
 
 /// Iterator that reads raw I/Q data and emits decoded [`IlsFrame`] measurements.
-pub struct IlsSource {
+pub struct IlsLocalizerSource {
     source: BaseIqSource,
-    demodulator: IlsDemodulator,
+    demodulator: IlsLocalizerDemodulator,
     ils_frequency: f64,
     center_frequency: f64,
     sample_count: usize,
@@ -68,7 +67,7 @@ pub struct IlsSource {
     audio_output: Option<AudioOutput>,
 }
 
-impl IlsSource {
+impl IlsLocalizerSource {
     /// Open an ILS source from a file path or device URI.
     ///
     /// # Parameters
@@ -97,10 +96,7 @@ impl IlsSource {
         let is_live = is_device_uri(&input);
 
         let source = if is_live {
-            let config =
-                DeviceConfig::from_str(&ensure_tuning_query(&input, center_freq_hz, sample_rate))
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-            BaseIqSource::from_device_config(config).map_err(|e| io::Error::other(e.to_string()))?
+            build_device_source(&input, center_freq_hz, sample_rate)?
         } else {
             BaseIqSource::from_file(
                 path_ref,
@@ -118,7 +114,7 @@ impl IlsSource {
             TimestampBase::FileStartUnix(resolve_file_start_unix(path_ref)?)
         };
 
-        let demodulator = IlsDemodulator::new(sample_rate);
+        let demodulator = IlsLocalizerDemodulator::new(sample_rate);
         let audio_rate = demodulator.audio_rate();
         let window_samples = (window_seconds * audio_rate).round() as usize;
         let morse_window_samples = (morse_window_seconds * audio_rate).round() as usize;
@@ -157,7 +153,7 @@ impl IlsSource {
     }
 }
 
-impl Iterator for IlsSource {
+impl Iterator for IlsLocalizerSource {
     type Item = Result<IlsFrame, io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -291,89 +287,4 @@ impl Iterator for IlsSource {
             }
         }
     }
-}
-
-// ── helpers (mirrored from source.rs) ────────────────────────────────────────
-
-fn is_device_uri(input: &str) -> bool {
-    input.starts_with("rtlsdr://")
-        || input.starts_with("soapy://")
-        || input.starts_with("airspy://")
-}
-
-fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {
-    let has_query = uri.contains('?');
-    let has_freq = uri.contains("freq=") || uri.contains("frequency=");
-    let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
-
-    let mut out = uri.to_string();
-    if !has_query {
-        out.push('?');
-    }
-    if !has_freq {
-        if !out.ends_with('?') && !out.ends_with('&') {
-            out.push('&');
-        }
-        out.push_str(&format!("freq={center_freq_hz}"));
-    }
-    if !has_rate {
-        if !out.ends_with('?') && !out.ends_with('&') {
-            out.push('&');
-        }
-        out.push_str(&format!("rate={sample_rate}"));
-    }
-    out
-}
-
-fn unix_now_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-fn resolve_file_start_unix(path: &Path) -> Result<f64, io::Error> {
-    if let Some(ts) = parse_gqrx_start_unix(path) {
-        return Ok(ts);
-    }
-
-    let meta = std::fs::metadata(path)?;
-    if let Ok(created) = meta.created() {
-        return Ok(created
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0));
-    }
-
-    if let Ok(modified) = meta.modified() {
-        return Ok(modified
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0));
-    }
-
-    Err(io::Error::other(
-        "Could not determine absolute start time for input file",
-    ))
-}
-
-fn parse_gqrx_start_unix(path: &Path) -> Option<f64> {
-    let name = path.file_name()?.to_str()?;
-    if !name.starts_with("gqrx_") {
-        return None;
-    }
-
-    let mut parts = name.split('_');
-    if parts.next()? != "gqrx" {
-        return None;
-    }
-
-    let date = parts.next()?;
-    let time = parts.next()?;
-    if date.len() != 8 || time.len() != 6 {
-        return None;
-    }
-
-    let dt = NaiveDateTime::parse_from_str(&format!("{date}{time}"), "%Y%m%d%H%M%S").ok()?;
-    Some(dt.and_utc().timestamp() as f64)
 }

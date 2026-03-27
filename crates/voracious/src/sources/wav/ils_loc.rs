@@ -25,7 +25,7 @@ use hound::WavReader;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
-use crate::decoders::ils::{IlsFrame, compute_ddm};
+use crate::decoders::ils_loc::{IlsFrame, compute_ddm};
 use crate::decoders::{metrics, morse};
 use crate::sources::common::{
     extract_ils_90hz_envelope, extract_ils_150hz_envelope, extract_ils_morse_envelope,
@@ -36,7 +36,7 @@ use crate::sources::common::{
 ///
 /// The WAV must be mono PCM containing AM-demodulated ILS audio (typically from GQRX).
 /// The sample rate is read from the WAV header — no `--sample-rate` flag needed.
-pub struct WavIlsSource {
+pub struct WavIlsLocalizerSource {
     /// All samples from the WAV, normalised to −1.0..+1.0.
     samples: Vec<f64>,
     sample_rate: f64,
@@ -59,7 +59,7 @@ pub struct WavIlsSource {
     all_tokens_history: Vec<String>,
 }
 
-impl WavIlsSource {
+impl WavIlsLocalizerSource {
     /// Open a WAV file for ILS decoding.
     ///
     /// - `ils_freq_mhz`: the ILS localizer frequency (label only, used in JSON output)
@@ -123,7 +123,7 @@ impl WavIlsSource {
     }
 }
 
-impl Iterator for WavIlsSource {
+impl Iterator for WavIlsLocalizerSource {
     type Item = Result<IlsFrame, io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -175,21 +175,23 @@ impl Iterator for WavIlsSource {
                     }
                 }
                 let total_count: usize = counts.values().sum();
-                let mut candidates: Vec<crate::decoders::ils::IlsMorseCandidate> = counts
+                let mut candidates: Vec<crate::decoders::ils_loc::IlsMorseCandidate> = counts
                     .into_iter()
-                    .map(|(token, count)| crate::decoders::ils::IlsMorseCandidate {
-                        token,
-                        count,
-                        confidence: if total_count > 0 {
-                            count as f64 / total_count as f64
-                        } else {
-                            0.0
+                    .map(
+                        |(token, count)| crate::decoders::ils_loc::IlsMorseCandidate {
+                            token,
+                            count,
+                            confidence: if total_count > 0 {
+                                count as f64 / total_count as f64
+                            } else {
+                                0.0
+                            },
                         },
-                    })
+                    )
                     .collect();
                 candidates
                     .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.token.cmp(&b.token)));
-                morse_debug = Some(crate::decoders::ils::IlsMorseDebugInfo {
+                morse_debug = Some(crate::decoders::ils_loc::IlsMorseDebugInfo {
                     candidates,
                     total_tokens: self.all_tokens_history.len(),
                     decode_attempts: attempts,

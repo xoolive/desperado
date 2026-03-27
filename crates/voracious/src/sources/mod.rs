@@ -40,5 +40,5 @@ pub mod iq;
 pub mod wav;
 
 // Re-export main types for public API
-pub use iq::{IlsSource, VorSource};
-pub use wav::{WavIlsSource, WavVorSource};
+pub use iq::{IlsLocalizerSource, VorSource};
+pub use wav::{WavIlsLocalizerSource, WavVorSource};

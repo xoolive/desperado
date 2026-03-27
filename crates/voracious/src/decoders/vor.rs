@@ -336,20 +336,44 @@ impl VorDemodulator {
         // 5. Decimate to audio rate
         let audio_decimated = decimate(&audio, self.decim_factor);
 
-        // 6. Extract subcarriers
-        let audio_f64: Vec<f64> = audio_decimated.to_vec();
+        // 6 & 7. Extract subcarriers and 30 Hz components
+        let (var_30, ref_30) = self.extract_subcarriers_and_30hz(&audio_decimated);
 
-        let var_sub = self.var_sub_bpf.filter(&audio_f64);
-        let ref_sub = self.ref_sub_bpf.filter(&audio_f64);
+        (var_30, ref_30, audio_decimated)
+    }
 
-        // 7. Extract 30 Hz components
+    /// Extract subcarrier signals and their 30 Hz modulation from audio samples.
+    ///
+    /// This is the core subcarrier extraction logic, factored out so it can be
+    /// reused by both I/Q demodulation and direct audio processing paths.
+    ///
+    /// # Arguments
+    ///
+    /// - `audio`: Audio samples already at the target audio rate (e.g., 48 kHz)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `variable_30hz`: Envelope of the 30 Hz variable signal (AM subcarrier)
+    /// - `reference_30hz`: Phase signal from the 30 Hz reference (FM subcarrier)
+    ///
+    /// Both outputs are at the audio rate. Returns empty vectors if input is empty.
+    pub fn extract_subcarriers_and_30hz(&mut self, audio: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        if audio.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Extract subcarriers (bandpass filtered at audio rate)
+        let var_sub = self.var_sub_bpf.filter(audio);
+        let ref_sub = self.ref_sub_bpf.filter(audio);
+
         // Variable: AM demodulation (envelope)
         let var_analytic = hilbert_transform(&var_sub);
         let var_envelope = envelope(&var_analytic);
 
         // Remove DC from variable signal
         if var_envelope.is_empty() || ref_sub.is_empty() {
-            return (Vec::new(), Vec::new(), audio_decimated);
+            return (Vec::new(), Vec::new());
         }
 
         let var_envelope_mean = var_envelope.iter().sum::<f64>() / var_envelope.len() as f64;
@@ -388,14 +412,40 @@ impl VorDemodulator {
 
         // Remove DC from reference signal
         if ref_phase_signal.is_empty() {
-            return (Vec::new(), Vec::new(), audio_decimated);
+            return (var_30, Vec::new());
         }
 
         let ref_mean = ref_phase_signal.iter().sum::<f64>() / ref_phase_signal.len() as f64;
         let ref_centered: Vec<f64> = ref_phase_signal.iter().map(|x| x - ref_mean).collect();
         let ref_30 = self.ref_30_lpf.filter(&ref_centered);
 
-        (var_30, ref_30, audio_decimated)
+        (var_30, ref_30)
+    }
+
+    /// Demodulate pre-decimated audio to extract VOR 30 Hz components.
+    ///
+    /// This method is used when audio is already available (e.g., from a WAV file)
+    /// and doesn't need frequency shifting or the full I/Q demodulation pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// - `audio_samples`: Audio samples at the configured audio rate
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `variable_30hz`: Envelope of the 30 Hz variable signal
+    /// - `reference_30hz`: Phase signal from the 30 Hz reference
+    /// - `audio_out`: The input audio (returned unchanged for pipeline compatibility)
+    ///
+    /// All outputs are at the audio rate. Returns empty vectors if input is empty.
+    pub fn demodulate_audio(&mut self, audio_samples: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        if audio_samples.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let (var_30, ref_30) = self.extract_subcarriers_and_30hz(audio_samples);
+        (var_30, ref_30, audio_samples.to_vec())
     }
 }
 

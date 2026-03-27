@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use voracious::{IqFormat, VorSource, WavIlsSource, WavVorSource};
+use voracious::{IqFormat, VorSource, WavIlsLocalizerSource, WavVorSource};
 
 #[derive(Parser)]
 #[command(name = "voracious")]
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle WAV files separately (no need for sample-rate or center-freq)
     if is_wav {
         if let Some(ils_freq) = cli.ils_freq {
-            let source = WavIlsSource::new(
+            let source = WavIlsLocalizerSource::new(
                 &cli.input,
                 ils_freq,
                 cli.window,
@@ -236,10 +236,10 @@ Use --center-freq explicitly or provide a gqrx file named like gqrx_*_<centerHz>
             }
         }
     } else {
-        // ILS I/Q mode
+        // ILS Localizer I/Q mode
         let ils_freq = cli.ils_freq.unwrap(); // Already validated above
-        use voracious::IlsSource;
-        let mut source = IlsSource::new(
+        use voracious::IlsLocalizerSource;
+        let mut source = IlsLocalizerSource::new(
             cli.input,
             sample_rate,
             iq_format,

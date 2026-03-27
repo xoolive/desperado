@@ -16,8 +16,8 @@
 //! Refactor to use shared DSP functions from `sources/common.rs`, eliminating
 //! code duplication between I/Q and WAV processing paths.
 
-pub mod ils;
+pub mod ils_loc;
 pub mod vor;
 
-pub use ils::WavIlsSource;
+pub use ils_loc::WavIlsLocalizerSource;
 pub use vor::WavVorSource;

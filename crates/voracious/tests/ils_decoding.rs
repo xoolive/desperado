@@ -37,9 +37,9 @@
 //! | Audio rate          | 9000 Hz (decimate 200×)            |
 //! | Recording duration  | ≈ 5.8 s                            |
 
+use desperado::dsp::voracious::hilbert_transform;
 use std::path::Path;
-use voracious::decoders::ils::{IlsDemodulator, IlsSide, compute_ddm};
-use voracious::dsp::hilbert_transform;
+use voracious::decoders::ils_loc::{IlsLocalizerDemodulator, IlsSide, compute_ddm};
 
 const ILS_AUDIO_RATE: f64 = 9_000.0;
 const ILS_STEM: &str = "gqrx_20251107_215806_110700000_1800000_fc_ils";
@@ -83,7 +83,7 @@ fn demodulate_ils_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     // means we shift IQ by +5000 Hz to bring the carrier to DC.
     // (freq_offset = ils_frequency − center_frequency = 110.695e6 − 110.700e6 = −5000)
     let freq_offset: f64 = -5_000.0;
-    let mut demod = IlsDemodulator::new(sample_rate);
+    let mut demod = IlsLocalizerDemodulator::new(sample_rate);
 
     let chunk_bytes = 262_144 * 8;
     let mut env_90_all = Vec::new();
@@ -217,7 +217,7 @@ fn test_ils_fixture_envelope_ddm() {
     let envelope = load_f32(&fixture_path(ILS_STEM, "envelope"));
     assert!(!envelope.is_empty(), "envelope fixture is empty");
 
-    // Recompute env_90 and env_150 from the envelope using the same filters IlsDemodulator uses
+    // Recompute env_90 and env_150 from the envelope using the same filters IlsLocalizerDemodulator uses
     use desperado::dsp::filters::ButterworthFilter;
 
     let mut bpf_90 = ButterworthFilter::bandpass(80.0, 100.0, ILS_AUDIO_RATE, 4);

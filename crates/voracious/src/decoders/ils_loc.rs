@@ -263,7 +263,7 @@ pub struct IlsMorseCandidate {
 ///
 /// Processes raw cf32 I/Q samples at 1.8 MSps and extracts 90 Hz / 150 Hz
 /// tone envelopes needed to compute DDM.
-pub struct IlsDemodulator {
+pub struct IlsLocalizerDemodulator {
     /// Input I/Q sample rate in Hz.
     pub sample_rate: f64,
     /// Decimated audio sample rate in Hz (= sample_rate / decim_factor).
@@ -278,7 +278,7 @@ pub struct IlsDemodulator {
     bpf_150: ButterworthFilter,
 }
 
-impl IlsDemodulator {
+impl IlsLocalizerDemodulator {
     /// Create a new demodulator for the given I/Q sample rate.
     ///
     /// With the default 1.8 MSps input the decimation factor is 200,
@@ -498,17 +498,70 @@ impl IlsDemodulator {
             return (Vec::new(), Vec::new(), Vec::new());
         }
 
-        // 5. Extract 90 Hz tone envelope
-        let tone_90 = self.bpf_90.filter(&audio);
+        // 5 & 6. Extract 90 Hz and 150 Hz tone envelopes
+        let (env_90, env_150) = self.extract_tones_and_audio(&audio);
+
+        (env_90, env_150, audio)
+    }
+
+    /// Extract 90 Hz and 150 Hz tone envelopes from audio samples.
+    ///
+    /// This is the core tone extraction logic, factored out so it can be
+    /// reused by both I/Q demodulation and direct audio processing paths.
+    ///
+    /// # Arguments
+    ///
+    /// - `audio`: Audio samples already at the target audio rate (e.g., 48 kHz)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `env_90`: Envelope of the 90 Hz modulation tone
+    /// - `env_150`: Envelope of the 150 Hz modulation tone
+    ///
+    /// Both outputs are at the audio rate. Returns empty vectors if input is empty.
+    pub fn extract_tones_and_audio(&mut self, audio: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        if audio.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Extract 90 Hz tone envelope
+        let tone_90 = self.bpf_90.filter(audio);
         let analytic_90 = hilbert_transform(&tone_90);
         let env_90 = envelope(&analytic_90);
 
-        // 6. Extract 150 Hz tone envelope
-        let tone_150 = self.bpf_150.filter(&audio);
+        // Extract 150 Hz tone envelope
+        let tone_150 = self.bpf_150.filter(audio);
         let analytic_150 = hilbert_transform(&tone_150);
         let env_150 = envelope(&analytic_150);
 
-        (env_90, env_150, audio)
+        (env_90, env_150)
+    }
+
+    /// Demodulate pre-decimated audio to extract ILS 90/150 Hz tone envelopes.
+    ///
+    /// This method is used when audio is already available (e.g., from a WAV file)
+    /// and doesn't need frequency shifting or the full I/Q demodulation pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// - `audio_samples`: Audio samples at the configured audio rate
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `env_90`: Envelope of the 90 Hz modulation tone
+    /// - `env_150`: Envelope of the 150 Hz modulation tone
+    /// - `audio_out`: The input audio (returned unchanged for pipeline compatibility)
+    ///
+    /// All outputs are at the audio rate. Returns empty vectors if input is empty.
+    pub fn demodulate_audio(&mut self, audio_samples: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        if audio_samples.is_empty() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let (env_90, env_150) = self.extract_tones_and_audio(audio_samples);
+        (env_90, env_150, audio_samples.to_vec())
     }
 
     /// Decode the 1020 Hz Morse ident from audio-rate samples.

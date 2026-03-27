@@ -5,24 +5,25 @@
 //!
 //! ## Currently Implemented
 //! - [`vor`]: VOR (VHF Omnidirectional Range) decoder
-//! - [`ils`]: ILS (Instrument Landing System) localizer decoder
+//! - [`ils_loc`]: ILS Localizer (LOC/LLZ) (Instrument Landing System lateral guidance) decoder
 //! - [`morse`]: Generic Morse code parsing (reusable for VOR, NDB, ILS, DME)
 //!
 //! ## Future Decoders
+//! - ILS Glide Slope (GS) decoder (vertical guidance)
 //! - DME (Distance Measuring Equipment) decoder
 
 pub mod error;
-pub mod ils;
+pub mod ils_loc;
 pub mod metrics;
 pub mod morse;
 pub mod vor;
 
 // Re-export public types and functions for convenient access
 pub use error::{Error, Result};
-pub use ils::{
+pub use ils_loc::{
     ILS_AUDIO_RATE, ILS_MORSE_AUDIO_BPF_HIGH, ILS_MORSE_AUDIO_BPF_LOW, ILS_MORSE_AUDIO_BPF_ORDER,
-    ILS_MORSE_BPF_HIGH, ILS_MORSE_BPF_LOW, ILS_MORSE_BPF_ORDER, ILS_SAMPLE_RATE_1_8M,
-    IlsDemodulator, IlsFrame, IlsMorseCandidate, IlsMorseDebugInfo, IlsSide, compute_ddm,
+    ILS_MORSE_BPF_HIGH, ILS_MORSE_BPF_LOW, ILS_MORSE_BPF_ORDER, ILS_SAMPLE_RATE_1_8M, IlsFrame,
+    IlsLocalizerDemodulator, IlsMorseCandidate, IlsMorseDebugInfo, IlsSide, compute_ddm,
 };
 pub use metrics::compute_signal_quality;
 pub use morse::MorseDecodeAttempt;
