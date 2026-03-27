@@ -85,9 +85,9 @@ struct Args {
     #[arg(short, long, value_parser = Frequency::from_str)]
     center_freq: Frequency,
 
-    /// Sample rate in Hz
-    #[arg(short, long, default_value_t = 2_000_000)]
-    sample_rate: u32,
+    /// Sample rate in Hz (default: 3_000_000 for airspy://, 2_000_000 otherwise)
+    #[arg(short, long)]
+    sample_rate: Option<u32>,
 
     /// Tuner gain (None for AGC, Some(gain) for manual)
     #[arg(short, long, default_value = None)]
@@ -130,6 +130,21 @@ struct Args {
     /// for optimal RDS decoding with redsea
     #[arg(long)]
     resample_out: Option<u32>,
+}
+
+impl Args {
+    fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate
+            .unwrap_or_else(|| default_sample_rate_for_source(&self.source))
+    }
+}
+
+fn default_sample_rate_for_source(source: &str) -> u32 {
+    if source.starts_with("airspy://") {
+        3_000_000
+    } else {
+        2_000_000
+    }
 }
 
 const FM_BANDWIDTH: f32 = 240_000.0;
@@ -211,7 +226,8 @@ fn spawn_inline_tui(
 
                     let body = chunks[0];
                     let footer = chunks[1];
-                    let inner = body.width.saturating_sub(4) as usize;
+                    let stats_area = body;
+                    let inner = stats_area.width.saturating_sub(4) as usize;
                     let src = one_line(&s.source, inner.saturating_sub(9));
                     let ps = one_line(&s.rds_ps, inner.saturating_sub(10));
                     let rt = one_line(&s.rds_rt, inner.saturating_sub(10));
@@ -251,7 +267,7 @@ fn spawn_inline_tui(
                             .title_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
                             .borders(Borders::ALL),
                     );
-                    f.render_widget(p, body);
+                    f.render_widget(p, stats_area);
 
                     let controls = if can_hard_retune {
                         "(Esc/Q) quit | (←/→) 100kHz | (↑/↓) 1MHz | (⤒/⤓) scan | (S) stereo"
@@ -548,7 +564,7 @@ async fn main() -> desperado::Result<()> {
         source: args.source.clone(),
         center_freq_hz: args.center_freq.0,
         alt_freq_hz: None,
-        sample_rate_hz: args.sample_rate,
+        sample_rate_hz: args.sample_rate_hz(),
         mpx_rate_hz: 0.0,
         iq_level_dbfs: -120.0,
         audio_buf_fill: 0,
@@ -582,14 +598,15 @@ async fn main() -> desperado::Result<()> {
         }
     });
 
-    let mut rotate = Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32);
+    let mut rotate =
+        Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32);
     let mut phase_extractor = PhaseExtractor::new();
-    let factor = (args.sample_rate as f32 / FM_BANDWIDTH).round() as usize;
+    let factor = (args.sample_rate_hz() as f32 / FM_BANDWIDTH).round() as usize;
     let mut decimator = Decimator::new(factor);
 
     // IMPORTANT: Calculate actual decimated sample rate
     // factor = round(2000000 / 240000) = 8, so actual rate = 2000000 / 8 = 250000
-    let actual_mpx_rate = args.sample_rate as f32 / factor as f32;
+    let actual_mpx_rate = args.sample_rate_hz() as f32 / factor as f32;
     info!(
         "[DSP] Decimation factor: {}, actual MPX rate: {} Hz (target was {} Hz)",
         factor, actual_mpx_rate, FM_BANDWIDTH
@@ -676,7 +693,7 @@ async fn build_iq_source(args: &Args, tuning_freq: u32) -> desperado::Result<IqA
             .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
         return Ok(IqAsyncSource::from_stdin(
             tuning_freq,
-            args.sample_rate,
+            args.sample_rate_hz(),
             16384,
             format,
         ));
@@ -688,7 +705,7 @@ async fn build_iq_source(args: &Args, tuning_freq: u32) -> desperado::Result<IqA
         return IqAsyncSource::from_file(
             &args.source,
             tuning_freq,
-            args.sample_rate,
+            args.sample_rate_hz(),
             16384,
             format,
         )
@@ -696,7 +713,7 @@ async fn build_iq_source(args: &Args, tuning_freq: u32) -> desperado::Result<IqA
     }
 
     let configured_uri =
-        ensure_tuning_query(&args.source, tuning_freq, args.sample_rate, args.gain);
+        ensure_tuning_query(&args.source, tuning_freq, args.sample_rate_hz(), args.gain);
     let config = DeviceConfig::from_str(&configured_uri)
         .map_err(|e| std::io::Error::other(format!("Invalid SDR URI: {}", e)))?;
 
@@ -803,7 +820,7 @@ async fn run_mono(
                         *current_center_hz = desired_center;
                         // Reset DSP state so demod/RDS reacquires on the new station.
                         *rotate = Rotate::new(
-                            -2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32,
+                            -2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32,
                         );
                         phase_extractor.reset();
                         decimator.reset();
@@ -1011,7 +1028,7 @@ async fn run_stereo(
                         *current_center_hz = desired_center;
                         // Reset DSP state so stereo/RDS lock is reacquired for new station.
                         *rotate = Rotate::new(
-                            -2.0 * PI * args.offset_freq as f32 / args.sample_rate as f32,
+                            -2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32,
                         );
                         phase_extractor.reset();
                         decimator.reset();
