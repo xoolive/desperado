@@ -382,20 +382,30 @@ impl AsyncRtlSdrReader {
     }
 
     /// Send a control message to the USB reader thread.
-    ///
-    /// Only `Frequency` is forwarded; other variants are not supported during
-    /// streaming and are logged as warnings.
     pub fn adjust(&self, message: RtlSdrMessage) -> error::Result<()> {
         match message {
             RtlSdrMessage::Frequency(freq) => self
                 .control
                 .tune(freq)
                 .map_err(|e| error::Error::device(format!("RTL-SDR tune failed: {e}"))),
-            other => {
+            RtlSdrMessage::Gain(gain) => {
+                let tuner_gain = match gain {
+                    Gain::Auto => TunerGain::Auto,
+                    Gain::Manual(db) => TunerGain::Manual((db * 10.0) as i32),
+                    Gain::Elements(_) => TunerGain::Auto,
+                };
+                self.control
+                    .set_gain(tuner_gain)
+                    .map_err(|e| error::Error::device(format!("RTL-SDR set gain failed: {e}")))
+            }
+            RtlSdrMessage::SampleRate(rate) => self
+                .control
+                .set_sample_rate(rate)
+                .map_err(|e| error::Error::device(format!("RTL-SDR set sample rate failed: {e}"))),
+            RtlSdrMessage::FreqCorrection(ppm) => {
                 tracing::warn!(
-                    message = ?other,
-                    "RTL-SDR live parameter adjustment not supported during streaming \
-                     (only Frequency/tune is); ignoring"
+                    ppm,
+                    "RTL-SDR live frequency correction change not supported during streaming; ignoring"
                 );
                 Ok(())
             }

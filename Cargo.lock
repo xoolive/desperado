@@ -2456,8 +2456,6 @@ dependencies = [
  "byteorder",
  "criterion",
  "ctrlc",
- "libc",
- "libusb1-sys",
  "log",
  "mockall",
  "num-complex",

@@ -1009,6 +1009,17 @@ impl IqAsyncSource {
         }
     }
 
+    /// Adjust tuner gain on supported live SDR sources.
+    pub fn set_gain(&self, _gain: Gain) -> error::Result<()> {
+        match self {
+            #[cfg(feature = "rtlsdr")]
+            IqAsyncSource::RtlSdr(source) => {
+                source.adjust(crate::rtlsdr::RtlSdrMessage::Gain(_gain))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Create a new file-based asynchronous I/Q source
     ///
     /// # Example
