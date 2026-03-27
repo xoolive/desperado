@@ -1048,7 +1048,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // Warn at info level if superframe success rate is poor,
                                     // so it's visible without RUST_LOG=debug.
                                     if sf_attempted >= 5 && sf_ok_pct < 80 {
-                                        tracing::warn!(
+                                        tracing::info!(
                                             superframes_attempted = sf_attempted,
                                             superframes_decoded = sf_decoded,
                                             fire_code_failures = sf_fc_fail,
