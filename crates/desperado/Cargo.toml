@@ -61,6 +61,16 @@ path = "examples/file_stream.rs"
 required-features = ["clap"]
 
 [[example]]
+name = "airspy_raw_bytes"
+path = "examples/airspy_raw_bytes.rs"
+required-features = ["airspy"]
+
+[[example]]
 name = "airspy_test"
 path = "examples/airspy_test.rs"
 required-features = ["airspy"]
+
+[[example]]
+name = "rtl_sdr"
+path = "examples/rtl_sdr.rs"
+required-features = ["rtlsdr", "clap"]
