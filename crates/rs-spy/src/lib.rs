@@ -28,7 +28,7 @@ pub mod transport;
 
 pub use error::{AirspyErrorCode, Error, Result};
 pub use iqconverter::IqConverter;
-pub use transport::{Airspy, RECOMMENDED_BUFFER_SIZE, SAMPLES_PER_BUFFER};
+pub use transport::{Airspy, AirspyGainStages, RECOMMENDED_BUFFER_SIZE, SAMPLES_PER_BUFFER};
 
 // Airspy device identifiers (USB VID/PID)
 pub const AIRSPY_VID: u16 = 0x1d50;

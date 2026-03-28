@@ -1016,6 +1016,10 @@ impl IqAsyncSource {
             IqAsyncSource::RtlSdr(source) => {
                 source.adjust(crate::rtlsdr::RtlSdrMessage::Gain(_gain))
             }
+            #[cfg(feature = "airspy")]
+            IqAsyncSource::Airspy(source) => {
+                source.adjust(crate::airspy::AirspyMessage::Gain(_gain))
+            }
             _ => Ok(()),
         }
     }

@@ -72,6 +72,41 @@ pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
 
 pub const DEFAULT_ASYNC_QUEUE_LEN: usize = 16;
 
+/// Raw gain stage values sent over the async control channel.
+///
+/// The dB-to-preset mapping lives in the caller (e.g. `desperado`); here we
+/// just carry the raw hardware knobs so rs-spy stays free of Gain abstractions.
+#[derive(Debug, Clone, Copy)]
+pub struct AirspyGainStages {
+    pub lna_agc: bool,
+    pub mixer_agc: bool,
+    pub lna: u8,   // 0-14
+    pub mixer: u8, // 0-15
+    pub vga: u8,   // 0-15
+}
+
+/// A cloneable handle for concurrent bulk reads from multiple threads.
+///
+/// Each clone wraps the same underlying `rusb::DeviceHandle` (which is both
+/// `Send` and `Sync`), so all copies submit independent bulk transfers that are
+/// in-flight simultaneously — the same technique libairspy uses internally with
+/// its USB transfer/event thread.
+pub struct SharedBulkHandle(Arc<DeviceHandle<Context>>);
+
+impl SharedBulkHandle {
+    pub fn read_bulk(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.0
+            .read_bulk(BULK_ENDPOINT_IN, buf, timeout)
+            .map_err(|e| Error::StreamingError(e.to_string()))
+    }
+}
+
+impl Clone for SharedBulkHandle {
+    fn clone(&self) -> Self {
+        SharedBulkHandle(Arc::clone(&self.0))
+    }
+}
+
 pub struct AsyncReadHandle {
     rx: mpsc::Receiver<Result<Vec<u8>>>,
     ctrl_tx: mpsc::Sender<AsyncReadControl>,
@@ -89,6 +124,7 @@ pub struct AsyncReadControlHandle {
 
 enum AsyncReadControl {
     Tune(u32),
+    SetGain(AirspyGainStages),
 }
 
 impl AsyncReadHandle {
@@ -128,6 +164,12 @@ impl AsyncReadControlHandle {
             .send(AsyncReadControl::Tune(center_freq))
             .map_err(|_| Error::StreamingError("async control channel closed".to_string()))
     }
+
+    pub fn set_gain(&self, stages: AirspyGainStages) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::SetGain(stages))
+            .map_err(|_| Error::StreamingError("async control channel closed".to_string()))
+    }
 }
 
 // GPIO port/pin for Bias-T (RF bias) - GPIO_PORT1, GPIO_PIN13
@@ -159,8 +201,12 @@ static SENSITIVITY_LNA_GAINS: [u8; GAIN_COUNT] = [
 ];
 
 /// Airspy device handle.
+///
+/// The USB handle is stored in an `Arc` so that `into_multi_transfer_reader`
+/// can hand out `SharedBulkHandle` clones to concurrent reader threads while
+/// the control thread retains ownership of the `Airspy` for configuration.
 pub struct Airspy {
-    device: DeviceHandle<Context>,
+    device: Arc<DeviceHandle<Context>>,
 }
 
 impl Airspy {
@@ -261,7 +307,18 @@ impl Airspy {
         // Claim interface 0
         handle.claim_interface(0)?;
 
-        Ok(Airspy { device: handle })
+        Ok(Airspy {
+            device: Arc::new(handle),
+        })
+    }
+
+    /// Return a handle suitable for concurrent bulk reads from multiple threads.
+    ///
+    /// `rusb::DeviceHandle` is both `Send` and `Sync` (libusb is thread-safe),
+    /// so each clone can call `read_bulk` simultaneously — the same effect as
+    /// libairspy's internal multi-transfer USB event loop.
+    pub fn shared_bulk_handle(&self) -> SharedBulkHandle {
+        SharedBulkHandle(Arc::clone(&self.device))
     }
 
     /// Get the firmware version string.
@@ -1031,6 +1088,11 @@ impl Airspy {
                                 return;
                             }
                         }
+                        AsyncReadControl::SetGain(stages) => {
+                            if let Err(e) = apply_gain_stages(&dev, stages) {
+                                tracing::warn!("Airspy set gain failed during streaming: {}", e);
+                            }
+                        }
                     }
                 }
 
@@ -1051,6 +1113,120 @@ impl Airspy {
                 }
             }
 
+            let _ = dev.stop_rx();
+        });
+
+        Ok(AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop,
+            dropped,
+            thread: Some(thread),
+        })
+    }
+
+    /// Start a multi-transfer async reader with `buf_num` concurrent bulk transfers.
+    ///
+    /// This mirrors how libairspy works internally: multiple USB bulk transfers are
+    /// kept in-flight simultaneously so the device FIFO never overflows between
+    /// transfers.  At 6 Msps (16-bit real samples = 12 MB/s), a single sequential
+    /// reader leaves the FIFO exposed for ~21 ms between each 256 KB read; with N
+    /// concurrent readers the gap shrinks to ~21/N ms.
+    ///
+    /// Architecture:
+    /// ```text
+    ///   buf_num reader threads  ──sync_channel(buf_num*4)──▶  control/bridge thread
+    ///   (each calls read_bulk)                                  (tune / set_gain)
+    /// ```
+    ///
+    /// Returns the same `AsyncReadHandle` as `into_async_reader`.
+    pub fn into_multi_transfer_reader(
+        self,
+        buf_num: usize,
+        buf_len: usize,
+    ) -> Result<AsyncReadHandle> {
+        let buf_num = if buf_num == 0 {
+            DEFAULT_ASYNC_QUEUE_LEN
+        } else {
+            buf_num
+        };
+        let buf_len = if buf_len == 0 {
+            RECOMMENDED_BUFFER_SIZE
+        } else {
+            buf_len
+        };
+
+        if !buf_len.is_multiple_of(512) {
+            return Err(Error::StreamingError(format!(
+                "Invalid buffer length {} (must be multiple of 512)",
+                buf_len
+            )));
+        }
+
+        // buf_num * 4 gives the same headroom as RTL-SDR's implementation.
+        // Reader threads drop chunks rather than blocking so the USB loop never stalls.
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(buf_num * 4);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<AsyncReadControl>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let shared = self.shared_bulk_handle();
+        let stop_readers = Arc::clone(&stop);
+
+        // Spawn buf_num independent reader threads.
+        // Each holds a clone of SharedBulkHandle and loops on read_bulk.
+        for _ in 0..buf_num {
+            let handle = shared.clone();
+            let tx = tx.clone();
+            let stop_r = Arc::clone(&stop_readers);
+            let dropped_ctr = Arc::clone(&dropped);
+            thread::spawn(move || {
+                let mut buf = vec![0u8; buf_len];
+                while !stop_r.load(Ordering::Relaxed) {
+                    match handle.read_bulk(&mut buf, Duration::from_millis(1000)) {
+                        Ok(0) => continue,
+                        Ok(n) => {
+                            let chunk = buf[..n].to_vec();
+                            if tx.try_send(Ok(chunk)).is_err() {
+                                dropped_ctr.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            // Timeout is expected on stop; only log other errors.
+                            if !stop_r.load(Ordering::Relaxed) {
+                                tracing::warn!("Airspy bulk read error: {}", e);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        // The control thread owns `self` (Airspy) for configuration calls.
+        // It uses recv_timeout so it notices the stop flag promptly on shutdown.
+        let dev = self;
+        let stop_ctrl = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            loop {
+                if stop_ctrl.load(Ordering::Relaxed) {
+                    break;
+                }
+                match ctrl_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(AsyncReadControl::Tune(freq)) => {
+                        if let Err(e) = dev.set_freq(freq) {
+                            tracing::warn!("Airspy retune to {} Hz failed: {}", freq, e);
+                        }
+                    }
+                    Ok(AsyncReadControl::SetGain(stages)) => {
+                        if let Err(e) = apply_gain_stages(&dev, stages) {
+                            tracing::warn!("Airspy set gain failed: {}", e);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
             let _ = dev.stop_rx();
         });
 
@@ -1186,6 +1362,22 @@ impl Airspy {
             }
         }
     }
+}
+
+/// Apply gain stages from an `AirspyGainStages` value to an open device.
+///
+/// Called from both the single-reader and multi-transfer control loops.
+fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
+    dev.set_lna_agc(stages.lna_agc)?;
+    dev.set_mixer_agc(stages.mixer_agc)?;
+    if !stages.lna_agc {
+        dev.set_lna_gain(stages.lna)?;
+    }
+    if !stages.mixer_agc {
+        dev.set_mixer_gain(stages.mixer)?;
+    }
+    dev.set_vga_gain(stages.vga)?;
+    Ok(())
 }
 
 impl Drop for Airspy {

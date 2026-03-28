@@ -38,7 +38,7 @@
 
 use futures::Stream;
 use num_complex::Complex;
-use rs_spy::{Airspy, IqConverter, RECOMMENDED_BUFFER_SIZE};
+use rs_spy::{Airspy, AirspyGainStages, IqConverter, RECOMMENDED_BUFFER_SIZE};
 
 use crate::{Gain, GainElementName, error};
 
@@ -572,6 +572,73 @@ impl Drop for AirspySdrReader {
 
 /// Asynchronous Airspy I/Q Reader
 ///
+/// Control message for dynamic Airspy parameter adjustment during streaming.
+#[derive(Debug, Clone)]
+pub enum AirspyMessage {
+    /// Retune to a new center frequency (Hz)
+    Frequency(u32),
+    /// Change gain configuration
+    Gain(Gain),
+}
+
+/// Convert a `Gain` to raw `AirspyGainStages` for the control channel.
+fn gain_to_stages(
+    gain: &Gain,
+    lna: Option<u8>,
+    mixer: Option<u8>,
+    vga: Option<u8>,
+) -> AirspyGainStages {
+    match gain {
+        Gain::Auto => AirspyGainStages {
+            lna_agc: true,
+            mixer_agc: true,
+            lna: 0,
+            mixer: 0,
+            vga: vga.unwrap_or(15),
+        },
+        Gain::Manual(db) => {
+            // Map 0–50 dB to sensitivity preset 0–21; matches configure_gain()
+            let level = ((*db as u32 * 21) / 50).min(21) as u8;
+            // Look up from the same SENSITIVITY tables used at init time
+            const SENSITIVITY_VGA: [u8; 22] = [
+                13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+            ];
+            const SENSITIVITY_MIXER: [u8; 22] = [
+                12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0,
+            ];
+            const SENSITIVITY_LNA: [u8; 22] = [
+                14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1, 0,
+            ];
+            let idx = (21 - level) as usize;
+            AirspyGainStages {
+                lna_agc: false,
+                mixer_agc: false,
+                lna: SENSITIVITY_LNA[idx],
+                mixer: SENSITIVITY_MIXER[idx],
+                vga: SENSITIVITY_VGA[idx],
+            }
+        }
+        Gain::Elements(elements) => {
+            let mut s = AirspyGainStages {
+                lna_agc: false,
+                mixer_agc: false,
+                lna: lna.unwrap_or(14),
+                mixer: mixer.unwrap_or(12),
+                vga: vga.unwrap_or(13),
+            };
+            for elem in elements {
+                match &elem.name {
+                    GainElementName::Lna => s.lna = (elem.value_db as u8).min(14),
+                    GainElementName::Mix => s.mixer = (elem.value_db as u8).min(15),
+                    GainElementName::Vga => s.vga = (elem.value_db as u8).min(15),
+                    _ => {}
+                }
+            }
+            s
+        }
+    }
+}
+
 /// Provides a `futures::Stream`-based interface for reading I/Q samples.
 /// Internally spawns a background thread that reads from the device and
 /// sends samples through a tokio channel.
@@ -646,8 +713,12 @@ impl AsyncAirspySdrReader {
                 .map_err(|e| error::Error::device(format!("Failed to set sample rate: {}", e)))?;
         }
 
+        // Use 15 concurrent bulk transfers (same as RTL-SDR's DEFAULT_ASYNC_BUF_NUMBER)
+        // to keep the device FIFO from overflowing between reads.
+        // At 6 Msps (12 MB/s), a single sequential read leaves the FIFO exposed for ~21 ms;
+        // with 15 in-flight transfers the gap is <2 ms.
         let async_reader = device
-            .into_async_reader(32, RECOMMENDED_BUFFER_SIZE)
+            .into_multi_transfer_reader(15, RECOMMENDED_BUFFER_SIZE)
             .map_err(|e| error::Error::device(format!("Failed to start async reader: {}", e)))?;
         let ctrl = async_reader.control_handle();
 
@@ -695,9 +766,23 @@ impl AsyncAirspySdrReader {
     }
 
     pub fn tune(&self, center_freq: u32) -> error::Result<()> {
-        self.ctrl
-            .tune(center_freq)
-            .map_err(|e| error::Error::device(format!("Airspy async tune failed: {}", e)))
+        self.adjust(AirspyMessage::Frequency(center_freq))
+    }
+
+    /// Send a control message to the device thread (tune or gain change).
+    pub fn adjust(&self, message: AirspyMessage) -> error::Result<()> {
+        match message {
+            AirspyMessage::Frequency(freq) => self
+                .ctrl
+                .tune(freq)
+                .map_err(|e| error::Error::device(format!("Airspy async tune failed: {}", e))),
+            AirspyMessage::Gain(gain) => {
+                let stages = gain_to_stages(&gain, None, None, None);
+                self.ctrl.set_gain(stages).map_err(|e| {
+                    error::Error::device(format!("Airspy async set_gain failed: {}", e))
+                })
+            }
+        }
     }
 }
 
