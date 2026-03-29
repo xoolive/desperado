@@ -209,7 +209,7 @@ impl OfdmProcessor {
 
                     // Use PRS correlation to find exact timing
                     let (prs_start, prs_snr) = self.find_prs_start();
-                    if prs_start < 0 {
+                    if prs_start == i32::MIN {
                         // Not enough data — wait for more
                         break;
                     }
@@ -221,10 +221,12 @@ impl OfdmProcessor {
                     // For initial sync (from_null_detect), we need good PRS correlation.
                     let drain_count = if self.from_null_detect {
                         // Initial sync - use PRS correlation result
-                        if prs_snr < 5.0 || best_lag.abs() > 1500 {
+                        // If prs_start < 0, we've already passed the PRS useful start — re-acquire.
+                        if prs_snr < 5.0 || best_lag.abs() > 1500 || prs_start < 0 {
                             debug!(
                                 snr = format!("{:.2}", prs_snr),
                                 best_lag,
+                                prs_start,
                                 frame_count = self.frame_count,
                                 "PRS correlation failed during initial sync, re-acquiring"
                             );
@@ -322,6 +324,11 @@ impl OfdmProcessor {
                             buffer_len_before = self.buffer.len(),
                             "Draining frame data"
                         );
+                        debug!(
+                            frame = self.frame_count,
+                            coarse_offset = frame.coarse_freq_offset,
+                            "produced frame"
+                        );
                         self.buffer.drain(..frame_data_len);
                         self.frame_count += 1;
                         frames.push(frame);
@@ -331,7 +338,8 @@ impl OfdmProcessor {
                         self.state = SyncState::NeedNullSkip;
                         // Continue to process NeedNullSkip state
                     } else {
-                        break;
+                        debug!("process_frame returned None, re-acquiring");
+                        self.state = SyncState::NeedNullDetect;
                     }
                 }
 
@@ -483,6 +491,15 @@ impl OfdmProcessor {
                 "Freq estimation"
             );
 
+            debug!(
+                coarse_est = coarse,
+                prs_snr = format!("{:.1}", self.last_prs_snr),
+                frame = self.frame_count,
+                raw_fine_hz = format!("{:.1}", raw_fine_freq),
+                fine_hz = format!("{:.1}", self.fine_freq_hz),
+                coarse_carriers = self.coarse_freq_carriers,
+                "freq estimation"
+            );
             if self.last_prs_snr > 20.0 || self.frame_count == 0 {
                 self.coarse_freq_carriers = coarse;
             }
@@ -543,14 +560,15 @@ impl OfdmProcessor {
     ///
     /// Expects buffer[0] to be approximately the PRS guard interval start.
     /// Returns `(sample_offset, snr)` where sample_offset is from buffer[0] to the PRS
-    /// useful-part start, or `(-1, 0.0)` if correlation is too weak.
+    /// useful-part start, or `(i32::MIN, 0.0)` if not enough data yet.
+    /// May return negative values if the PRS start was already passed (caller should re-acquire).
     fn find_prs_start(&self) -> (i32, f32) {
         if self.buffer.len() < T_S + T_G {
-            return (-1, 0.0);
+            return (i32::MIN, 0.0);
         }
 
         if T_G + T_U > self.buffer.len() {
-            return (-1, 0.0);
+            return (i32::MIN, 0.0);
         }
 
         // Window at the expected useful part location: buffer[T_G..T_G+T_U]
@@ -610,7 +628,17 @@ impl OfdmProcessor {
             "find_prs_start"
         );
 
-        (prs_start.max(0), snr)
+        debug!(
+            buf = self.buffer.len(),
+            win_power = format!("{:.4}", window_power),
+            best_lag,
+            best_mag = format!("{:.2}", best_mag.sqrt()),
+            snr = format!("{:.2}", snr),
+            prs_start,
+            "find_prs_start"
+        );
+
+        (prs_start, snr)
     }
 
     /// Find the null symbol by detecting a power drop (initial acquisition only).
@@ -661,7 +689,15 @@ impl OfdmProcessor {
             "find_null_symbol"
         );
 
-        if best_ratio < 4.0 {
+        debug!(
+            buf = self.buffer.len(),
+            search = search_len,
+            best_ratio = format!("{:.2}", best_ratio),
+            best_pos,
+            "find_null_symbol"
+        );
+
+        if best_ratio < 2.0 {
             let discard = self.buffer.len().min(T_F / 2);
             // Advance phase for discarded samples to maintain continuity
             let total_freq_hz =
@@ -821,9 +857,9 @@ mod tests {
             let peak_mag: f32 = corr.iter().map(|c| c.norm_sqr()).fold(0.0f32, f32::max);
             let sum_mag: f32 = corr.iter().map(|c| c.norm_sqr().sqrt()).sum();
             let snr = peak_mag.sqrt() * T_U as f32 / sum_mag;
-            eprintln!(
-                "  Freq offset test: snr={:.1} (should be low for 3-carrier offset)",
-                snr
+            trace!(
+                snr = format!("{:.1}", snr),
+                "freq offset test (should be low for 3-carrier offset)"
             );
         }
     }

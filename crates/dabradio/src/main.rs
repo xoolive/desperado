@@ -32,7 +32,8 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use std::collections::hash_map::DefaultHasher;
@@ -47,7 +48,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tinyaudio::prelude::*;
 use tracing::Level;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
 /// Unified IQ chunk iterator that works with both sync and async sources.
@@ -101,19 +102,27 @@ const AUDIO_RATE: usize = 48_000;
 
 #[derive(Default, Clone)]
 struct TuiState {
-    source: String,
+    // Header
+    ensemble_name: String,
     channel: String,
     center_freq_hz: u32,
+    // Signal
     input_rate_hz: u32,
     output_rate_hz: u32,
-    ofdm_frames: usize,
-    fibs: usize,
-    msc_frames: usize,
+    iq_level_dbfs: f32,
+    // Services panel
+    services: Vec<(String, Option<u16>)>, // (label, bitrate_kbps)
+    selected_service_idx: usize,
+    // Decode info
+    service_switch_request: Option<String>, // written by TUI, consumed by main loop
     service: String,
     dls: String,
     mot_count: usize,
     mot_info: String,
+    mot_filename: Option<String>, // content name for the current preview image
     mot_preview_path: Option<String>,
+    clear_mot_image: bool, // request Kitty image erase on next TUI tick
+    save_message: String,  // transient feedback after (S) save
     audio_q_fill: usize,
     status: String,
 }
@@ -144,102 +153,207 @@ fn spawn_dab_tui(
         let mut terminal = match Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(18),
+                viewport: Viewport::Inline(20),
             },
         ) {
             Ok(t) => t,
             Err(_) => {
                 let _ = disable_raw_mode();
-                eprintln!("dabradio: failed to initialize TUI terminal backend");
+                error!("failed to initialize TUI terminal backend");
                 return;
             }
         };
 
+        let mut save_message_until: Option<Instant> = None;
+
         while running.load(Ordering::Relaxed) {
+            // Auto-clear save feedback after a few seconds
+            if let Some(until) = save_message_until {
+                if Instant::now() >= until {
+                    save_message_until = None;
+                    if let Ok(mut s) = state.lock() {
+                        s.save_message.clear();
+                    }
+                }
+            }
+
             if let Ok(s) = state.lock() {
                 let _ = terminal.draw(|f| {
                     let area = f.area();
+
+                    // Outer vertical split: header (1) / body (fill) / footer (1)
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1),
+                            Constraint::Min(0),
+                            Constraint::Length(1),
+                        ])
+                        .split(area);
+                    let header_area = rows[0];
+                    let body_area = rows[1];
+                    let footer_area = rows[2];
+
+                    // ── Header ──
+                    let ensemble_display = if s.ensemble_name.is_empty() {
+                        "Scanning…".to_string()
+                    } else {
+                        s.ensemble_name.clone()
+                    };
+                    let freq_str = format!("{:.3} MHz", s.center_freq_hz as f64 / 1_000_000.0);
+                    let (status_color, status_dot) = if s.status.contains("decoding") {
+                        (Color::Green, "●")
+                    } else if s.status.contains("sync") || s.status.contains("FIC") {
+                        (Color::Yellow, "●")
+                    } else {
+                        (Color::DarkGray, "○")
+                    };
+                    let header = Paragraph::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            ensemble_display,
+                            Style::default()
+                                .fg(Color::Blue)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("  ·  ", Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(s.channel.clone(), Style::default().fg(Color::Blue)),
+                        Span::styled("  ·  ", Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(freq_str, Style::default().fg(Color::Blue)),
+                        Span::raw("   "),
+                        Span::styled(status_dot, Style::default().fg(status_color)),
+                        Span::styled(
+                            format!("  {}", s.status),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                    f.render_widget(header, header_area);
+
+                    // ── Footer ──
+                    let controls = if keyboard_available {
+                        "  (↑↓) navigate   (↵) select   (S) save image   (q/Esc) quit"
+                    } else {
+                        "  Ctrl-C to quit  (stdin piped)"
+                    };
+                    let footer = Paragraph::new(Line::from(Span::styled(
+                        controls,
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                    f.render_widget(footer, footer_area);
+
+                    // Body: services panel (28%) | info+MOT panel (72%)
                     let cols = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-                        .split(area);
+                        .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+                        .split(body_area);
                     let left = cols[0];
                     let right = cols[1];
-                    let inner = left.width.saturating_sub(4) as usize;
-                    let controls = if keyboard_available {
-                        " Controls: q/Esc/Ctrl-C quit"
+
+                    // ── Services panel ──
+                    let svc_inner = left.width.saturating_sub(4) as usize;
+                    let svc_title = format!(" Services ({}) ", s.services.len());
+                    let services_lines: Vec<Line> = if s.services.is_empty() {
+                        vec![Line::from("  Scanning…")]
                     } else {
-                        " Controls: Ctrl-C quit (stdin is piped)"
+                        s.services
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (label, bitrate))| {
+                                let is_active = !s.service.is_empty()
+                                    && label.trim().eq_ignore_ascii_case(s.service.trim());
+                                let is_cursor = i == s.selected_service_idx;
+                                let prefix = if is_active || is_cursor { "► " } else { "  " };
+                                let br_str =
+                                    bitrate.map(|br| format!(" {}k", br)).unwrap_or_default();
+                                let max_label = svc_inner.saturating_sub(2 + br_str.len());
+                                let text =
+                                    format!("{}{}{}", prefix, one_line(label, max_label), br_str);
+                                if is_active {
+                                    Line::from(Span::styled(
+                                        text,
+                                        Style::default()
+                                            .fg(Color::Cyan)
+                                            .add_modifier(Modifier::BOLD),
+                                    ))
+                                } else if is_cursor {
+                                    Line::from(Span::styled(
+                                        text,
+                                        Style::default().add_modifier(Modifier::BOLD),
+                                    ))
+                                } else {
+                                    Line::from(text)
+                                }
+                            })
+                            .collect()
                     };
-                    let left_lines = vec![
+                    let services_panel = Paragraph::new(services_lines)
+                        .block(Block::default().title(svc_title).borders(Borders::ALL));
+                    f.render_widget(services_panel, left);
+
+                    // ── Info + MOT panel ──
+                    let right_inner = right.width.saturating_sub(4) as usize;
+                    let right_lines = vec![
                         Line::from(format!(
-                            " Source: {}",
-                            one_line(&s.source, inner.saturating_sub(9))
+                            " IQ: {}  {:.1} dBFS   Buf: {}",
+                            level_bar(s.iq_level_dbfs, -60.0, 0.0, 14),
+                            s.iq_level_dbfs,
+                            s.audio_q_fill
                         )),
                         Line::from(format!(
-                            " Channel: {}   Freq: {:.3} MHz",
-                            one_line(&s.channel, 8),
-                            s.center_freq_hz as f64 / 1_000_000.0
-                        )),
-                        Line::from(format!(
-                            " Input: {} Hz   Output: {} Hz",
-                            s.input_rate_hz, s.output_rate_hz
+                            " In: {:.3} MHz  →  {} Hz",
+                            s.input_rate_hz as f64 / 1_000_000.0,
+                            s.output_rate_hz,
                         )),
                         Line::from(""),
                         Line::from(format!(
-                            " OFDM frames: {}   FIBs: {}   MSC frames: {}",
-                            s.ofdm_frames, s.fibs, s.msc_frames
-                        )),
-                        Line::from(format!(
-                            " Service: {}",
-                            one_line(&s.service, inner.saturating_sub(10))
+                            " {}",
+                            one_line(&s.service, right_inner.saturating_sub(1))
                         )),
                         Line::from(format!(
                             " DLS: {}",
-                            one_line(&s.dls, inner.saturating_sub(6))
+                            one_line(&s.dls, right_inner.saturating_sub(6))
                         )),
+                        Line::from(""),
                         Line::from(format!(
-                            " MOT: {}   {}",
+                            " MOT: {}  ·  {}",
                             s.mot_count,
-                            one_line(&s.mot_info, inner.saturating_sub(15))
+                            one_line(&s.mot_info, right_inner.saturating_sub(12))
                         )),
-                        Line::from(format!(" Audio queue: {} samples", s.audio_q_fill)),
-                        Line::from(""),
-                        Line::from(format!(
-                            " Status: {}",
-                            one_line(&s.status, inner.saturating_sub(9))
-                        )),
-                        Line::from(""),
-                        Line::from(controls),
+                        if s.save_message.is_empty() {
+                            Line::from("")
+                        } else {
+                            Line::from(Span::styled(
+                                format!(" {}", s.save_message),
+                                Style::default().fg(Color::Green),
+                            ))
+                        },
                     ];
-
-                    let left_panel = Paragraph::new(left_lines).block(
-                        Block::default()
-                            .title(" DAB Radio Dashboard ")
-                            .borders(Borders::ALL),
-                    );
-                    f.render_widget(left_panel, left);
-
-                    let right_lines = vec![
-                        Line::from(format!(" MOT count: {}", s.mot_count)),
-                        Line::from(format!(
-                            " {}",
-                            one_line(&s.mot_info, right.width.saturating_sub(4) as usize)
-                        )),
-                        Line::from(""),
-                    ];
-
-                    let right_panel = Paragraph::new(right_lines).block(
-                        Block::default()
-                            .title(" MOT Preview ")
-                            .borders(Borders::ALL),
-                    );
+                    let right_panel = Paragraph::new(right_lines)
+                        .block(Block::default().title(" DAB+ ").borders(Borders::ALL));
                     f.render_widget(right_panel, right);
 
-                    if inline_image_support && let Some(path) = &s.mot_preview_path {
-                        draw_tui_image(path, right);
+                    if inline_image_support {
+                        if let Some(path) = &s.mot_preview_path {
+                            draw_tui_image(path, right);
+                        }
                     }
                 });
+            }
+
+            // Erase Kitty image when service switches
+            if inline_image_support {
+                let needs_clear = state
+                    .try_lock()
+                    .ok()
+                    .map(|s| s.clear_mot_image)
+                    .unwrap_or(false);
+                if needs_clear {
+                    let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
+                    let _ = std::io::stdout().flush();
+                    if let Ok(mut s) = state.lock() {
+                        s.clear_mot_image = false;
+                    }
+                }
             }
 
             if keyboard_available && event::poll(Duration::from_millis(1)).unwrap_or(false) {
@@ -248,12 +362,51 @@ fn spawn_dab_tui(
                         let _ = terminal.autoresize();
                         let _ = terminal.clear();
                     }
-                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
                             running.store(false, Ordering::Relaxed);
                             break;
                         }
-                    }
+                        KeyCode::Up => {
+                            if let Ok(mut s) = state.lock() {
+                                s.selected_service_idx = s.selected_service_idx.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Ok(mut s) = state.lock() {
+                                let max = s.services.len().saturating_sub(1);
+                                s.selected_service_idx = (s.selected_service_idx + 1).min(max);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Ok(mut s) = state.lock() {
+                                if let Some((label, _)) =
+                                    s.services.get(s.selected_service_idx).cloned()
+                                {
+                                    s.service_switch_request = Some(label);
+                                }
+                            }
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            if let Ok(mut s) = state.lock() {
+                                if let Some(ref src) = s.mot_preview_path.clone() {
+                                    let ext = if src.ends_with(".png") { "png" } else { "jpg" };
+                                    let dest = s
+                                        .mot_filename
+                                        .clone()
+                                        .unwrap_or_else(|| format!("mot_{}.{}", s.mot_count, ext));
+                                    s.save_message = match std::fs::copy(src, &dest) {
+                                        Ok(_) => format!("Saved: {}", dest),
+                                        Err(e) => format!("Save failed: {}", e),
+                                    };
+                                } else {
+                                    s.save_message = "No image available".to_string();
+                                }
+                                save_message_until = Some(Instant::now() + Duration::from_secs(4));
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -274,13 +427,26 @@ fn spawn_dab_tui(
 }
 
 fn draw_tui_image(path: &str, area: Rect) {
+    // Layout inside right panel (with border):
+    //   row 0: top border
+    //   row 1: IQ bar
+    //   row 2: rates
+    //   row 3: blank
+    //   row 4: service name
+    //   row 5: DLS
+    //   row 6: blank
+    //   row 7: MOT info
+    //   row 8+: image area
+    //   row last: bottom border
+    let image_y_offset = 8u16;
+    let overhead = image_y_offset + 1; // +1 for bottom border
     let cfg = viuer::Config {
         absolute_offset: true,
         x: area.x.saturating_add(1),
-        y: area.y.saturating_add(4) as i16,
+        y: area.y.saturating_add(image_y_offset) as i16,
         restore_cursor: false,
-        width: Some(area.width.saturating_sub(2) as u32),
-        height: Some(area.height.saturating_sub(5) as u32),
+        width: None, // let viuer calculate width to preserve aspect ratio
+        height: Some(area.height.saturating_sub(overhead) as u32),
         transparent: true,
         premultiplied_alpha: false,
         truecolor: true,
@@ -288,6 +454,13 @@ fn draw_tui_image(path: &str, area: Rect) {
         use_iterm: false,
     };
     let _ = viuer::print_from_file(path, &cfg);
+}
+
+fn level_bar(value: f32, min_val: f32, max_val: f32, width: usize) -> String {
+    let clamped = value.clamp(min_val, max_val);
+    let filled = ((clamped - min_val) / (max_val - min_val) * width as f32) as usize;
+    let filled = filled.min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 fn one_line(input: &str, max_len: usize) -> String {
@@ -537,11 +710,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open IQ source (file or live SDR URI)
     // - stdin/file: use --sample-rate when provided
-    // - airspy:// default: 6.0 MS/s (then resample to 2.048 MS/s)
+    // - airspy://: 3.0 MS/s IQ; set_sample_rate_hz(3M, iq_mode=true) doubles the value sent to
+    //   firmware → 6000 kHz hardware real rate; rs-spy IqConverter halves to 3 Msps complex IQ.
+    //   (welle.io uses 4096k with libairspy FLOAT32_IQ which does NOT decimate — that approach
+    //   requires 4096 kHz firmware support, not in [6M, 3M] for Airspy Mini)
     // - others default: 2.048 MS/s
     let default_input_rate = cli.sample_rate.unwrap_or_else(|| {
         if source.starts_with("airspy://") {
-            6_000_000
+            3_000_000
         } else {
             constants::SAMPLE_RATE
         }
@@ -611,7 +787,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_state = Arc::new(Mutex::new(TuiState {
-        source: cli.source.clone().unwrap_or_default(),
         channel: cli
             .channel
             .clone()
@@ -619,11 +794,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         center_freq_hz: center_freq,
         input_rate_hz: input_sample_rate,
         output_rate_hz: constants::SAMPLE_RATE,
-        status: if tui_enabled && !keyboard_available {
-            "stdin piped: q/esc disabled; use Ctrl-C".to_string()
-        } else {
-            "starting".to_string()
-        },
+        iq_level_dbfs: -60.0,
+        status: "starting".to_string(),
         ..Default::default()
     }));
     let _tui_guard = if tui_enabled {
@@ -682,7 +854,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut first_pcm_logged = false;
     let mut audio_primed_logged = false;
 
-    let _device = if decoding_service && !cli.no_audio {
+    let _device = if !cli.no_audio {
         let config = OutputDeviceParameters {
             channels_count: 2, // DAB+ HE-AAC v2 typically outputs stereo
             sample_rate: AUDIO_RATE,
@@ -742,10 +914,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let mut main_loop_iter = 0usize;
     while app_running.load(Ordering::Relaxed) {
         let Some(chunk) = source.next_chunk().await else {
+            info!("stream ended");
             break;
         };
+        main_loop_iter += 1;
+        if main_loop_iter <= 10 {
+            debug!(
+                iter = main_loop_iter,
+                samples = chunk.as_ref().map(|c| c.len()).unwrap_or(0),
+                "got chunk"
+            );
+        }
         let mut samples = chunk?;
         if startup_discard_samples > 0 {
             if samples.len() <= startup_discard_samples {
@@ -765,13 +947,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let samples = {
             let mut samples = samples;
             if let Some(ref mut resampler) = iq_resampler {
+                if main_loop_iter <= 10 {
+                    debug!(n = samples.len(), "resampling");
+                }
                 samples = resampler.process(&samples);
+                if main_loop_iter <= 10 {
+                    debug!(n = samples.len(), "resampled");
+                }
                 if samples.is_empty() {
                     continue;
                 }
             }
             samples
         };
+        if main_loop_iter <= 10 {
+            debug!(n = samples.len(), "ofdm processing");
+        }
+
+        // Update IQ level (mean power → dBFS, smoothed with EMA)
+        if tui_enabled && !samples.is_empty() {
+            let mean_power =
+                samples.iter().map(|s| s.norm_sqr()).sum::<f32>() / samples.len() as f32;
+            let dbfs = if mean_power > 0.0 {
+                10.0 * mean_power.log10()
+            } else {
+                -120.0
+            };
+            if let Ok(mut s) = tui_state.try_lock() {
+                s.iq_level_dbfs = s.iq_level_dbfs * 0.7 + dbfs * 0.3;
+            }
+        }
+
         let frames = ofdm_processor.process(&samples);
 
         for frame in &frames {
@@ -779,9 +985,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             frame_count += 1;
-            if let Ok(mut s) = tui_state.try_lock() {
-                s.ofdm_frames = frame_count;
-            }
 
             // DQPSK decode all symbols
             let soft_bits = ofdm::decoder::dqpsk_decode(&frame.symbols);
@@ -824,13 +1027,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fib_count += 1;
                     ensemble.parse_fib(fib);
                 }
+                if frame_count <= 5 || frame_count % 50 == 0 {
+                    debug!(
+                        frame = frame_count,
+                        fibs_total = fib_count,
+                        fibs_this = fibs.len(),
+                        "FIC"
+                    );
+                }
                 if let Ok(mut s) = tui_state.try_lock() {
-                    s.fibs = fib_count;
                     s.status = if fib_count > 0 {
                         "sync + FIC OK".to_string()
                     } else {
                         "OFDM sync only".to_string()
                     };
+                    // Ensemble name
+                    if s.ensemble_name.is_empty() {
+                        if let Some(name) = &ensemble.ensemble_label {
+                            s.ensemble_name = name.clone();
+                        }
+                    }
+                    // Services list: rebuild when count changes
+                    if s.services.len() != ensemble.services.len() {
+                        let mut list: Vec<(String, Option<u16>)> = ensemble
+                            .services
+                            .values()
+                            .filter_map(|svc| {
+                                let label = svc.label.clone()?;
+                                let bitrate = svc
+                                    .subchannel_id
+                                    .and_then(|sid| ensemble.subchannels.get(&sid))
+                                    .map(|sub| sub.bitrate);
+                                Some((label.trim().to_string(), bitrate))
+                            })
+                            .collect();
+                        list.sort_by(|a, b| a.0.cmp(&b.0));
+                        // Keep cursor on the active service
+                        if !s.service.is_empty() {
+                            if let Some(idx) = list
+                                .iter()
+                                .position(|(l, _)| l.eq_ignore_ascii_case(&s.service))
+                            {
+                                s.selected_service_idx = idx;
+                            }
+                        }
+                        s.services = list;
+                    }
                 }
             }
 
@@ -846,7 +1088,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(label = %label.trim(), "Resolved service label");
                 announced_service_label = true;
                 if let Ok(mut s) = tui_state.try_lock() {
-                    s.service = label.trim().to_string();
+                    let trimmed = label.trim().to_string();
+                    if let Some(idx) = s
+                        .services
+                        .iter()
+                        .position(|(l, _)| l.eq_ignore_ascii_case(&trimmed))
+                    {
+                        s.selected_service_idx = idx;
+                    }
+                    s.service = trimmed;
                 }
             }
 
@@ -883,15 +1133,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Service switch request from TUI Enter key
+            if tui_enabled && ensemble.has_services() {
+                let switch_to = tui_state
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut s| s.service_switch_request.take());
+                if let Some(ref label) = switch_to {
+                    ensemble.resolve_services();
+                    if let Some((new_handler, bitrate)) = try_init_msc(&ensemble, label) {
+                        msc_handler = Some(new_handler);
+                        dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
+                        audio_primed.store(false, Ordering::Relaxed);
+                        announced_service_label = true; // suppress old --service label logic
+                        info!(service = %label, bitrate, "Switching service");
+                        if let Ok(mut s) = tui_state.try_lock() {
+                            s.service = label.clone();
+                            s.status = format!("decoding @ {} kbps", bitrate);
+                            s.dls.clear();
+                            s.mot_count = 0;
+                            s.mot_info.clear();
+                            s.mot_filename = None;
+                            s.mot_preview_path = None;
+                            s.clear_mot_image = true;
+                        }
+                    } else {
+                        warn!(service = %label, "Service switch failed: subchannel not ready yet");
+                    }
+                }
+            }
+
             // Feed MSC symbols to handler (symbols 3..74 are MSC, i.e. soft_bits[3..75])
             if let Some(ref mut handler) = msc_handler {
                 let msc_start = constants::FIC_SYMBOLS; // 3
                 let msc_end = soft_bits.len().min(75); // 75 data symbols total
                 for sym in &soft_bits[msc_start..msc_end] {
                     if let Some(decoded) = handler.feed_symbol(sym) {
-                        if let Ok(mut s) = tui_state.try_lock() {
-                            s.msc_frames = handler.frames_decoded;
-                        }
                         debug!(
                             "MSC frame {}: {} bytes, first 8: {:02X?}",
                             handler.frames_decoded,
@@ -927,11 +1204,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                         if let Ok(mut s) = tui_state.try_lock() {
                                             s.mot_count = mot_image_count;
-                                            s.mot_info = format!(
-                                                "{} bytes {}",
-                                                mot.data.len(),
-                                                mot.content_type
-                                            );
+                                            s.mot_info =
+                                                mot.content_name.clone().unwrap_or_else(|| {
+                                                    format!("{} bytes", mot.data.len())
+                                                });
+                                            s.mot_filename = Some({
+                                                let name =
+                                                    mot.content_name.clone().unwrap_or_else(|| {
+                                                        format!("mot_{}", mot_image_count)
+                                                    });
+                                                if name.contains('.') {
+                                                    name
+                                                } else {
+                                                    format!("{}.{}", name, ext)
+                                                }
+                                            });
                                             if tui_enabled {
                                                 let mut path = std::env::temp_dir();
                                                 path.push(format!(
@@ -1454,28 +1741,28 @@ fn print_services(ensemble: &fic::fib::EnsembleInfo, json: bool) {
     }
 
     if let Some(label) = &output.ensemble_label {
-        eprintln!(
+        println!(
             "Ensemble: {} (EId: 0x{:04X})",
             label,
             output.ensemble_id.unwrap_or(0)
         );
     } else if let Some(eid) = output.ensemble_id {
-        eprintln!("Ensemble: EId 0x{:04X}", eid);
+        println!("Ensemble: EId 0x{:04X}", eid);
     }
 
     if output.services.is_empty() {
-        eprintln!("No services found.");
+        println!("No services found.");
         return;
     }
 
-    eprintln!("\nServices:");
-    eprintln!(
+    println!("\nServices:");
+    println!(
         "{:<8} {:<20} {:<6} {:<10} Protection",
         "SId", "Label", "SubCh", "Bitrate"
     );
-    eprintln!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(60));
     for svc in &output.services {
-        eprintln!(
+        println!(
             "{:<8} {:<20} {:<6} {:<10} {}",
             svc.service_id,
             svc.label.as_deref().unwrap_or("(unknown)"),

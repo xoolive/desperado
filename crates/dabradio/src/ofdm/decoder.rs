@@ -2,7 +2,7 @@
 
 use crate::constants::*;
 use num_complex::Complex;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Build the frequency de-interleaving permutation table for Mode I.
 ///
@@ -114,6 +114,7 @@ pub fn dqpsk_decode(symbols: &[Vec<Complex<f32>>]) -> Vec<Vec<i8>> {
             // Print first 20 soft bits for symbol 1
             if sym_idx == 1 {
                 let first_20: Vec<i8> = soft_bits[..20].to_vec();
+                debug!(avg_abs = format!("{:.1}", avg_abs), count_high, first20 = ?first_20, "dqpsk sym=1");
                 trace!(
                     sym_idx,
                     avg_abs = format!("{:.1}", avg_abs),
@@ -122,6 +123,12 @@ pub fn dqpsk_decode(symbols: &[Vec<Complex<f32>>]) -> Vec<Vec<i8>> {
                     "DQPSK soft bit stats"
                 );
             } else {
+                debug!(
+                    sym = sym_idx,
+                    avg_abs = format!("{:.1}", avg_abs),
+                    count_high,
+                    "dqpsk"
+                );
                 trace!(
                     sym_idx,
                     avg_abs = format!("{:.1}", avg_abs),
