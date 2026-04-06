@@ -25,8 +25,9 @@
 /// assert!(output.len() >= 120 && output.len() <= 130);
 /// ```
 use num_complex::Complex;
-use std::f32::consts::PI;
 
+use super::buffer::StreamBuffer;
+use super::window::{design_fir_filter, WindowType};
 use super::DspBlock;
 
 /// A decimator that reduces the sample rate by an integer factor.
@@ -41,7 +42,7 @@ use super::DspBlock;
 pub struct Decimator {
     factor: usize,
     fir: Vec<f32>,
-    buffer: Vec<Complex<f32>>,
+    buffer: StreamBuffer<Complex<f32>>,
 }
 
 impl Decimator {
@@ -65,32 +66,12 @@ impl Decimator {
         // Design anti-aliasing filter
         let taps = 31;
         let cutoff = 0.5 / factor as f32; // Normalized cutoff (Nyquist = 0.5)
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
-
-        // Hamming-windowed sinc filter
-        for n in 0..taps {
-            let x = n as isize - mid;
-            let sinc = if x == 0 {
-                2.0 * cutoff
-            } else {
-                (2.0 * cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-            // Hamming window
-            let window = 0.54 - 0.46 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos();
-            fir.push(sinc * window);
-        }
-
-        // Normalize filter to unity gain at DC
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
+        let fir = design_fir_filter(cutoff, taps, WindowType::Hamming);
 
         Self {
             factor,
             fir,
-            buffer: Vec::new(),
+            buffer: StreamBuffer::new(),
         }
     }
 
@@ -118,30 +99,12 @@ impl Decimator {
             "Cutoff must be in range (0.0, 0.5]"
         );
 
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
-
-        // Hamming-windowed sinc filter
-        for n in 0..taps {
-            let x = n as isize - mid;
-            let sinc = if x == 0 {
-                2.0 * cutoff
-            } else {
-                (2.0 * cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-            let window = 0.54 - 0.46 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos();
-            fir.push(sinc * window);
-        }
-
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
+        let fir = design_fir_filter(cutoff, taps, WindowType::Hamming);
 
         Self {
             factor,
             fir,
-            buffer: Vec::new(),
+            buffer: StreamBuffer::new(),
         }
     }
 
@@ -173,7 +136,7 @@ impl DspBlock for Decimator {
     /// Decimated output samples (length ≈ input.len() / factor)
     fn process(&mut self, data: &[Complex<f32>]) -> Vec<Complex<f32>> {
         // Append new data to buffer
-        self.buffer.extend_from_slice(data);
+        self.buffer.push_slice(data);
 
         let taps = self.fir.len();
         let mid = taps / 2;
@@ -199,7 +162,7 @@ impl DspBlock for Decimator {
         // Keep only the samples needed for the next iteration
         // We need to keep at least `taps` samples for the filter state
         let keep = self.buffer.len().saturating_sub(mid);
-        self.buffer.drain(0..keep);
+        self.buffer.consume(keep);
 
         output
     }

@@ -1,5 +1,6 @@
 //! Complex (I/Q) sample-rate resampling utilities.
 
+use crate::dsp::buffer::StreamBuffer;
 use num_complex::Complex;
 
 const DEFAULT_TAPS: usize = 128;
@@ -69,7 +70,7 @@ impl ComplexResampler {
 struct IntegerDecimator {
     factor: u32,
     filter_taps: Vec<f32>,
-    buffer: Vec<Complex<f32>>,
+    buffer: StreamBuffer<Complex<f32>>,
 }
 
 impl IntegerDecimator {
@@ -87,12 +88,12 @@ impl IntegerDecimator {
         Ok(Self {
             factor,
             filter_taps,
-            buffer: Vec::with_capacity(8192),
+            buffer: StreamBuffer::with_capacity(8192),
         })
     }
 
     fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        self.buffer.extend_from_slice(input);
+        self.buffer.push_slice(input);
 
         let filter_len = self.filter_taps.len();
         let half_len = filter_len / 2;
@@ -111,7 +112,7 @@ impl IntegerDecimator {
 
         // Keep unconsumed samples for next call
         let consumed = (n - half_len).min(self.buffer.len());
-        self.buffer.drain(..consumed);
+        self.buffer.consume(consumed);
 
         output
     }
@@ -124,7 +125,7 @@ struct SingleStageResampler {
     step: f64,
     pos: f64,
     kernel: Vec<f32>,
-    buffer: Vec<Complex<f32>>,
+    buffer: StreamBuffer<Complex<f32>>,
 }
 
 impl SingleStageResampler {
@@ -145,7 +146,7 @@ impl SingleStageResampler {
             step,
             pos: taps as f64 / 2.0 - 1.0,
             kernel,
-            buffer: Vec::with_capacity(8192),
+            buffer: StreamBuffer::with_capacity(8192),
         })
     }
 
@@ -155,7 +156,7 @@ impl SingleStageResampler {
             return Vec::new();
         }
 
-        self.buffer.extend_from_slice(input);
+        self.buffer.push_slice(input);
         let mut output = Vec::with_capacity((input.len() as f64 / self.step).ceil() as usize + 8);
         let half = self.taps / 2;
 
@@ -191,7 +192,7 @@ impl SingleStageResampler {
         let consumed = self.pos.floor().max(0.0) as usize;
         if consumed > keep_before {
             let drop_n = consumed - keep_before;
-            self.buffer.drain(..drop_n);
+            self.buffer.consume(drop_n);
             self.pos -= drop_n as f64;
         }
 

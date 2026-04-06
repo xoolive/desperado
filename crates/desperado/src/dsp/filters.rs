@@ -18,8 +18,8 @@
 //! assert_eq!(output.len(), 100);
 //! ```
 
+use super::window::{design_fir_filter, WindowType};
 use num_complex::Complex;
-use std::f32::consts::PI;
 
 /// Finite Impulse Response (FIR) low-pass filter.
 ///
@@ -91,33 +91,8 @@ impl LowPassFir {
         assert!(taps > 0, "Number of taps must be greater than 0");
         assert!(sample_rate > 0.0, "Sample rate must be greater than 0");
 
-        let mut fir = Vec::with_capacity(taps);
-        let mid = (taps / 2) as isize;
         let norm_cutoff = cutoff_freq / (sample_rate / 2.0);
-
-        // Design windowed-sinc filter
-        for n in 0..taps {
-            let x = n as isize - mid;
-
-            // Sinc function: sinc(x) = sin(πx) / (πx), with sinc(0) = 1
-            let sinc = if x == 0 {
-                2.0 * norm_cutoff
-            } else {
-                (2.0 * norm_cutoff * PI * x as f32).sin() / (PI * x as f32)
-            };
-
-            // Blackman window: w(n) = 0.42 - 0.5*cos(2πn/N) + 0.08*cos(4πn/N)
-            let window = 0.42 - 0.5 * ((2.0 * PI * n as f32) / (taps as f32 - 1.0)).cos()
-                + 0.08 * ((4.0 * PI * n as f32) / (taps as f32 - 1.0)).cos();
-
-            fir.push(sinc * window);
-        }
-
-        // Normalize to unity gain
-        let norm: f32 = fir.iter().sum();
-        for v in fir.iter_mut() {
-            *v /= norm;
-        }
+        let fir = design_fir_filter(norm_cutoff, taps, WindowType::Blackman);
 
         Self { fir }
     }
@@ -485,7 +460,11 @@ impl ButterworthFilter {
 
 fn taps_from_order(order: usize) -> usize {
     let base = (order.max(1) * 16) + 1;
-    if base % 2 == 1 { base } else { base + 1 }
+    if base % 2 == 1 {
+        base
+    } else {
+        base + 1
+    }
 }
 
 fn fir_step(x: f64, coeffs: &[f64], state: &mut [f64], pos: &mut usize) -> f64 {

@@ -28,6 +28,8 @@
 /// - [`decimator`]: Sample rate reduction with anti-aliasing filtering
 /// - [`filters`]: Digital filter implementations (FIR low-pass, Butterworth, etc.)
 /// - [`iir`]: IIR Butterworth filters with zero-phase filtering (filtfilt)
+/// - [`window`]: Window functions for filter design (Hamming, Blackman, Hann)
+/// - [`buffer`]: Streaming buffer for sample accumulation and consumption
 ///
 /// ## Carrier and Timing Recovery
 /// - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
@@ -84,9 +86,12 @@ use num_complex::Complex;
 
 pub mod afc;
 pub mod agc;
+pub mod buffer;
+pub mod chebyshev;
 #[cfg(feature = "resampler")]
 pub mod dab_resampler;
 pub mod decimator;
+pub mod downsample;
 pub mod filters;
 pub mod iir;
 pub mod nco;
@@ -95,6 +100,7 @@ pub mod resampler;
 pub mod rotate;
 pub mod symsync;
 pub mod voracious;
+pub mod window;
 
 /// Trait for DSP blocks that process complex-valued signals.
 ///
