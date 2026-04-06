@@ -511,6 +511,8 @@ pub struct RdsParser {
 /// Extracted station metadata from RDS group 0A/0B
 #[derive(Debug, Clone, Default)]
 pub struct StationInfo {
+    /// Program Identification code (unique 16-bit identifier for FM station)
+    pub pi: u16,
     /// Traffic Program flag (TP)
     pub is_traffic_program: bool,
     /// Traffic Announcement flag (TA)
@@ -638,12 +640,17 @@ impl RdsParser {
         }
     }
 
-    /// Get the station metadata (TP, TA, PTY, DI, AF list)
-    pub fn station_info(&self) -> &StationInfo {
-        &self.station_info
-    }
+     /// Get the station metadata (TP, TA, PTY, DI, AF list)
+     pub fn station_info(&self) -> &StationInfo {
+         &self.station_info
+     }
 
-    /// Get the program type name (PTY)
+     /// Get the Program Identification (PI) code - a unique 16-bit identifier for FM station
+     pub fn program_id(&self) -> u16 {
+         self.station_info.pi
+     }
+
+     /// Get the program type name (PTY)
     pub fn program_type_name(&self) -> &str {
         PTY_NAMES[self.station_info.program_type as usize]
     }
@@ -1020,16 +1027,17 @@ impl RdsParser {
         }
     }
 
-    /// Process a full 4-block group (datas array: block1..block4 data words).
-    /// block_valid indicates which blocks passed CRC (like redsea's group.has()).
-    pub(super) fn handle_group(&mut self, datas: [u16; 4], block_valid: [bool; 4]) {
-        self.groups_decoded += 1;
+     /// Process a full 4-block group (datas array: block1..block4 data words).
+     /// block_valid indicates which blocks passed CRC (like redsea's group.has()).
+     pub(super) fn handle_group(&mut self, datas: [u16; 4], block_valid: [bool; 4]) {
+         self.groups_decoded += 1;
 
-        // block 1 is PI (program identification)
-        let pi = datas[0];
-        let block2 = datas[1];
-        let block3 = datas[2];
-        let block4 = datas[3];
+         // block 1 is PI (program identification)
+         let pi = datas[0];
+         self.station_info.pi = pi; // Store PI for later retrieval
+         let block2 = datas[1];
+         let block3 = datas[2];
+         let block4 = datas[3];
 
         // Convenience flags for block validity (like redsea's group.has(BLOCK3), etc.)
         let has_block3 = block_valid[2];
@@ -1762,9 +1770,9 @@ impl RdsParser {
         }
         // Add alternative frequencies if any
         if !self.station_info.af_list.is_empty() {
-            let af_strs: Vec<String> = self
-                .station_info
-                .af_list
+            let mut af_sorted = self.station_info.af_list.clone();
+            af_sorted.sort_unstable();
+            let af_strs: Vec<String> = af_sorted
                 .iter()
                 .map(|&f| format!("{:.1}", f as f64 / 100.0))
                 .collect();

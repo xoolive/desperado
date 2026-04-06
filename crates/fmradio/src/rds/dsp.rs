@@ -259,7 +259,9 @@ impl RdsResamplerCustom {
             let expected_delta = 2.0 * std::f64::consts::PI * 19000.0 / self.input_rate as f64;
             trace!(
                 "[RDS-PILOT-DBG] avg_delta: {:.5}, expected: {:.5}, measured_freq: {:.1} Hz",
-                avg_delta, expected_delta, measured_freq
+                avg_delta,
+                expected_delta,
+                measured_freq
             );
         }
 
@@ -446,9 +448,9 @@ impl RdsDecoder {
         // The NCO runs at the DECIMATED rate (7125 Hz) for phase tracking at symbol rate
         let decimated_rate = 7125.0_f64;
         let mut nco = Nco::new(0.0, decimated_rate); // Zero frequency for IQ path
-        // PLL bandwidth for phase tracking (at 7125 Hz rate, 2375 symbol rate)
-        // Use ~2 Hz effective bandwidth for stable tracking
-        // At symbol rate ~2375 Hz, we update every ~3 samples, so effective = nominal * (2375/7125) / 3 ≈ nominal * 0.11
+                                                     // PLL bandwidth for phase tracking (at 7125 Hz rate, 2375 symbol rate)
+                                                     // Use ~2 Hz effective bandwidth for stable tracking
+                                                     // At symbol rate ~2375 Hz, we update every ~3 samples, so effective = nominal * (2375/7125) / 3 ≈ nominal * 0.11
         nco.set_pll_bandwidth(20.0, decimated_rate); // ~2.2 Hz effective at symbol rate
 
         debug!("[RDS-DSP] NCO: freq=0 Hz (IQ path), PLL bandwidth=20Hz (~2Hz effective)");
@@ -737,7 +739,10 @@ impl RdsDecoder {
                 if self.debug_counter % 30000 < 200 && old_polarity != self.biphase_polarity {
                     trace!(
                         "[RDS-BIPH-CLK] even: {:.1}, odd: {:.1}, polarity: {} -> {}",
-                        even_sum, odd_sum, old_polarity, self.biphase_polarity
+                        even_sum,
+                        odd_sum,
+                        old_polarity,
+                        self.biphase_polarity
                     );
                 }
             }
@@ -763,7 +768,9 @@ impl RdsDecoder {
                 }
                 trace!(
                     "[RDS-BIPH] diff_product: {:+.3}, biph_bit: {}, Δphase: {:+.1}°",
-                    diff_product, biphase_bit, phase_diff
+                    diff_product,
+                    biphase_bit,
+                    phase_diff
                 );
             }
 
@@ -976,7 +983,10 @@ impl RdsDecoder {
                     let biphase_mag = (biphase_i * biphase_i + biphase_q * biphase_q).sqrt();
                     trace!(
                         "[RDS-BIPH-IQ] biphase_i: {:.3}, biphase_q: {:.3}, mag: {:.3}, bit: {}",
-                        biphase_i, biphase_q, biphase_mag, biphase_bit
+                        biphase_i,
+                        biphase_q,
+                        biphase_mag,
+                        biphase_bit
                     );
                 }
 
@@ -1001,6 +1011,10 @@ impl RdsDecoder {
 
     pub fn clock_time(&self) -> Option<super::ClockTimeInfo> {
         self.rds_parser.station_info().clock_time.clone()
+    }
+
+    pub fn program_id(&self) -> u16 {
+        self.rds_parser.program_id()
     }
 
     pub fn program_type(&self) -> String {
@@ -1033,6 +1047,16 @@ impl RdsDecoder {
             .iter()
             .find(|&&f| (1..=204).contains(&f))
             .map(|&f| u32::from(f) * 10_000) // Convert to Hz
+    }
+
+    /// Return all alternative frequencies as a Vec<u32> in Hz
+    pub fn alt_frequencies(&self) -> Vec<u32> {
+        self.rds_parser
+            .station_info()
+            .af_list
+            .iter()
+            .map(|&f| u32::from(f) * 10_000) // Convert to Hz
+            .collect()
     }
 
     /// Process accumulated bits through the RDS parser and display results

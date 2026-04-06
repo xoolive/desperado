@@ -156,19 +156,18 @@ struct TuiState {
     mode: &'static str,
     source: String,
     center_freq_hz: u32,
-    alt_freq_hz: Option<u32>,
     sample_rate_hz: u32,
     mpx_rate_hz: f32,
     iq_level_dbfs: f32,
     audio_buf_fill: usize,
     rds_ps: String,
     rds_rt: String,
+    rds_pi: u16,
+    rds_af_list: Vec<u32>,
     rds_total_blocks: u64,
     rds_valid_blocks: u64,
     rds_groups: u64,
-    rds_language: String,
     rds_ct: String,
-    program_type: String,
     /// None = auto gain, Some(db) = manual gain in dB
     gain: Option<f64>,
 }
@@ -223,12 +222,22 @@ fn spawn_inline_tui(
                     let ps = one_line(&s.rds_ps, inner.saturating_sub(10));
                     let rt = one_line(&s.rds_rt, inner.saturating_sub(10));
                     let time = one_line(&s.rds_ct, inner.saturating_sub(10));
-                    let language = one_line(&s.rds_language, inner.saturating_sub(10));
-                    let program_type = one_line(&s.program_type, inner.saturating_sub(10));
-                    let alt_freq_str = s
-                        .alt_freq_hz
-                        .map(|f| format!("{:.1} MHz", f as f64 / 1_000_000.0))
-                        .unwrap_or_else(|| "—".to_string());
+                    let pi_str = if s.rds_pi > 0 {
+                        format!("0x{:04X}", s.rds_pi)
+                    } else {
+                        "—".to_string()
+                    };
+                    let af_list_str = if s.rds_af_list.is_empty() {
+                        "—".to_string()
+                    } else {
+                        let mut sorted_af = s.rds_af_list.clone();
+                        sorted_af.sort_unstable();
+                        sorted_af
+                            .iter()
+                            .map(|&f| format!("{:.1}", f as f64 / 1_000_000.0))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     let gain_str = match s.gain {
                         None => "auto".to_string(),
                         Some(db) => format!("{:.1} dB", db),
@@ -242,10 +251,9 @@ fn spawn_inline_tui(
                         Line::from(""),
                         Line::from(format!(" RDS PS: {}", ps)),
                         Line::from(format!(" RDS RT: {}", rt)),
+                        Line::from(format!(" RDS PI: {}", pi_str)),
                         Line::from(format!(" RDS Clock: {}", time)),
-                        Line::from(format!(" RDS Program Type: {}", program_type)),
-                        Line::from(format!(" RDS Language: {}", language)),
-                        Line::from(format!(" RDS Alt Freq: {}", alt_freq_str)),
+                        Line::from(format!(" RDS AF List: {}", af_list_str)),
                         Line::from(""),
                         Line::from(" Metrics:"),
                         Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
@@ -472,25 +480,24 @@ async fn main() -> desperado::Result<()> {
         None
     };
 
-    let tui_state = Arc::new(Mutex::new(TuiState {
-        mode: if initial_stereo { "stereo" } else { "mono" },
-        source: args.source.clone(),
-        center_freq_hz: args.center_freq.0,
-        alt_freq_hz: None,
-        sample_rate_hz: args.sample_rate_hz(),
-        mpx_rate_hz: 0.0,
-        iq_level_dbfs: -120.0,
-        audio_buf_fill: 0,
-        rds_ps: String::new(),
-        rds_rt: String::new(),
-        rds_total_blocks: 0,
-        rds_valid_blocks: 0,
-        rds_groups: 0,
-        program_type: String::new(),
-        rds_ct: String::new(),
-        rds_language: String::new(),
-        gain: args.gain.map(|g| g as f64 / 10.0),
-    }));
+      let tui_state = Arc::new(Mutex::new(TuiState {
+          mode: if initial_stereo { "stereo" } else { "mono" },
+          source: args.source.clone(),
+          center_freq_hz: args.center_freq.0,
+          sample_rate_hz: args.sample_rate_hz(),
+          mpx_rate_hz: 0.0,
+          iq_level_dbfs: -120.0,
+          audio_buf_fill: 0,
+          rds_ps: String::new(),
+          rds_rt: String::new(),
+          rds_pi: 0,
+          rds_af_list: Vec::new(),
+          rds_total_blocks: 0,
+          rds_valid_blocks: 0,
+          rds_groups: 0,
+          rds_ct: String::new(),
+          gain: args.gain.map(|g| g as f64 / 10.0),
+      }));
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_thread = if args.tui {
         let can_hard_retune =
@@ -977,6 +984,8 @@ async fn run_stereo(
                                 s.center_freq_hz = desired_center;
                                 s.rds_ps.clear();
                                 s.rds_rt.clear();
+                                s.rds_pi = 0;
+                                s.rds_af_list.clear();
                                 s.rds_total_blocks = 0;
                                 s.rds_valid_blocks = 0;
                                 s.rds_groups = 0;
@@ -1094,30 +1103,29 @@ async fn run_stereo(
         let deem_l = deemphasis_l.process(&left);
         let deem_r = deemphasis_r.process(&right);
 
-        // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
-        // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
-        let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
-        if !rds_i.is_empty() {
-            rds.process_iq(&rds_i, &rds_q);
-            if let Some(state) = &tui_state
-                && let Ok(mut s) = state.lock()
-            {
-                let (total, valid, groups) = rds.stats();
-                s.rds_total_blocks = total;
-                s.rds_valid_blocks = u64::from(valid);
-                s.rds_groups = u64::from(groups);
-                s.rds_ps = rds.station_name().unwrap_or_default();
-                s.rds_rt = rds.radio_text().unwrap_or_default();
-                s.rds_ct = rds
-                    .clock_time()
-                    .map(|t| format!("{:}", t))
-                    .unwrap_or_default();
-                s.rds_language = rds.language().unwrap_or_default();
-                s.program_type = rds.program_type();
-                s.alt_freq_hz = rds.alt_frequency();
-                s.mode = if stereo_on { "stereo" } else { "mono" };
-            }
-        }
+         // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
+         // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
+         let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
+          if !rds_i.is_empty() {
+              rds.process_iq(&rds_i, &rds_q);
+              if let Some(state) = &tui_state
+                  && let Ok(mut s) = state.lock()
+              {
+                  let (total, valid, groups) = rds.stats();
+                  s.rds_total_blocks = total;
+                  s.rds_valid_blocks = u64::from(valid);
+                  s.rds_groups = u64::from(groups);
+                  s.rds_ps = rds.station_name().unwrap_or_default();
+                  s.rds_rt = rds.radio_text().unwrap_or_default();
+                   s.rds_pi = rds.program_id();
+                   s.rds_af_list = rds.alt_frequencies();
+                   s.rds_ct = rds
+                       .clock_time()
+                       .map(|t| format!("{:}", t))
+                       .unwrap_or_default();
+                   s.mode = if stereo_on { "stereo" } else { "mono" };
+              }
+         }
 
         // Interleave stereo
         let mut interleaved = Vec::with_capacity(deem_l.len() * 2);
