@@ -64,10 +64,19 @@ The following features are only needed for examples:
 - **`waterfall`**: Waterfall plot visualization example
 - **`audio`**: FM demodulation examples with audio output
 
-## Projects using desperado
+## Dependent projects
+
+This Desperado workspace includes several specialized crates built on top of the core I/Q streaming library:
+
+- **[fmradio](crates/fmradio)** - FM radio receiver with RDS data decoding and adaptive audio resampling
+- **[dabradio](crates/dabradio)** - DAB/DAB+ digital radio decoder with OFDM and AAC audio
+- **[voracious](crates/voracious)** - VOR/ILS/DME aviation navigation signal decoder
+
+External projects that depend on Desperado for I/Q streaming:
 
 - **[jet1090](https://github.com/xoolive/jet1090)** - Real-time ADS-B decoder for tracking aircraft
-- **[ship162](https://github.com/xoolive/ship162)** - AIS decoder for tracking maritime vessels
+- **[ship162](https://github.com/xoolive/ship162)** - Real-time AIS decoder for tracking maritime vessels
+- **[datalink](https://github.com/xoolive/datalink)** - VDL2 and ARINC 629 aviation datalink decoder
 
 If you're using Desperado in your project, feel free to open a PR to add it here!
 
