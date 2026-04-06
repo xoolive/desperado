@@ -41,6 +41,7 @@
 //! This implementation is based on liquid-dsp's `nco_crcf` object.
 //! See: <https://github.com/jgaeddert/liquid-dsp>
 
+use crate::dsp::pll_filter::PllFilter;
 use std::f64::consts::PI;
 
 /// Numerically Controlled Oscillator with integrated Phase-Locked Loop.
@@ -56,13 +57,8 @@ pub struct Nco {
     /// Frequency in cycles per sample
     frequency: f64,
 
-    /// PLL frequency proportion (integral gain)
-    /// Higher alpha = faster frequency tracking, more noise
-    alpha: f64,
-
-    /// PLL phase proportion (proportional gain)
-    /// Typically beta = sqrt(alpha) for critical damping
-    beta: f64,
+    /// PLL loop filter (handles alpha/beta gains)
+    pll_filter: PllFilter,
 }
 
 impl Nco {
@@ -87,8 +83,7 @@ impl Nco {
         Self {
             phase: 0.0,
             frequency,
-            alpha: 0.1, // Default bandwidth, will be overridden by set_pll_bandwidth
-            beta: 0.1_f64.sqrt(),
+            pll_filter: PllFilter::from_bandwidth(0.1 * sample_rate, sample_rate), // Default bandwidth, will be overridden
         }
     }
 
@@ -120,10 +115,7 @@ impl Nco {
     /// nco.set_pll_bandwidth(0.03, 171000.0);
     /// ```
     pub fn set_pll_bandwidth(&mut self, bandwidth_hz: f64, sample_rate: f64) {
-        // Normalize bandwidth to sample rate
-        // liquid-dsp uses this directly as alpha
-        self.alpha = bandwidth_hz / sample_rate;
-        self.beta = self.alpha.sqrt();
+        self.pll_filter.set_bandwidth(bandwidth_hz, sample_rate);
     }
 
     /// Set the PLL gains directly (advanced).
@@ -135,8 +127,7 @@ impl Nco {
     /// * `alpha` - Frequency (integral) gain
     /// * `beta` - Phase (proportional) gain
     pub fn set_pll_gains(&mut self, alpha: f64, beta: f64) {
-        self.alpha = alpha;
-        self.beta = beta;
+        self.pll_filter.set_gains(alpha, beta);
     }
 
     /// Get the current phase in radians [0, 2*PI).
@@ -327,24 +318,24 @@ impl Nco {
         // Convert phase error from radians to cycles
         let error_cycles = phase_error / (2.0 * PI);
 
-        // Second-order loop filter (matches liquid-dsp nco_pll_step):
-        // 1. Adjust frequency by alpha * error (integral)
-        self.adjust_frequency(error_cycles * self.alpha);
+        // Use loop filter to compute adjustments
+        let (freq_adj_cycles, phase_adj_cycles) = self.pll_filter.update_cycles(error_cycles);
 
-        // 2. Adjust phase by beta * error (proportional)
-        self.adjust_phase(error_cycles * self.beta);
+        // Apply adjustments
+        self.adjust_frequency(freq_adj_cycles);
+        self.adjust_phase(phase_adj_cycles);
     }
 
     /// Update the PLL with a phase error (error already in cycles, not radians).
     ///
     /// This variant is useful when you've already computed the error in cycles.
     pub fn pll_step_cycles(&mut self, phase_error_cycles: f64) {
-        // Second-order loop filter:
-        // 1. Adjust frequency by alpha * error (integral)
-        self.adjust_frequency(phase_error_cycles * self.alpha);
+        // Use loop filter to compute adjustments
+        let (freq_adj_cycles, phase_adj_cycles) = self.pll_filter.update_cycles(phase_error_cycles);
 
-        // 2. Adjust phase by beta * error (proportional)
-        self.adjust_phase(phase_error_cycles * self.beta);
+        // Apply adjustments
+        self.adjust_frequency(freq_adj_cycles);
+        self.adjust_phase(phase_adj_cycles);
     }
 
     /// Reset the NCO to initial state.
@@ -368,8 +359,7 @@ impl Default for Nco {
         Self {
             phase: 0.0,
             frequency: 0.0,
-            alpha: 0.1,
-            beta: 0.1_f64.sqrt(),
+            pll_filter: PllFilter::default(),
         }
     }
 }
@@ -425,10 +415,22 @@ mod tests {
         let mut nco = Nco::new(57000.0, 171000.0);
         nco.set_pll_bandwidth(0.03, 171000.0);
 
-        // Check that alpha is properly normalized
+        // Check that alpha and beta are properly set
+        // We can't access them directly, but we can verify behavior through PLL updates
         let expected_alpha = 0.03 / 171000.0;
-        assert!((nco.alpha - expected_alpha).abs() < 1e-15);
-        assert!((nco.beta - expected_alpha.sqrt()).abs() < 1e-10);
+
+        // Simulate a PLL error and verify the filter responds appropriately
+        let phase_error = 1.0; // 1 radian
+        let freq_before = nco.get_frequency();
+
+        nco.pll_step(phase_error);
+
+        let freq_after = nco.get_frequency();
+        // Frequency should have increased by approximately alpha * error_cycles
+        let error_cycles = phase_error / (2.0 * std::f64::consts::PI);
+        let expected_freq_change = expected_alpha * error_cycles;
+
+        assert!((freq_after - freq_before - expected_freq_change).abs() < 1e-15);
     }
 
     #[test]

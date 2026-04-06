@@ -34,6 +34,7 @@
 /// ## Carrier and Timing Recovery
 /// - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
 /// - [`symsync`]: Polyphase Symbol Synchronizer for timing recovery
+/// - [`pll_filter`]: Reusable second-order PLL loop filter (used by nco and symsync)
 /// - [`agc`]: Automatic Gain Control for amplitude normalization
 ///
 /// ## Advanced Features
@@ -95,6 +96,7 @@ pub mod downsample;
 pub mod filters;
 pub mod iir;
 pub mod nco;
+pub mod pll_filter;
 #[cfg(feature = "resampler")]
 pub mod resampler;
 pub mod rotate;
