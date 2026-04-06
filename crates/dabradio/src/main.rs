@@ -1047,8 +1047,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             s.ensemble_name = name.clone();
                         }
                     }
-                    // Services list: rebuild when count changes
-                    if s.services.len() != ensemble.services.len() {
+                    // Services list: rebuild when the labeled-service count changes.
+                    // Compare against labeled services only (same filter as the list
+                    // itself) so unlabeled entries don't cause a perpetual rebuild
+                    // that would override the user's cursor position every frame.
+                    let labeled_count = ensemble
+                        .services
+                        .values()
+                        .filter(|svc| svc.label.is_some())
+                        .count();
+                    if s.services.len() != labeled_count {
                         let mut list: Vec<(String, Option<u16>)> = ensemble
                             .services
                             .values()
@@ -1062,16 +1070,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .collect();
                         list.sort_by(|a, b| a.0.cmp(&b.0));
-                        // Keep cursor on the active service
-                        if !s.service.is_empty() {
-                            if let Some(idx) = list
-                                .iter()
-                                .position(|(l, _)| l.eq_ignore_ascii_case(&s.service))
-                            {
-                                s.selected_service_idx = idx;
-                            }
-                        }
                         s.services = list;
+                        // Cursor is set by service-start paths; don't touch it here.
                     }
                 }
             }
