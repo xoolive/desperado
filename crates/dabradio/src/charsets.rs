@@ -255,11 +255,43 @@ mod tests {
     }
 
     #[test]
-    fn test_ebu_latin_control_chars_to_space() {
-        // Control characters 0x00-0x1F should map to space
-        for b in 0x00..=0x1Fu8 {
-            assert_eq!(ebu_to_char(b), ' ', "byte 0x{:02X} should be space", b);
-        }
-        assert_eq!(ebu_to_char(0x7F), ' ');
+    fn test_ebu_latin_extended_chars() {
+        // EBU Latin bytes 0x00-0x1F are NOT ASCII control characters —
+        // they are defined printable characters per ETSI TS 101 756, Table 1.
+        // Only 0x00, 0x0A, 0x0B, 0x1F are "reserved" (mapped to U+FFFD).
+        assert_eq!(ebu_to_char(0x00), '\u{FFFD}'); // reserved
+        assert_eq!(ebu_to_char(0x01), 'Ę');
+        assert_eq!(ebu_to_char(0x02), 'Į');
+        assert_eq!(ebu_to_char(0x03), 'Ų');
+        assert_eq!(ebu_to_char(0x04), 'Ă');
+        assert_eq!(ebu_to_char(0x05), 'Ė');
+        assert_eq!(ebu_to_char(0x06), 'Ď');
+        assert_eq!(ebu_to_char(0x07), 'Ș');
+        assert_eq!(ebu_to_char(0x08), 'Ț');
+        assert_eq!(ebu_to_char(0x09), 'Ċ');
+        assert_eq!(ebu_to_char(0x0A), '\u{FFFD}'); // reserved
+        assert_eq!(ebu_to_char(0x0B), '\u{FFFD}'); // reserved
+        assert_eq!(ebu_to_char(0x0C), 'Ġ');
+        assert_eq!(ebu_to_char(0x0D), 'Ĺ');
+        assert_eq!(ebu_to_char(0x0E), 'Ż');
+        assert_eq!(ebu_to_char(0x0F), 'Ń');
+        assert_eq!(ebu_to_char(0x10), 'ą');
+        assert_eq!(ebu_to_char(0x11), 'ę');
+        assert_eq!(ebu_to_char(0x12), 'į');
+        assert_eq!(ebu_to_char(0x13), 'ų');
+        assert_eq!(ebu_to_char(0x14), 'ă');
+        assert_eq!(ebu_to_char(0x15), 'ė');
+        assert_eq!(ebu_to_char(0x16), 'ď');
+        assert_eq!(ebu_to_char(0x17), 'ș');
+        assert_eq!(ebu_to_char(0x18), 'ț');
+        assert_eq!(ebu_to_char(0x19), 'ċ');
+        assert_eq!(ebu_to_char(0x1A), 'Ň');
+        assert_eq!(ebu_to_char(0x1B), 'Ě');
+        assert_eq!(ebu_to_char(0x1C), 'ġ');
+        assert_eq!(ebu_to_char(0x1D), 'ĺ');
+        assert_eq!(ebu_to_char(0x1E), 'ż');
+        assert_eq!(ebu_to_char(0x1F), '\u{FFFD}'); // reserved
+        // 0x7F is also a defined character in EBU Latin, not a control char
+        assert_eq!(ebu_to_char(0x7F), 'Ħ');
     }
 }

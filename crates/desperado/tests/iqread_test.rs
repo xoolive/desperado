@@ -2,25 +2,30 @@
 
 use desperado::{IqFormat, IqSource};
 use std::fs;
+use tempfile::NamedTempFile;
+
+/// Helper to create a temp file with the given bytes and return (NamedTempFile, path String).
+/// The NamedTempFile must be kept alive for the duration of the test.
+fn temp_iq(data: &[u8]) -> (NamedTempFile, String) {
+    let f = NamedTempFile::new().expect("Failed to create temp file");
+    let path = f.path().to_str().unwrap().to_string();
+    fs::write(&path, data).expect("Failed to write test file");
+    (f, path)
+}
 
 #[test]
 fn test_iqformat_bytes_per_sample_cu8() {
     // Cu8 format: 2 bytes per sample (1 byte I, 1 byte Q)
     let format = IqFormat::Cu8;
-    // Note: bytes_per_sample is private, so we test indirectly through file reads
-    // Each sample should consume 2 bytes from the buffer
 
     let samples = vec![127, 127, 128, 128, 255, 255]; // 3 samples
-    let temp_path = "/tmp/test_cu8_bps.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 3, format)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 3, format)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
     assert_eq!(chunk.len(), 3, "Should read exactly 3 samples from 6 bytes");
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -29,16 +34,13 @@ fn test_iqformat_bytes_per_sample_cs8() {
     let format = IqFormat::Cs8;
 
     let samples = vec![0, 0, 127, 127]; // 2 samples
-    let temp_path = "/tmp/test_cs8_bps.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 2, format)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 2, format)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
     assert_eq!(chunk.len(), 2, "Should read exactly 2 samples from 4 bytes");
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -47,16 +49,13 @@ fn test_iqformat_bytes_per_sample_cs16() {
     let format = IqFormat::Cs16;
 
     let samples = vec![0, 0, 0, 0, 0xFF, 0x7F, 0xFF, 0x7F]; // 2 samples
-    let temp_path = "/tmp/test_cs16_bps.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 2, format)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 2, format)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
     assert_eq!(chunk.len(), 2, "Should read exactly 2 samples from 8 bytes");
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -71,10 +70,9 @@ fn test_iqformat_bytes_per_sample_cf32() {
     samples.extend_from_slice(&(-1.0f32).to_le_bytes());
     // Total: 16 bytes = 2 samples
 
-    let temp_path = "/tmp/test_cf32_bps.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 2, format)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 2, format)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
@@ -83,8 +81,6 @@ fn test_iqformat_bytes_per_sample_cf32() {
         2,
         "Should read exactly 2 samples from 16 bytes"
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -92,17 +88,18 @@ fn test_expanduser_with_tilde() {
     // Test that paths starting with ~ are expanded to home directory
     // Since expanduser() is private, we test it indirectly
 
-    // Create a test file in the actual home directory
+    // Create a test file in the actual home directory with a unique name
     let home = dirs::home_dir().expect("Could not get home directory");
-    let test_file = home.join(".desperado_test.iq");
+    let unique_name = format!(".desperado_test_{}.iq", std::process::id());
+    let test_file = home.join(&unique_name);
 
     // Write a small test file
     let samples = vec![127, 127, 128, 128]; // 2 Cu8 samples
     fs::write(&test_file, &samples).expect("Failed to write test file");
 
     // Try to open with tilde path
-    let tilde_path = "~/.desperado_test.iq";
-    let result = IqSource::from_file(tilde_path, 162_000_000, 96_000, 2, IqFormat::Cu8);
+    let tilde_path = format!("~/{}", unique_name);
+    let result = IqSource::from_file(&tilde_path, 162_000_000, 96_000, 2, IqFormat::Cu8);
 
     // Should successfully open the file
     assert!(
@@ -123,14 +120,11 @@ fn test_expanduser_with_tilde() {
 #[test]
 fn test_expanduser_without_tilde() {
     // Test that regular paths work normally
-    let temp_path = "/tmp/test_no_tilde.iq";
     let samples = vec![127, 127];
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let result = IqSource::from_file(temp_path, 162_000_000, 96_000, 1, IqFormat::Cu8);
+    let result = IqSource::from_file(&path, 162_000_000, 96_000, 1, IqFormat::Cu8);
     assert!(result.is_ok(), "Failed to open file with regular path");
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -164,11 +158,10 @@ fn test_iqread_integration_multiple_chunks() {
         }
     }
 
-    let temp_path = "/tmp/test_multi_chunk.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
     let mut iq_source = IqSource::from_file(
-        temp_path,
+        &path,
         162_000_000,
         96_000,
         10, // chunk size
@@ -196,8 +189,6 @@ fn test_iqread_integration_multiple_chunks() {
         iq_source.next().is_none(),
         "Should reach EOF after 3 chunks"
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -211,10 +202,9 @@ fn test_iqread_integration_partial_chunk() {
         samples.push(i as u8);
     }
 
-    let temp_path = "/tmp/test_partial_chunk.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 10, IqFormat::Cu8)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 10, IqFormat::Cu8)
         .expect("Failed to create IQ source");
 
     // First two chunks should be full (10 samples each)
@@ -230,8 +220,6 @@ fn test_iqread_integration_partial_chunk() {
     // The Iterator impl treats UnexpectedEof as None (end of stream)
     let result = iq_source.next();
     assert!(result.is_none(), "Partial chunk should result in EOF");
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]

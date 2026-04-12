@@ -18,7 +18,7 @@
 //! assert_eq!(output.len(), 100);
 //! ```
 
-use super::window::{design_fir_filter, WindowType};
+use super::window::{WindowType, design_fir_filter};
 use num_complex::Complex;
 
 /// Finite Impulse Response (FIR) low-pass filter.
@@ -460,11 +460,7 @@ impl ButterworthFilter {
 
 fn taps_from_order(order: usize) -> usize {
     let base = (order.max(1) * 16) + 1;
-    if base % 2 == 1 {
-        base
-    } else {
-        base + 1
-    }
+    if base % 2 == 1 { base } else { base + 1 }
 }
 
 fn fir_step(x: f64, coeffs: &[f64], state: &mut [f64], pos: &mut usize) -> f64 {

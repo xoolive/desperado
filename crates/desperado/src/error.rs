@@ -23,7 +23,7 @@ pub enum Error {
 
     /// RTL-SDR specific error (requires "rtlsdr" feature)
     #[cfg(feature = "rtlsdr")]
-    RtlSdr(rtl_sdr_rs::error::RtlsdrError),
+    RtlSdr(rs_rtl::Error),
 
     /// SoapySDR specific error (requires "soapy" feature)
     #[cfg(feature = "soapy")]
@@ -58,6 +58,8 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(err) => Some(err),
+            #[cfg(feature = "rtlsdr")]
+            Error::RtlSdr(err) => Some(err),
             #[cfg(feature = "soapy")]
             Error::SoapySdr(err) => Some(err),
             _ => None,
@@ -86,8 +88,8 @@ impl From<&str> for Error {
 }
 
 #[cfg(feature = "rtlsdr")]
-impl From<rtl_sdr_rs::error::RtlsdrError> for Error {
-    fn from(err: rtl_sdr_rs::error::RtlsdrError) -> Self {
+impl From<rs_rtl::Error> for Error {
+    fn from(err: rs_rtl::Error) -> Self {
         Error::RtlSdr(err)
     }
 }

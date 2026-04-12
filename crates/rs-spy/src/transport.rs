@@ -604,48 +604,59 @@ impl Airspy {
         Ok(())
     }
 
-    /// Set sample rate by value (Hz), matching libairspy behavior.
+    /// Set sample rate for host-side IQ output, matching libairspy behavior.
     ///
-    /// When IQ conversion is enabled in host-side processing, libairspy sends
-    /// double the requested rate (in kHz units) to firmware.
-    pub fn set_sample_rate_hz(&self, sample_rate_hz: u32, iq_mode: bool) -> Result<()> {
-        tracing::debug!(sample_rate_hz, iq_mode, "set_sample_rate_hz");
+    /// Since [`IqConverter`] halves the real sample rate (N real → N/2 complex IQ),
+    /// the hardware must run at `iq_rate_hz * 2`. This method:
+    ///
+    /// 1. Looks up `iq_rate_hz * 2` in the supported rates list (libairspy primary method)
+    /// 2. If found, uses index-based [`set_sample_rate`] (firmware-safe)
+    /// 3. If not found, falls back to sending `iq_rate_hz * 2 / 1000` kHz directly
+    ///
+    /// # Arguments
+    /// * `iq_rate_hz` - Desired IQ output rate in Hz (e.g., `3_000_000` → hardware 6 Msps)
+    ///
+    /// [`IqConverter`]: rs_spy::IqConverter
+    pub fn set_sample_rate_for_iq(&self, iq_rate_hz: u32) -> Result<()> {
+        let hardware_rate = iq_rate_hz.saturating_mul(2);
+        tracing::debug!(iq_rate_hz, hardware_rate, "set_sample_rate_for_iq");
 
+        // Primary: index-based lookup (matches libairspy's airspy_set_samplerate)
+        if let Ok(supported) = self.supported_sample_rates()
+            && let Some(idx) = supported.iter().position(|&r| r == hardware_rate)
+        {
+            tracing::debug!(hardware_rate, idx, "set_sample_rate_for_iq: using index");
+            return self.set_sample_rate(idx as u8);
+        }
+
+        // Fallback: send hardware rate in kHz directly (libairspy fallback path)
+        tracing::debug!(hardware_rate, "set_sample_rate_for_iq: kHz fallback");
         if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
-            tracing::trace!(
-                "clear_halt before set_sample_rate_hz: {:?} (may be expected)",
-                e
-            );
+            tracing::trace!("clear_halt before set_sample_rate_for_iq: {:?}", e);
         }
 
         let mut retval = [0u8; 1];
-        let mut value_hz = sample_rate_hz;
-        if value_hz >= 1_000_000 {
-            if iq_mode {
-                value_hz = value_hz.saturating_mul(2);
-            }
-            value_hz /= 1000;
-        }
+        let khz = hardware_rate / 1000;
 
         let n = self.control_in(
             0xC0,
             AirspyCommand::SetSamplerate.as_u8(),
             0,
-            value_hz as u16,
+            khz as u16,
             &mut retval,
         )?;
 
         if n < 1 {
             return Err(Error::ControlTransferFailed(
-                "SET_SAMPLERATE_HZ: no response".to_string(),
+                "SET_SAMPLERATE: no response".to_string(),
             ));
         }
 
         tracing::debug!(
-            sample_rate_hz,
-            value_hz,
+            iq_rate_hz,
+            hardware_rate,
             response = retval[0],
-            "set_sample_rate_hz: success"
+            "set_sample_rate_for_iq: success"
         );
         Ok(())
     }
@@ -1182,16 +1193,28 @@ impl Airspy {
             let dropped_ctr = Arc::clone(&dropped);
             thread::spawn(move || {
                 let mut buf = vec![0u8; buf_len];
+                let mut first = true;
                 while !stop_r.load(Ordering::Relaxed) {
                     match handle.read_bulk(&mut buf, Duration::from_millis(1000)) {
-                        Ok(0) => continue,
+                        Ok(0) => {
+                            if first {
+                                eprintln!("[rs-spy] read_bulk Ok(0)");
+                                first = false;
+                            }
+                            continue;
+                        }
                         Ok(n) => {
+                            if first {
+                                eprintln!("[rs-spy] read_bulk Ok({n})");
+                                first = false;
+                            }
                             let chunk = buf[..n].to_vec();
                             if tx.try_send(Ok(chunk)).is_err() {
                                 dropped_ctr.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
+                            eprintln!("[rs-spy] read_bulk Err: {e}");
                             // Timeout is expected on stop; only log other errors.
                             if !stop_r.load(Ordering::Relaxed) {
                                 tracing::warn!("Airspy bulk read error: {}", e);

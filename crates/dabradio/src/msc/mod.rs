@@ -516,6 +516,7 @@ mod tests {
     /// Diagnostic: run OUR OWN CIF subchannel dumps through our de-interleave + FEC.
     /// Compare with the same test using welle.io's dumps to find where data diverges.
     #[test]
+    #[ignore = "requires /tmp/dabradio_subch_cif*.bin files from a dabradio debug run"]
     fn test_our_own_cifs_through_deinterleave_and_fec() {
         let params = eep::eep_params(88, 2, 0).expect("EEP 3-A 88kbps should be valid");
         let subch_size: usize = 66 * 64; // 4224
@@ -616,6 +617,7 @@ mod tests {
     /// ~30% means the soft bits have valid convolutional structure (good OFDM/DQPSK).
     /// A metric of ~2-3% means they don't (corrupted bits).
     #[test]
+    #[ignore = "requires /tmp/dabradio_dqpsk_sym*.bin files from a dabradio debug run"]
     fn test_msc_symbol_convolutional_structure() {
         use crate::fec::{eep, viterbi};
 

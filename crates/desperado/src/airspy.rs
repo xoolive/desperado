@@ -39,6 +39,7 @@
 use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, AirspyGainStages, IqConverter, RECOMMENDED_BUFFER_SIZE};
+use tracing::{debug, error, info, warn};
 
 use crate::{Gain, GainElementName, error};
 
@@ -202,10 +203,7 @@ pub fn list_devices() -> error::Result<Vec<AirspyDeviceInfo>> {
             }
             Err(e) => {
                 // Device exists but we can't open it (permissions, busy, etc.)
-                eprintln!(
-                    "Warning: Could not open Airspy device at index {}: {}",
-                    index, e
-                );
+                warn!(index, error = %e, "Could not open Airspy device");
             }
         }
     }
@@ -329,10 +327,7 @@ fn configure_gain(
                         })?;
                     }
                     other => {
-                        eprintln!(
-                            "Warning: Airspy does not support gain element {:?}, ignoring",
-                            other
-                        );
+                        warn!(element = ?other, "Airspy does not support gain element, ignoring");
                     }
                 }
             }
@@ -367,53 +362,20 @@ pub struct AirspySdrReader {
     float_buf: Vec<f32>,
     iq_converter: IqConverter,
     packing: bool,
-    sample_layout: Option<AirspySampleLayout>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AirspySampleLayout {
-    Upper12,
-    Lower12,
-}
-
-fn convert_airspy_real_to_f32(
-    bytes: &[u8],
-    out: &mut [f32],
-    layout_hint: Option<AirspySampleLayout>,
-) -> (usize, AirspySampleLayout) {
+/// Convert raw Airspy USB bytes to f32 samples.
+///
+/// Airspy hardware stores 12-bit ADC values in the lower 12 bits of each 16-bit word
+/// (upper 4 bits are always zero). The correct formula matches libairspy's
+/// `convert_samples_float`: `(raw - 2048) * (1/2048)`.
+fn convert_airspy_real_to_f32(bytes: &[u8], out: &mut [f32]) -> usize {
     let num_samples = bytes.len() / 2;
-    let layout = if let Some(layout) = layout_hint {
-        layout
-    } else {
-        // Auto-detect layout from first chunk.
-        // Some paths expose the 12-bit sample in upper bits, others in lower bits.
-        let mut sum_upper = 0.0f32;
-        let mut sum_lower = 0.0f32;
-        let check_n = num_samples.min(4096);
-        for chunk in bytes.chunks_exact(2).take(check_n) {
-            let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
-            let upper = ((raw >> 4) as f32 - 2048.0) / 2048.0;
-            let lower = ((raw & 0x0FFF) as f32 - 2048.0) / 2048.0;
-            sum_upper += upper.abs();
-            sum_lower += lower.abs();
-        }
-        if sum_upper >= sum_lower {
-            AirspySampleLayout::Upper12
-        } else {
-            AirspySampleLayout::Lower12
-        }
-    };
-
     for (i, chunk) in bytes.chunks_exact(2).enumerate() {
         let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
-        let sample_u12 = match layout {
-            AirspySampleLayout::Upper12 => raw >> 4,
-            AirspySampleLayout::Lower12 => raw & 0x0FFF,
-        };
-        out[i] = (sample_u12 as f32 - 2048.0) / 2048.0;
+        out[i] = (raw as f32 - 2048.0) / 2048.0;
     }
-
-    (num_samples, layout)
+    num_samples
 }
 
 impl AirspySdrReader {
@@ -453,7 +415,7 @@ impl AirspySdrReader {
         // Note: sample rate setting may fail on some firmware versions before streaming starts;
         // if it fails here, we retry after start_rx().
         let mut sample_rate_set = false;
-        match device.set_sample_rate_hz(config.sample_rate, true) {
+        match device.set_sample_rate_for_iq(config.sample_rate) {
             Ok(()) => sample_rate_set = true,
             Err(_e) => {
                 // Will try again after start_rx
@@ -468,14 +430,14 @@ impl AirspySdrReader {
 
         // If sample rate wasn't set before, try now after start_rx
         if !sample_rate_set {
-            match device.set_sample_rate_hz(config.sample_rate, true) {
+            match device.set_sample_rate_for_iq(config.sample_rate) {
                 Ok(()) => {}
                 Err(e) => {
                     let supported = device.supported_sample_rates().unwrap_or_default();
                     return Err(error::Error::device(format!(
                         "Failed to set sample rate after start_rx: {}. \
                         Supported rates: {:?}. \
-                        Requested: {} Hz",
+                        Requested IQ: {} Hz",
                         e, supported, config.sample_rate
                     )));
                 }
@@ -492,7 +454,6 @@ impl AirspySdrReader {
             float_buf: vec![0.0f32; max_samples],
             iq_converter: IqConverter::new(),
             packing: config.packing,
-            sample_layout: None,
         })
     }
 
@@ -538,17 +499,11 @@ impl Iterator for AirspySdrReader {
 
                 if self.packing {
                     // TODO: Implement 12-bit unpacking for packed mode
-                    eprintln!(
-                        "Warning: 12-bit unpacking not yet implemented, data may be incorrect"
-                    );
+                    warn!("12-bit unpacking not yet implemented, data may be incorrect");
                 }
 
-                let (num_samples, layout) = convert_airspy_real_to_f32(
-                    &self.buf[..bytes_read],
-                    &mut self.float_buf,
-                    self.sample_layout,
-                );
-                self.sample_layout = Some(layout);
+                let num_samples =
+                    convert_airspy_real_to_f32(&self.buf[..bytes_read], &mut self.float_buf);
 
                 // Process through IqConverter (Fs/4 translation)
                 // This converts real samples to interleaved I/Q
@@ -678,6 +633,14 @@ impl AsyncAirspySdrReader {
 
         let device = open_device_with_selector(&cfg.device)?;
 
+        // Debug: print device info
+        if let Ok(rates) = device.supported_sample_rates() {
+            info!(rates = ?rates, "Airspy supported sample rates");
+        }
+        if let Ok((_, _, sn)) = device.board_partid_serialno() {
+            info!(serial = format!("0x{:016X}", sn), "Airspy serial number");
+        }
+
         device
             .set_freq(cfg.center_freq)
             .map_err(|e| error::Error::device(format!("Failed to set frequency: {}", e)))?;
@@ -699,7 +662,7 @@ impl AsyncAirspySdrReader {
             .map_err(|e| error::Error::device(format!("Failed to set packing: {}", e)))?;
 
         let mut sample_rate_set = false;
-        if device.set_sample_rate_hz(cfg.sample_rate, true).is_ok() {
+        if device.set_sample_rate_for_iq(cfg.sample_rate).is_ok() {
             sample_rate_set = true;
         }
 
@@ -709,7 +672,7 @@ impl AsyncAirspySdrReader {
 
         if !sample_rate_set {
             device
-                .set_sample_rate_hz(cfg.sample_rate, true)
+                .set_sample_rate_for_iq(cfg.sample_rate)
                 .map_err(|e| error::Error::device(format!("Failed to set sample rate: {}", e)))?;
         }
 
@@ -727,7 +690,7 @@ impl AsyncAirspySdrReader {
             let max_samples = RECOMMENDED_BUFFER_SIZE / 2;
             let mut float_buf = vec![0.0f32; max_samples];
             let mut iq_converter = IqConverter::new();
-            let mut sample_layout: Option<AirspySampleLayout> = None;
+            let mut chunk_count = 0usize;
 
             while let Some(chunk_res) = reader.recv() {
                 match chunk_res {
@@ -737,16 +700,33 @@ impl AsyncAirspySdrReader {
                         }
 
                         if cfg.packing {
-                            eprintln!("Warning: 12-bit unpacking not yet implemented");
+                            warn!("12-bit unpacking not yet implemented");
                         }
 
-                        let (num_samples, layout) =
-                            convert_airspy_real_to_f32(&bytes, &mut float_buf, sample_layout);
-                        sample_layout = Some(layout);
+                        let num_samples = convert_airspy_real_to_f32(&bytes, &mut float_buf);
                         let samples =
                             iq_converter.process_to_complex(&mut float_buf[..num_samples]);
-                        if tx.blocking_send(Ok(samples)).is_err() {
-                            break;
+                        chunk_count += 1;
+                        if chunk_count <= 5 {
+                            debug!(
+                                chunk = chunk_count,
+                                iq_samples = samples.len(),
+                                "Airspy sending chunk"
+                            );
+                        }
+                        match tx.try_send(Ok(samples)) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
+                                warn!(chunk = chunk_count, "Airspy channel full, blocking");
+                                if tx.blocking_send(v).is_err() {
+                                    error!("Airspy blocking_send failed, exiting");
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Airspy channel closed, exiting");
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -756,6 +736,7 @@ impl AsyncAirspySdrReader {
                     }
                 }
             }
+            debug!(chunks = chunk_count, "Airspy background thread exiting");
         });
 
         Ok(Self {

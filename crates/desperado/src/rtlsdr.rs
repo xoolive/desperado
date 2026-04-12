@@ -2,20 +2,26 @@
 //! (requires the `rtlsdr` feature)
 //!
 //! Provides synchronous and asynchronous I/Q readers for RTL-SDR devices,
-//! using the vendored `rtl_sdr_rs` crate for hardware access.
+//! using the `rs_rtl` crate (pure-Rust nusb backend) for hardware access.
+//!
+//! The rs_rtl driver keeps multiple USB bulk transfers in-flight simultaneously
+//! via nusb's endpoint queue, eliminating the inter-transfer gap that causes
+//! RTL2832U FIFO overflow at high sample rates.
 
 use futures::Stream;
 use num_complex::Complex;
-use rtl_sdr_rs::{
-    DEFAULT_ASYNC_BUF_NUMBER, DEFAULT_BUF_LENGTH, DeviceDescriptors, RtlSdr, TunerGain,
-};
 
 use crate::{Gain, IqFormat, error};
 
 /// Tokio-side bridge queue depth between the USB reader thread and the async consumer.
-/// The inner `into_async_reader` queue (DEFAULT_ASYNC_BUF_NUMBER = 15 chunks) is the
-/// real buffer; this just bridges sync → tokio.
-const BRIDGE_QUEUE_DEPTH: usize = 4;
+///
+/// The inner `rs_rtl` streaming queue (RECOMMENDED_QUEUE_DEPTH = 32 chunks) is the
+/// primary buffer; this bridges the sync reader thread → tokio async consumer.
+///
+/// Sized to absorb bursts when the tokio event loop is busy with OFDM/DSP work.
+/// At DAB sample rates (2048 kSPS CU8 = 2 MB/s), each 16 KB chunk is ~4 ms,
+/// so 32 chunks ≈ 128 ms of headroom.
+const BRIDGE_QUEUE_DEPTH: usize = 32;
 
 /**
  * Device selector for RTL-SDR devices
@@ -126,39 +132,46 @@ pub struct RtlSdrDeviceInfo {
 
 /// List all available RTL-SDR devices.
 pub fn list_devices() -> error::Result<Vec<RtlSdrDeviceInfo>> {
-    let descriptors = DeviceDescriptors::new()
+    let devices = rs_rtl::list_devices()
         .map_err(|e| error::Error::device(format!("Failed to enumerate devices: {e}")))?;
-    Ok(descriptors
+    Ok(devices
         .iter()
-        .map(|d| RtlSdrDeviceInfo {
-            index: d.index,
-            manufacturer: d.manufacturer,
-            product: d.product,
-            serial: d.serial,
+        .enumerate()
+        .map(|(i, d)| RtlSdrDeviceInfo {
+            index: i,
+            manufacturer: d.manufacturer.clone().unwrap_or_default(),
+            product: d.product.clone().unwrap_or_default(),
+            serial: d.serial.clone().unwrap_or_default(),
         })
         .collect())
 }
 
-/// Open an RTL-SDR device based on a selector.
-fn open_device_with_selector(selector: &DeviceSelector) -> error::Result<RtlSdr> {
+/// Resolve a DeviceSelector to a device index.
+fn resolve_device_index(selector: &DeviceSelector) -> error::Result<usize> {
     match selector {
-        DeviceSelector::Index(idx) => RtlSdr::open_with_index(*idx).map_err(|e| e.into()),
+        DeviceSelector::Index(idx) => Ok(*idx),
         DeviceSelector::Filter {
             manufacturer,
             product,
             serial,
         } => {
-            let descriptors = DeviceDescriptors::new()
+            let devices = rs_rtl::list_devices()
                 .map_err(|e| error::Error::device(format!("Failed to enumerate devices: {e}")))?;
 
-            let matching = descriptors.iter().find(|d| {
-                manufacturer.as_ref().is_none_or(|m| &d.manufacturer == m)
-                    && product.as_ref().is_none_or(|p| &d.product == p)
-                    && serial.as_ref().is_none_or(|s| &d.serial == s)
+            let matching = devices.iter().enumerate().find(|(_, d)| {
+                manufacturer
+                    .as_ref()
+                    .is_none_or(|m| d.manufacturer.as_deref() == Some(m.as_str()))
+                    && product
+                        .as_ref()
+                        .is_none_or(|p| d.product.as_deref() == Some(p.as_str()))
+                    && serial
+                        .as_ref()
+                        .is_none_or(|s| d.serial.as_deref() == Some(s.as_str()))
             });
 
             match matching {
-                Some(dev) => RtlSdr::open_with_index(dev.index).map_err(|e| e.into()),
+                Some((idx, _)) => Ok(idx),
                 None => Err(error::Error::device(format!(
                     "No RTL-SDR device found matching filters: \
                      manufacturer={manufacturer:?}, product={product:?}, serial={serial:?}"
@@ -168,32 +181,42 @@ fn open_device_with_selector(selector: &DeviceSelector) -> error::Result<RtlSdr>
     }
 }
 
-/// Configure an open RTL-SDR device from a `RtlSdrConfig`.
-fn configure_rtlsdr(rtlsdr: &mut RtlSdr, config: &RtlSdrConfig) -> error::Result<()> {
-    rtlsdr.set_sample_rate(config.sample_rate)?;
-    let _ = rtlsdr.set_tuner_bandwidth(config.sample_rate);
-    let _ = rtlsdr.set_freq_correction(config.freq_correction_ppm);
-    rtlsdr.set_center_freq(config.center_freq)?;
+/// Open and configure an RTL-SDR device from a `RtlSdrConfig`.
+fn open_and_configure(config: &RtlSdrConfig) -> error::Result<rs_rtl::RtlSdr> {
+    let idx = resolve_device_index(&config.device)?;
+    let mut sdr = rs_rtl::RtlSdr::open(idx)?;
+
+    sdr.set_sample_rate(config.sample_rate)?;
+    let _ = sdr.set_bandwidth(config.sample_rate);
+
+    if config.freq_correction_ppm != 0 {
+        tracing::warn!(
+            ppm = config.freq_correction_ppm,
+            "rs-rtl does not support frequency correction PPM; ignoring"
+        );
+    }
+
+    sdr.set_center_freq(config.center_freq)?;
+
     match config.gain {
         Gain::Manual(gain_db) => {
             let gain_tenths = (gain_db * 10.0) as i32;
             tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
-            rtlsdr.set_tuner_gain(TunerGain::Manual(gain_tenths))?
+            sdr.set_gain_manual(gain_tenths)?;
         }
         Gain::Auto => {
             tracing::info!("Setting automatic tuner gain");
-            rtlsdr.set_tuner_gain(TunerGain::Auto)?
+            sdr.set_gain_auto()?;
         }
         Gain::Elements(_) => {
-            eprintln!(
-                "Warning: RTL-SDR does not support element-based gain control, using auto gain"
-            );
-            rtlsdr.set_tuner_gain(TunerGain::Auto)?
+            tracing::warn!("RTL-SDR does not support element-based gain control, using auto gain");
+            sdr.set_gain_auto()?;
         }
-    };
-    let _ = rtlsdr.set_bias_tee(config.bias_tee);
-    rtlsdr.reset_buffer()?;
-    Ok(())
+    }
+
+    let _ = sdr.set_bias_t(config.bias_tee);
+
+    Ok(sdr)
 }
 
 /**
@@ -201,9 +224,7 @@ fn configure_rtlsdr(rtlsdr: &mut RtlSdr, config: &RtlSdrConfig) -> error::Result
  */
 pub struct RtlSdrReader {
     config: RtlSdrConfig,
-    buf_size: usize,
-    /// Background reader thread receiver (lazily initialized on first `next()` call).
-    /// Sends raw u8 bytes to minimize time between USB reads.
+    /// Background streaming handle (lazily initialized on first `next()` call).
     bg_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
 }
 
@@ -211,7 +232,6 @@ impl RtlSdrReader {
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
         Ok(Self {
             config: config.clone(),
-            buf_size: DEFAULT_BUF_LENGTH,
             bg_rx: None,
         })
     }
@@ -221,10 +241,9 @@ impl RtlSdrReader {
         let (tx_init, rx_init) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
         let config = self.config.clone();
-        let buf_size = self.buf_size;
 
         std::thread::spawn(move || {
-            let mut rtlsdr = match open_device_with_selector(&config.device) {
+            let mut sdr = match open_and_configure(&config) {
                 Ok(dev) => dev,
                 Err(e) => {
                     let _ = tx_init.send(Err(e.to_string()));
@@ -232,32 +251,22 @@ impl RtlSdrReader {
                 }
             };
 
-            if let Err(e) = configure_rtlsdr(&mut rtlsdr, &config) {
-                let _ = tx_init.send(Err(e.to_string()));
-                return;
-            }
+            let reader = match sdr.start_streaming() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx_init.send(Err(e.to_string()));
+                    return;
+                }
+            };
             let _ = tx_init.send(Ok(()));
 
-            let mut buf_a = vec![0u8; buf_size];
-            let mut buf_b = vec![0u8; buf_size];
-            let mut use_a = true;
-
-            loop {
-                let buf = if use_a { &mut buf_a } else { &mut buf_b };
-                match rtlsdr.read_sync(buf) {
-                    Ok(bytes_read) => {
-                        if bytes_read == 0 {
-                            continue;
-                        }
-                        if tx.send(Ok(buf[..bytes_read].to_vec())).is_err() {
-                            break;
-                        }
-                        use_a = !use_a;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e.to_string()));
-                        break;
-                    }
+            while let Some(data) = reader.recv() {
+                if data.is_empty() {
+                    continue;
+                }
+                // Use blocking send for backpressure (lesson 20.1)
+                if tx.send(Ok(data)).is_err() {
+                    break;
                 }
             }
         });
@@ -278,8 +287,6 @@ impl RtlSdrReader {
     pub fn tune(&mut self, center_freq: u32) -> error::Result<()> {
         if self.bg_rx.is_none() {
             self.config.center_freq = center_freq;
-            let mut rtlsdr = open_device_with_selector(&self.config.device)?;
-            configure_rtlsdr(&mut rtlsdr, &self.config)?;
         }
         Ok(())
     }
@@ -288,8 +295,6 @@ impl RtlSdrReader {
     pub fn set_gain(&mut self, gain: Gain) -> error::Result<()> {
         if self.bg_rx.is_none() {
             self.config.gain = gain;
-            let mut rtlsdr = open_device_with_selector(&self.config.device)?;
-            configure_rtlsdr(&mut rtlsdr, &self.config)?;
         }
         Ok(())
     }
@@ -321,19 +326,24 @@ impl Iterator for RtlSdrReader {
 
 /// Asynchronous RTL-SDR I/Q Reader.
 ///
-/// Uses `RtlSdr::into_async_reader()` from the vendored library, which runs USB reads
-/// on a dedicated OS thread with a bounded `sync_channel(DEFAULT_ASYNC_BUF_NUMBER)`.
-/// A thin bridge thread converts raw bytes to `Complex<f32>` and forwards to a small
-/// tokio channel, keeping the tokio worker pool free for decode work.
+/// Uses `rs_rtl::RtlSdr::start_streaming()` which runs multi-transfer USB I/O
+/// on a dedicated OS thread with a bounded `sync_channel`. A thin bridge thread
+/// converts raw bytes to `Complex<f32>` and forwards to a tokio channel,
+/// keeping the tokio worker pool free for decode work.
 ///
 /// Architecture:
 /// ```text
-///   USB reader thread  ──sync_channel(15)──▶  bridge thread  ──tokio::mpsc(4)──▶  decode loop
-///   (into_async_reader)                        (bytes→complex)                     (IqAsyncSource)
+///   USB streaming thread  ──sync_channel(32)──▶  bridge thread  ──tokio::mpsc(32)──▶  decode loop
+///   (nusb multi-transfer)                         (bytes→complex)                      (IqAsyncSource)
 /// ```
+///
+/// The streaming thread uses nusb's endpoint queue with 15 transfers in-flight
+/// simultaneously, eliminating inter-transfer gaps. Delivery uses blocking
+/// `send()` for backpressure — the USB thread pauses when the queue is full,
+/// preventing data loss.
 pub struct AsyncRtlSdrReader {
-    /// Control handle for tune/stop on the USB reader thread.
-    control: rtl_sdr_rs::AsyncReadControlHandle,
+    /// Control handle for tune/gain/stop on the USB reader thread.
+    control: rs_rtl::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
 }
@@ -341,34 +351,29 @@ pub struct AsyncRtlSdrReader {
 impl AsyncRtlSdrReader {
     /// Create a new async RTL-SDR reader.
     ///
-    /// Opens and configures the device, then hands ownership to a dedicated USB reader
-    /// thread via `into_async_reader`. A bridge thread converts samples and forwards
-    /// them to the tokio channel.
+    /// Opens and configures the device, then starts multi-transfer streaming.
+    /// A bridge thread converts raw IQ bytes and forwards them to the tokio channel.
     pub fn new(config: &RtlSdrConfig) -> error::Result<Self> {
-        let mut rtl = open_device_with_selector(&config.device)?;
-        configure_rtlsdr(&mut rtl, config)?;
+        let mut sdr = open_and_configure(config)?;
 
-        // 15 concurrent libusb bulk transfers — mirrors C librtlsdr's rtlsdr_read_async
-        // so the hardware FIFO never overflows between transfers.
-        let handle = rtl
-            .into_multi_transfer_reader(DEFAULT_ASYNC_BUF_NUMBER, DEFAULT_BUF_LENGTH)
-            .map_err(|e| error::Error::device(format!("Failed to start async reader: {e}")))?;
-        let control = handle.control_handle();
+        let reader = sdr
+            .start_streaming()
+            .map_err(|e| error::Error::device(format!("Failed to start streaming: {e}")))?;
+        let control = reader.control_handle();
 
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
 
-        // Bridge thread: receives raw bytes from the USB reader, converts to complex,
-        // sends to tokio channel. Exits when the consumer drops `samples_rx`.
+        // Bridge thread: receives raw bytes from the USB streaming thread,
+        // converts to complex, sends to tokio channel.
+        // Exits when the consumer drops `samples_rx`.
         std::thread::Builder::new()
             .name("rtlsdr-bridge".into())
             .spawn(move || {
-                for result in handle {
-                    let to_send = match result {
-                        Ok(bytes) => Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes)),
-                        Err(e) => Err(error::Error::from(e)),
-                    };
-                    let is_err = to_send.is_err();
-                    if samples_tx.blocking_send(to_send).is_err() || is_err {
+                // Keep sdr alive so the device is not dropped while streaming
+                let _sdr = sdr;
+                while let Some(bytes) = reader.recv() {
+                    let samples = Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
+                    if samples_tx.blocking_send(samples).is_err() {
                         break;
                     }
                 }
@@ -388,20 +393,27 @@ impl AsyncRtlSdrReader {
                 .control
                 .tune(freq)
                 .map_err(|e| error::Error::device(format!("RTL-SDR tune failed: {e}"))),
-            RtlSdrMessage::Gain(gain) => {
-                let tuner_gain = match gain {
-                    Gain::Auto => TunerGain::Auto,
-                    Gain::Manual(db) => TunerGain::Manual((db * 10.0) as i32),
-                    Gain::Elements(_) => TunerGain::Auto,
-                };
-                self.control
-                    .set_gain(tuner_gain)
-                    .map_err(|e| error::Error::device(format!("RTL-SDR set gain failed: {e}")))
+            RtlSdrMessage::Gain(gain) => match gain {
+                Gain::Auto => self.control.set_gain_auto().map_err(|e| {
+                    error::Error::device(format!("RTL-SDR set auto gain failed: {e}"))
+                }),
+                Gain::Manual(db) => {
+                    let gain_tenths = (db * 10.0) as i32;
+                    self.control
+                        .set_gain(gain_tenths)
+                        .map_err(|e| error::Error::device(format!("RTL-SDR set gain failed: {e}")))
+                }
+                Gain::Elements(_) => {
+                    tracing::warn!("Element-based gain not supported for RTL-SDR; ignoring");
+                    Ok(())
+                }
+            },
+            RtlSdrMessage::SampleRate(_rate) => {
+                tracing::warn!(
+                    "RTL-SDR live sample rate change not supported during streaming; ignoring"
+                );
+                Ok(())
             }
-            RtlSdrMessage::SampleRate(rate) => self
-                .control
-                .set_sample_rate(rate)
-                .map_err(|e| error::Error::device(format!("RTL-SDR set sample rate failed: {e}"))),
             RtlSdrMessage::FreqCorrection(ppm) => {
                 tracing::warn!(
                     ppm,

@@ -7,6 +7,16 @@ mod helpers;
 
 use desperado::{IqFormat, IqSource};
 use std::fs;
+use tempfile::NamedTempFile;
+
+/// Helper to create a temp file with the given bytes and return (NamedTempFile, path String).
+/// The NamedTempFile must be kept alive for the duration of the test.
+fn temp_iq(data: &[u8]) -> (NamedTempFile, String) {
+    let f = NamedTempFile::new().expect("Failed to create temp file");
+    let path = f.path().to_str().unwrap().to_string();
+    fs::write(&path, data).expect("Failed to write test file");
+    (f, path)
+}
 
 #[test]
 fn test_iq_conversion_cu8_sine_wave() {
@@ -14,12 +24,11 @@ fn test_iq_conversion_cu8_sine_wave() {
     let samples = helpers::generate_sine_wave_cu8(1000.0, 96000, 96);
 
     // Write to temporary file
-    let temp_path = "/tmp/test_sine_cu8.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
     // Read back using IqSource
     let mut iq_source = IqSource::from_file(
-        temp_path,
+        &path,
         162_000_000, // center freq (arbitrary for test)
         96_000,      // sample rate
         96,          // chunk size
@@ -36,9 +45,6 @@ fn test_iq_conversion_cu8_sine_wave() {
     // Verify samples are complex numbers (not all zero)
     let non_zero = chunk.iter().any(|c| c.norm() > 0.01);
     assert!(non_zero, "All samples are near zero");
-
-    // Clean up
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -46,10 +52,9 @@ fn test_iq_conversion_dc_signal() {
     // Generate DC signal (constant I=0, Q=0 in normalized space)
     let samples = helpers::generate_dc_signal_cu8(100, 0.0, 0.0);
 
-    let temp_path = "/tmp/test_dc_cu8.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 100, IqFormat::Cu8)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 100, IqFormat::Cu8)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
@@ -67,8 +72,6 @@ fn test_iq_conversion_dc_signal() {
             sample.im
         );
     }
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -84,11 +87,10 @@ fn test_convert_cu8_boundaries() {
         255, 255, // I=255, Q=255 → (0.996, 0.996)
     ];
 
-    let temp_path = "/tmp/test_cu8_boundaries.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
     let mut iq_source = IqSource::from_file(
-        temp_path,
+        &path,
         162_000_000,
         96_000,
         4, // 4 samples
@@ -142,8 +144,6 @@ fn test_convert_cu8_boundaries() {
         "Sample 3 Q: expected ~0.996, got {}",
         chunk[3].im
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -159,10 +159,9 @@ fn test_convert_cs8_sign_handling() {
         127, 127, // I=127, Q=127 → (0.992, 0.992)
     ];
 
-    let temp_path = "/tmp/test_cs8_sign.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 4, IqFormat::Cs8)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 4, IqFormat::Cs8)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
@@ -210,8 +209,6 @@ fn test_convert_cs8_sign_handling() {
         "Sample 3 Q: expected ~0.992, got {}",
         chunk[3].im
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -226,10 +223,9 @@ fn test_convert_cs16_endianness() {
         0xFFu8, 0x7Fu8, 0xFFu8, 0x7Fu8, // I=32767, Q=32767 (LE) → (0.999, 0.999)
     ];
 
-    let temp_path = "/tmp/test_cs16_endian.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 3, IqFormat::Cs16)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 3, IqFormat::Cs16)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
@@ -267,8 +263,6 @@ fn test_convert_cs16_endianness() {
         "Sample 2 Q: expected ~0.999, got {}",
         chunk[2].im
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -285,10 +279,9 @@ fn test_convert_cf32_float_precision() {
     samples.extend_from_slice(&0.0f32.to_le_bytes());
     samples.extend_from_slice(&0.0f32.to_le_bytes());
 
-    let temp_path = "/tmp/test_cf32_float.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 3, IqFormat::Cf32)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 3, IqFormat::Cf32)
         .expect("Failed to create IQ source");
 
     let chunk = iq_source.next().expect("No data").expect("Read error");
@@ -327,8 +320,6 @@ fn test_convert_cf32_float_precision() {
         "Sample 2 Q: expected 0.0, got {}",
         chunk[2].im
     );
-
-    fs::remove_file(temp_path).ok();
 }
 
 #[test]
@@ -336,10 +327,9 @@ fn test_convert_empty_buffer() {
     // Test edge case with empty file (0 samples)
     let samples: Vec<u8> = vec![];
 
-    let temp_path = "/tmp/test_empty.iq";
-    fs::write(temp_path, &samples).expect("Failed to write test file");
+    let (_tmp, path) = temp_iq(&samples);
 
-    let mut iq_source = IqSource::from_file(temp_path, 162_000_000, 96_000, 100, IqFormat::Cu8)
+    let mut iq_source = IqSource::from_file(&path, 162_000_000, 96_000, 100, IqFormat::Cu8)
         .expect("Failed to create IQ source");
 
     // Should return None (no data) rather than error
@@ -349,6 +339,4 @@ fn test_convert_empty_buffer() {
         "Expected None for empty file, got {:?}",
         result
     );
-
-    fs::remove_file(temp_path).ok();
 }

@@ -26,9 +26,9 @@
 /// ```
 use num_complex::Complex;
 
-use super::buffer::StreamBuffer;
-use super::window::{design_fir_filter, WindowType};
 use super::DspBlock;
+use super::buffer::StreamBuffer;
+use super::window::{WindowType, design_fir_filter};
 
 /// A decimator that reduces the sample rate by an integer factor.
 ///

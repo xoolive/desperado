@@ -640,17 +640,17 @@ impl RdsParser {
         }
     }
 
-     /// Get the station metadata (TP, TA, PTY, DI, AF list)
-     pub fn station_info(&self) -> &StationInfo {
-         &self.station_info
-     }
+    /// Get the station metadata (TP, TA, PTY, DI, AF list)
+    pub fn station_info(&self) -> &StationInfo {
+        &self.station_info
+    }
 
-     /// Get the Program Identification (PI) code - a unique 16-bit identifier for FM station
-     pub fn program_id(&self) -> u16 {
-         self.station_info.pi
-     }
+    /// Get the Program Identification (PI) code - a unique 16-bit identifier for FM station
+    pub fn program_id(&self) -> u16 {
+        self.station_info.pi
+    }
 
-     /// Get the program type name (PTY)
+    /// Get the program type name (PTY)
     pub fn program_type_name(&self) -> &str {
         PTY_NAMES[self.station_info.program_type as usize]
     }
@@ -1027,17 +1027,17 @@ impl RdsParser {
         }
     }
 
-     /// Process a full 4-block group (datas array: block1..block4 data words).
-     /// block_valid indicates which blocks passed CRC (like redsea's group.has()).
-     pub(super) fn handle_group(&mut self, datas: [u16; 4], block_valid: [bool; 4]) {
-         self.groups_decoded += 1;
+    /// Process a full 4-block group (datas array: block1..block4 data words).
+    /// block_valid indicates which blocks passed CRC (like redsea's group.has()).
+    pub(super) fn handle_group(&mut self, datas: [u16; 4], block_valid: [bool; 4]) {
+        self.groups_decoded += 1;
 
-         // block 1 is PI (program identification)
-         let pi = datas[0];
-         self.station_info.pi = pi; // Store PI for later retrieval
-         let block2 = datas[1];
-         let block3 = datas[2];
-         let block4 = datas[3];
+        // block 1 is PI (program identification)
+        let pi = datas[0];
+        self.station_info.pi = pi; // Store PI for later retrieval
+        let block2 = datas[1];
+        let block3 = datas[2];
+        let block4 = datas[3];
 
         // Convenience flags for block validity (like redsea's group.has(BLOCK3), etc.)
         let has_block3 = block_valid[2];

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/desperado", "crates/fmradio", "crates/rs-spy", "crates/voracious", "crates/dabradio"]
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]

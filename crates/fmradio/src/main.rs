@@ -480,24 +480,24 @@ async fn main() -> desperado::Result<()> {
         None
     };
 
-      let tui_state = Arc::new(Mutex::new(TuiState {
-          mode: if initial_stereo { "stereo" } else { "mono" },
-          source: args.source.clone(),
-          center_freq_hz: args.center_freq.0,
-          sample_rate_hz: args.sample_rate_hz(),
-          mpx_rate_hz: 0.0,
-          iq_level_dbfs: -120.0,
-          audio_buf_fill: 0,
-          rds_ps: String::new(),
-          rds_rt: String::new(),
-          rds_pi: 0,
-          rds_af_list: Vec::new(),
-          rds_total_blocks: 0,
-          rds_valid_blocks: 0,
-          rds_groups: 0,
-          rds_ct: String::new(),
-          gain: args.gain.map(|g| g as f64 / 10.0),
-      }));
+    let tui_state = Arc::new(Mutex::new(TuiState {
+        mode: if initial_stereo { "stereo" } else { "mono" },
+        source: args.source.clone(),
+        center_freq_hz: args.center_freq.0,
+        sample_rate_hz: args.sample_rate_hz(),
+        mpx_rate_hz: 0.0,
+        iq_level_dbfs: -120.0,
+        audio_buf_fill: 0,
+        rds_ps: String::new(),
+        rds_rt: String::new(),
+        rds_pi: 0,
+        rds_af_list: Vec::new(),
+        rds_total_blocks: 0,
+        rds_valid_blocks: 0,
+        rds_groups: 0,
+        rds_ct: String::new(),
+        gain: args.gain.map(|g| g as f64 / 10.0),
+    }));
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_thread = if args.tui {
         let can_hard_retune =
@@ -1103,29 +1103,29 @@ async fn run_stereo(
         let deem_l = deemphasis_l.process(&left);
         let deem_r = deemphasis_r.process(&right);
 
-         // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
-         // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
-         let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
-          if !rds_i.is_empty() {
-              rds.process_iq(&rds_i, &rds_q);
-              if let Some(state) = &tui_state
-                  && let Ok(mut s) = state.lock()
-              {
-                  let (total, valid, groups) = rds.stats();
-                  s.rds_total_blocks = total;
-                  s.rds_valid_blocks = u64::from(valid);
-                  s.rds_groups = u64::from(groups);
-                  s.rds_ps = rds.station_name().unwrap_or_default();
-                  s.rds_rt = rds.radio_text().unwrap_or_default();
-                   s.rds_pi = rds.program_id();
-                   s.rds_af_list = rds.alt_frequencies();
-                   s.rds_ct = rds
-                       .clock_time()
-                       .map(|t| format!("{:}", t))
-                       .unwrap_or_default();
-                   s.mode = if stereo_on { "stereo" } else { "mono" };
-              }
-         }
+        // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
+        // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
+        let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
+        if !rds_i.is_empty() {
+            rds.process_iq(&rds_i, &rds_q);
+            if let Some(state) = &tui_state
+                && let Ok(mut s) = state.lock()
+            {
+                let (total, valid, groups) = rds.stats();
+                s.rds_total_blocks = total;
+                s.rds_valid_blocks = u64::from(valid);
+                s.rds_groups = u64::from(groups);
+                s.rds_ps = rds.station_name().unwrap_or_default();
+                s.rds_rt = rds.radio_text().unwrap_or_default();
+                s.rds_pi = rds.program_id();
+                s.rds_af_list = rds.alt_frequencies();
+                s.rds_ct = rds
+                    .clock_time()
+                    .map(|t| format!("{:}", t))
+                    .unwrap_or_default();
+                s.mode = if stereo_on { "stereo" } else { "mono" };
+            }
+        }
 
         // Interleave stereo
         let mut interleaved = Vec::with_capacity(deem_l.len() * 2);

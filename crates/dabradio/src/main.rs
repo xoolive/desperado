@@ -99,6 +99,8 @@ impl IqChunkSource {
 }
 
 const AUDIO_RATE: usize = 48_000;
+const AUDIO_QUEUE_SECONDS: usize = 4;
+const AUDIO_QUEUE_MAX: usize = AUDIO_RATE * 2 * AUDIO_QUEUE_SECONDS; // stereo buffer in samples
 
 #[derive(Default, Clone)]
 struct TuiState {
@@ -168,12 +170,12 @@ fn spawn_dab_tui(
 
         while running.load(Ordering::Relaxed) {
             // Auto-clear save feedback after a few seconds
-            if let Some(until) = save_message_until {
-                if Instant::now() >= until {
-                    save_message_until = None;
-                    if let Ok(mut s) = state.lock() {
-                        s.save_message.clear();
-                    }
+            if let Some(until) = save_message_until
+                && Instant::now() >= until
+            {
+                save_message_until = None;
+                if let Ok(mut s) = state.lock() {
+                    s.save_message.clear();
                 }
             }
 
@@ -294,10 +296,11 @@ fn spawn_dab_tui(
                     let right_inner = right.width.saturating_sub(4) as usize;
                     let right_lines = vec![
                         Line::from(format!(
-                            " IQ: {}  {:.1} dBFS   Buf: {}",
+                            " IQ: {}  {:.1} dBFS   Audio buffer: {} {}",
                             level_bar(s.iq_level_dbfs, -60.0, 0.0, 14),
                             s.iq_level_dbfs,
-                            s.audio_q_fill
+                            level_bar(s.audio_q_fill as f32, 0.0, AUDIO_QUEUE_MAX as f32, 14),
+                            s.audio_q_fill,
                         )),
                         Line::from(format!(
                             " In: {:.3} MHz  →  {} Hz",
@@ -332,10 +335,8 @@ fn spawn_dab_tui(
                         .block(Block::default().title(" DAB+ ").borders(Borders::ALL));
                     f.render_widget(right_panel, right);
 
-                    if inline_image_support {
-                        if let Some(path) = &s.mot_preview_path {
-                            draw_tui_image(path, right);
-                        }
+                    if inline_image_support && let Some(path) = &s.mot_preview_path {
+                        draw_tui_image(path, right);
                     }
                 });
             }
@@ -359,6 +360,13 @@ fn spawn_dab_tui(
             if keyboard_available && event::poll(Duration::from_millis(1)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Resize(_, _)) => {
+                        // Clear Kitty graphics layer images before resize;
+                        // they persist at old absolute coordinates otherwise,
+                        // creating a "patchwork" of ghost images.
+                        if inline_image_support {
+                            let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
+                            let _ = std::io::stdout().flush();
+                        }
                         let _ = terminal.autoresize();
                         let _ = terminal.clear();
                     }
@@ -379,12 +387,11 @@ fn spawn_dab_tui(
                             }
                         }
                         KeyCode::Enter => {
-                            if let Ok(mut s) = state.lock() {
-                                if let Some((label, _)) =
+                            if let Ok(mut s) = state.lock()
+                                && let Some((label, _)) =
                                     s.services.get(s.selected_service_idx).cloned()
-                                {
-                                    s.service_switch_request = Some(label);
-                                }
+                            {
+                                s.service_switch_request = Some(label);
                             }
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -837,8 +844,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PCM enqueue is blocking for both paths: no samples are ever silently dropped.
     // The IQ bridge chain (sync_channel(15) + tokio mpsc(4) ≈ 1.2 s deep) absorbs
     // any stall while the audio queue drains to make room.
-    let audio_queue_seconds = 4;
-    let (tx, rx) = channel::bounded::<f32>(AUDIO_RATE * 2 * audio_queue_seconds);
+    let (tx, rx) = channel::bounded::<f32>(AUDIO_QUEUE_MAX);
     let audio_underruns = Arc::new(AtomicU64::new(0));
     let audio_dropped = Arc::new(AtomicU64::new(0));
     let audio_primed = Arc::new(AtomicBool::new(false));
@@ -1027,7 +1033,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fib_count += 1;
                     ensemble.parse_fib(fib);
                 }
-                if frame_count <= 5 || frame_count % 50 == 0 {
+                if frame_count <= 5 || frame_count.is_multiple_of(50) {
                     debug!(
                         frame = frame_count,
                         fibs_total = fib_count,
@@ -1042,10 +1048,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "OFDM sync only".to_string()
                     };
                     // Ensemble name
-                    if s.ensemble_name.is_empty() {
-                        if let Some(name) = &ensemble.ensemble_label {
-                            s.ensemble_name = name.clone();
-                        }
+                    if s.ensemble_name.is_empty()
+                        && let Some(name) = &ensemble.ensemble_label
+                    {
+                        s.ensemble_name = name.clone();
                     }
                     // Services list: rebuild when the labeled-service count changes.
                     // Compare against labeled services only (same filter as the list
@@ -1071,7 +1077,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .collect();
                         list.sort_by(|a, b| a.0.cmp(&b.0));
                         s.services = list;
-                        // Cursor is set by service-start paths; don't touch it here.
+                        // Update cursor position to match the currently playing service
+                        // (by label, not by stale index) to handle list rebuilds
+                        if !s.service.is_empty()
+                            && let Some(idx) = s
+                                .services
+                                .iter()
+                                .position(|(l, _)| l.eq_ignore_ascii_case(&s.service))
+                        {
+                            s.selected_service_idx = idx;
+                        }
                     }
                 }
             }
