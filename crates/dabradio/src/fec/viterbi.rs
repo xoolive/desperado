@@ -180,7 +180,6 @@ pub fn viterbi_decode_with_metric(soft_bits: &[i8]) -> (Vec<u8>, i32) {
 
 /// Same as viterbi_decode_with_metric but always traces back from state 0 (for tail-terminated codes).
 /// Uses the same initialization (small penalty for non-start states).
-#[cfg(test)]
 pub fn viterbi_decode_state0(soft_bits: &[i8]) -> (Vec<u8>, i32) {
     let n_steps = soft_bits.len() / 4;
     if n_steps == 0 {

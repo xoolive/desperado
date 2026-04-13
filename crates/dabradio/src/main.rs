@@ -15,16 +15,31 @@ use clap::Parser;
 use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 use desperado::DeviceConfig;
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 use desperado::IqAsyncSource;
 use desperado::dsp::DspBlock;
 #[cfg(feature = "resampler")]
 use desperado::dsp::dab_resampler::DabResampler;
 use desperado::dsp::rotate::Rotate;
 use desperado::{IqFormat, IqSource};
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 use futures::StreamExt;
 use num_complex::Complex;
 use pad::PadData;
@@ -40,7 +55,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Seek, SeekFrom, Write};
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,7 +77,12 @@ use tracing_subscriber::prelude::*;
 /// For live SDR sources, uses `IqAsyncSource` directly.
 enum IqChunkSource {
     Sync(Box<IqSource>),
-    #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+    #[cfg(any(
+        feature = "rtlsdr",
+        feature = "soapy",
+        feature = "airspy",
+        feature = "hackrf"
+    ))]
     Async {
         source: IqAsyncSource,
         chunk_size: usize,
@@ -72,7 +97,12 @@ impl IqChunkSource {
     async fn next_chunk(&mut self) -> Option<desperado::error::Result<Vec<Complex<f32>>>> {
         match self {
             IqChunkSource::Sync(source) => source.next(),
-            #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+            #[cfg(any(
+                feature = "rtlsdr",
+                feature = "soapy",
+                feature = "airspy",
+                feature = "hackrf"
+            ))]
             IqChunkSource::Async {
                 source,
                 chunk_size,
@@ -1520,14 +1550,30 @@ async fn open_iq_source(
             return Err("airspy:// is not enabled. Rebuild with --features airspy".into());
         }
     }
+    if input.starts_with("hackrf://") {
+        #[cfg(not(feature = "hackrf"))]
+        {
+            return Err("hackrf:// is not enabled. Rebuild with --features hackrf".into());
+        }
+    }
 
     let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
     info!("Opening live SDR source: {}", configured_uri);
     let input_rate = detect_device_sample_rate(&configured_uri)?;
-    #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+    #[cfg(not(any(
+        feature = "rtlsdr",
+        feature = "soapy",
+        feature = "airspy",
+        feature = "hackrf"
+    )))]
     let _ = input_rate;
 
-    #[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+    #[cfg(any(
+        feature = "rtlsdr",
+        feature = "soapy",
+        feature = "airspy",
+        feature = "hackrf"
+    ))]
     {
         let config = DeviceConfig::from_str(&configured_uri)?;
         let source = IqAsyncSource::from_device_config(&config).await?;
@@ -1542,14 +1588,24 @@ async fn open_iq_source(
         ))
     }
 
-    #[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+    #[cfg(not(any(
+        feature = "rtlsdr",
+        feature = "soapy",
+        feature = "airspy",
+        feature = "hackrf"
+    )))]
     Err(
         format!("No SDR backend enabled for URI: {configured_uri}. Rebuild with --features rtlsdr")
             .into(),
     )
 }
 
-#[cfg(any(feature = "rtlsdr", feature = "soapy", feature = "airspy"))]
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 fn detect_device_sample_rate(configured_uri: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let config = DeviceConfig::from_str(configured_uri)?;
     #[cfg(feature = "rtlsdr")]
@@ -1564,6 +1620,10 @@ fn detect_device_sample_rate(configured_uri: &str) -> Result<u32, Box<dyn std::e
     if let DeviceConfig::Airspy(cfg) = &config {
         return Ok(cfg.sample_rate);
     }
+    #[cfg(feature = "hackrf")]
+    if let DeviceConfig::HackRf(cfg) = &config {
+        return Ok(cfg.sample_rate);
+    }
 
     Err(std::io::Error::other(format!(
         "Unsupported SDR backend for sample-rate detection: {configured_uri}"
@@ -1571,7 +1631,12 @@ fn detect_device_sample_rate(configured_uri: &str) -> Result<u32, Box<dyn std::e
     .into())
 }
 
-#[cfg(not(any(feature = "rtlsdr", feature = "soapy", feature = "airspy")))]
+#[cfg(not(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+)))]
 fn detect_device_sample_rate(_configured_uri: &str) -> Result<u32, Box<dyn std::error::Error>> {
     Err(std::io::Error::other("No SDR backend enabled").into())
 }
@@ -1580,6 +1645,7 @@ fn is_device_uri(input: &str) -> bool {
     input.starts_with("rtlsdr://")
         || input.starts_with("soapy://")
         || input.starts_with("airspy://")
+        || input.starts_with("hackrf://")
 }
 
 fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {

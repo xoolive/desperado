@@ -581,22 +581,27 @@ impl R82xx {
             // Allow calibration to settle
             std::thread::sleep(Duration::from_millis(2));
 
-            // Stop trigger (reg 0x0b bit 2)
-            self.write_reg_mask(dev, 0x0b, 0x00, 0x04)?;
+            // Stop trigger (reg 0x0b bit 4)
+            self.write_reg_mask(dev, 0x0b, 0x00, 0x10)?;
 
             // Read calibration result from regs 0x00-0x04, cal code in byte 4
             let cal_data = self.read_regs(dev, 0x00, 5)?;
             self.fil_cal_code = cal_data[4] & 0x0f;
 
-            if self.fil_cal_code != 0x0f {
+            if self.fil_cal_code != 0 && self.fil_cal_code != 0x0f {
                 break;
             }
+        }
 
-            // Narrowest — calibration failed, reset and retry
+        // If cal code is still 0x0f after retries, reset to 0
+        if self.fil_cal_code == 0x0f {
             self.fil_cal_code = 0;
         }
 
         trace!("filter cal code: 0x{:02x}", self.fil_cal_code);
+
+        // Disable calibration clock (reg 0x0f bit 2)
+        self.write_reg_mask(dev, 0x0f, 0x00, 0x04)?;
 
         // --- Configure for 6 MHz DVB-T ---
 
@@ -697,9 +702,6 @@ impl R82xx {
         // AGC clock 60Hz (reg 0x1a bits [5:4])
         self.write_reg_mask(dev, 0x1a, 0x20, 0x30)?;
 
-        // Final: LNA discharge to reg 0x10 bit 2
-        self.write_reg_mask(dev, 0x10, lna_discharge, 0x04)?;
-
         Ok(())
     }
 
@@ -790,17 +792,15 @@ impl R82xx {
     /// 2. Calculate integer (Ni, Si) and fractional (SDM) components
     /// 3. Write to PLL registers and verify lock
     ///
-    /// This implementation matches librtlsdr's r82xx_set_pll exactly:
-    /// - Frequency rounding: (freq + 500) / 1000 for kHz conversion
+    /// This implementation matches librtlsdr's r82xx_set_pll:
+    /// - Frequency rounding: (freq + 500) / 1000 for kHz conversion in VCO range check
     /// - VCO computed in Hz (u64) for maximum precision
-    /// - Iterative SDM algorithm matching the reference
+    /// - Exact fixed-point SDM calculation: vco_div = (pll_ref + 65536*vco_freq) / (2*pll_ref)
     fn set_pll(&mut self, dev: &Device, freq: u32) -> Result<()> {
-        // Round to kHz (matching librtlsdr)
-        let freq_khz = (freq + 500) / 1000;
         let pll_ref = self.xtal_freq;
-        let pll_ref_khz = (pll_ref + 500) / 1000;
+        let freq_khz = (freq + 500) / 1000;
 
-        trace!("set_pll: freq={}kHz, pll_ref={}kHz", freq_khz, pll_ref_khz);
+        trace!("set_pll: freq={}kHz, pll_ref={}Hz", freq_khz, pll_ref);
 
         // Disable refdiv2
         self.write_reg_mask(dev, 0x10, 0x00, 0x10)?;
@@ -863,12 +863,14 @@ impl R82xx {
         let vco_freq: u64 = freq as u64 * mix_div as u64;
         trace!("vco_freq: {}", vco_freq);
 
-        // Integer divider
-        let nint = (vco_freq / (2 * pll_ref as u64)) as u8;
-        trace!("nint: {}", nint);
+        // Exact fixed-point PLL divider calculation (matching librtlsdr).
+        // vco_div is a 16.16 fixed-point representation of vco_freq / (2 * pll_ref),
+        // with rounding: (pll_ref + 65536 * vco_freq) / (2 * pll_ref).
+        let vco_div: u64 = (pll_ref as u64 + 65536u64 * vco_freq) / (2 * pll_ref as u64);
+        let nint = (vco_div / 65536) as u8;
+        let sdm = (vco_div % 65536) as u32;
 
-        // VCO fractional remainder in kHz
-        let mut vco_fra = ((vco_freq - 2 * pll_ref as u64 * nint as u64) / 1000) as u32;
+        trace!("nint: {}, sdm: 0x{:04x}", nint, sdm);
 
         // Check nint overflow
         if nint > ((128 / vco_power_ref) - 1) {
@@ -880,49 +882,34 @@ impl R82xx {
 
         // Encode Ni/Si for register 0x14.
         // nint = 4 * Ni + Si + 13
-        let ni = ((nint as i32).overflowing_sub(13).0 / 4) as u8;
-        let si = (nint as i32 - 4 * ni as i32 - 13) as u8;
+        let ni = nint.wrapping_sub(13) / 4;
+        let si = nint.wrapping_sub(4 * ni).wrapping_sub(13);
 
         trace!(
-            "PLL: mix_div={}, nint={}, ni={}, si={}, reg=0x{:02x}, vco_fra={}",
+            "PLL: mix_div={}, nint={}, ni={}, si={}, reg=0x{:02x}",
             mix_div,
             nint,
             ni,
             si,
-            ni.overflowing_add(si << 6).0,
-            vco_fra
+            ni.wrapping_add(si << 6),
         );
 
-        self.write_reg_mask(dev, 0x14, ni.overflowing_add(si << 6).0, 0xff)?;
+        self.write_reg_mask(dev, 0x14, ni.wrapping_add(si << 6), 0xff)?;
 
         // Fractional divider (SDM)
-        if vco_fra == 0 {
+        if sdm == 0 {
             // Disable SDM
             self.write_reg_mask(dev, 0x12, 0x08, 0x08)?;
         } else {
             // Enable SDM
             self.write_reg_mask(dev, 0x12, 0x00, 0x08)?;
-
-            // Iterative SDM calculator (matching librtlsdr exactly)
-            let mut sdm: u32 = 0;
-            let mut n_sdm: u32 = 2;
-            while vco_fra > 1 {
-                if vco_fra > (2 * pll_ref_khz / n_sdm) {
-                    sdm += 32768 / (n_sdm / 2);
-                    vco_fra -= 2 * pll_ref_khz / n_sdm;
-                    if n_sdm >= 0x8000 {
-                        break;
-                    }
-                }
-                n_sdm <<= 1;
-            }
-
-            // Write SDM: reg 0x16 = high byte, reg 0x15 = low byte
-            self.write_reg_mask(dev, 0x16, (sdm >> 8) as u8, 0xff)?;
-            self.write_reg_mask(dev, 0x15, (sdm & 0xff) as u8, 0xff)?;
-
-            trace!("PLL SDM: 0x{:04x}", sdm);
         }
+
+        // Always write SDM registers (matching librtlsdr bulk write behavior)
+        self.write_reg_mask(dev, 0x16, (sdm >> 8) as u8, 0xff)?;
+        self.write_reg_mask(dev, 0x15, (sdm & 0xff) as u8, 0xff)?;
+
+        trace!("PLL SDM: 0x{:04x}", sdm);
 
         // Check PLL lock (up to 2 attempts).
         // IMPORTANT: R82xx I2C reads always start from register 0x00.
@@ -946,9 +933,9 @@ impl R82xx {
             }
 
             if attempt == 0 {
-                // Increase VCO current and retry (same value as initial, matching librtlsdr)
+                // Increase VCO current and retry (matching librtlsdr: 0x60)
                 trace!("PLL not locked, increasing VCO current");
-                self.write_reg_mask(dev, 0x12, 0x80, 0xe0)?;
+                self.write_reg_mask(dev, 0x12, 0x60, 0xe0)?;
             }
         }
 
@@ -1021,6 +1008,9 @@ impl R82xx {
         self.write_reg_mask(dev, 0x07, 0x10, 0x10)?;
 
         // VGA gain = 26.5 dB (reg 0x0c bits [4:0] = 0x0b)
+        // Matches librtlsdr. Note: for strong signals (e.g. local FM), the
+        // hardware AGC may still clip; applications should use manual gain
+        // when they know the signal environment.
         self.write_reg_mask(dev, 0x0c, 0x0b, 0x9f)?;
 
         Ok(())

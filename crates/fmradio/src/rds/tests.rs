@@ -195,7 +195,7 @@ fn test_rds_parser_push_bits_insufficient() {
     let mut parser = RdsParser::new();
     let bits: Vec<u8> = vec![1, 0, 1, 0, 1]; // 5 bits
     parser.push_bits(&bits);
-    let (_, blocks, _) = parser.stats();
+    let (_, blocks, _, _) = parser.stats();
     assert_eq!(blocks, 0, "Should not detect blocks with <26 bits");
 }
 
@@ -207,7 +207,7 @@ fn test_rds_parser_push_bits_invalid_block() {
     parser.push_bits(&bits);
     // All zeros has syndrome 0, which doesn't match any offset
     // So no blocks should be detected
-    let (_, blocks, _) = parser.stats();
+    let (_, blocks, _, _) = parser.stats();
     assert_eq!(blocks, 0, "Random bits should not produce valid blocks");
 }
 
@@ -321,7 +321,7 @@ fn test_create_and_decode_valid_block_a() {
 
     parser.push_bits(&bits);
 
-    let (_, blocks, _) = parser.stats();
+    let (_, blocks, _, _) = parser.stats();
     assert_eq!(blocks, 1, "Should have detected one valid block");
     // With sync-based approach, a single block doesn't acquire sync
     assert!(
@@ -340,7 +340,7 @@ fn test_create_and_decode_valid_block_b() {
 
     parser.push_bits(&bits);
 
-    let (_, blocks, _) = parser.stats();
+    let (_, blocks, _, _) = parser.stats();
     assert_eq!(blocks, 1, "Should have detected one valid block");
 }
 
@@ -387,7 +387,7 @@ fn test_rds_sync_acquisition_with_full_group() {
 
     parser.push_bits(&all_bits);
 
-    let (_, blocks, groups) = parser.stats();
+    let (_, blocks, groups, _) = parser.stats();
     assert!(
         blocks >= 6,
         "Should have detected at least 6 blocks, got {}",
@@ -556,14 +556,14 @@ fn test_rds_comprehensive_real_station_sequence() {
 fn test_rds_parser_stats() {
     let mut parser = RdsParser::new();
 
-    let (bits, blocks, groups) = parser.stats();
+    let (bits, blocks, groups, _) = parser.stats();
     assert_eq!(bits, 0);
     assert_eq!(blocks, 0);
     assert_eq!(groups, 0);
 
     // Push some bits
     parser.push_bits(&[0, 1, 0, 1]);
-    let (bits, _, _) = parser.stats();
+    let (bits, _, _, _) = parser.stats();
     assert_eq!(bits, 4);
 }
 

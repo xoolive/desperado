@@ -34,8 +34,9 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 [features]
-default = ["rtlsdr", "airspy"]
+default = ["rtlsdr", "airspy", "hackrf"]
 rtlsdr = ["desperado/rtlsdr"]
+hackrf = ["desperado/hackrf"]
 soapy = ["desperado/soapy"]
 resampler = ["desperado/resampler"]
 airspy = ["desperado/airspy", "resampler"]

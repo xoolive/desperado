@@ -39,10 +39,12 @@ use super::window::{WindowType, design_fir_filter};
 /// - `factor`: The decimation factor (output rate = input rate / factor)
 /// - `fir`: The FIR filter coefficients
 /// - `buffer`: Internal buffer for maintaining state between process() calls
+/// - `phase`: Position of the next output sample in the buffer (decimation grid tracking)
 pub struct Decimator {
     factor: usize,
     fir: Vec<f32>,
     buffer: StreamBuffer<Complex<f32>>,
+    phase: usize,
 }
 
 impl Decimator {
@@ -67,11 +69,13 @@ impl Decimator {
         let taps = 31;
         let cutoff = 0.5 / factor as f32; // Normalized cutoff (Nyquist = 0.5)
         let fir = design_fir_filter(cutoff, taps, WindowType::Hamming);
+        let mid = taps / 2;
 
         Self {
             factor,
             fir,
             buffer: StreamBuffer::new(),
+            phase: mid, // First valid centered FIR position
         }
     }
 
@@ -100,11 +104,13 @@ impl Decimator {
         );
 
         let fir = design_fir_filter(cutoff, taps, WindowType::Hamming);
+        let mid = taps / 2;
 
         Self {
             factor,
             fir,
             buffer: StreamBuffer::new(),
+            phase: mid,
         }
     }
 
@@ -121,6 +127,7 @@ impl Decimator {
     /// Clears the internal state buffer.
     pub fn reset(&mut self) {
         self.buffer.clear();
+        self.phase = self.fir.len() / 2;
     }
 }
 
@@ -135,34 +142,39 @@ impl DspBlock for Decimator {
     /// # Returns
     /// Decimated output samples (length ≈ input.len() / factor)
     fn process(&mut self, data: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        // Append new data to buffer
+        // Append new data to buffer (which may contain overlap from previous call)
         self.buffer.push_slice(data);
 
         let taps = self.fir.len();
         let mid = taps / 2;
         let mut output = Vec::new();
 
-        // Process with filtering and decimation
-        let mut i = mid;
-        while i < self.buffer.len() {
+        // Process with filtering and decimation.
+        // self.phase tracks the position of the next output sample in the buffer,
+        // maintaining the correct decimation grid across chunk boundaries.
+        let mut i = self.phase;
+
+        // Only produce output when the full filter window fits:
+        // FIR reads from i-mid to i-mid+taps-1 = i+mid (for odd taps)
+        while i + mid < self.buffer.len() {
             let mut acc = Complex::new(0.0, 0.0);
-
-            // Apply FIR filter
+            let base = i - mid;
             for j in 0..taps {
-                let buf_idx = i + j - mid;
-                if buf_idx < self.buffer.len() {
-                    acc += self.buffer[buf_idx] * self.fir[j];
-                }
+                acc += self.buffer[base + j] * self.fir[j];
             }
-
             output.push(acc);
             i += self.factor;
         }
 
-        // Keep only the samples needed for the next iteration
-        // We need to keep at least `taps` samples for the filter state
-        let keep = self.buffer.len().saturating_sub(mid);
-        self.buffer.consume(keep);
+        // i is now the position where the next output would be (didn't fit this call).
+        // Keep enough samples so the next call's first FIR computation has full overlap.
+        // The next output at position i needs samples from i-mid onwards.
+        let consume = i.saturating_sub(mid);
+        if consume > 0 {
+            self.buffer.consume(consume);
+        }
+        // Update phase: position of next output in the post-consume buffer
+        self.phase = i - consume;
 
         output
     }

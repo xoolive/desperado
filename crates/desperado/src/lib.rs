@@ -21,6 +21,8 @@ use std::task::{Context, Poll};
 pub mod airspy;
 pub mod dsp;
 pub mod error;
+#[cfg(feature = "hackrf")]
+pub mod hackrf;
 pub mod iqread;
 pub mod metrics;
 #[cfg(feature = "pluto")]
@@ -367,6 +369,8 @@ pub enum DeviceConfig {
     Soapy(soapy::SoapyConfig),
     #[cfg(feature = "airspy")]
     Airspy(airspy::AirspyConfig),
+    #[cfg(feature = "hackrf")]
+    HackRf(hackrf::HackRfConfig),
 }
 
 impl std::str::FromStr for DeviceConfig {
@@ -719,6 +723,72 @@ impl std::str::FromStr for DeviceConfig {
                 cfg.vga_gain = vga_gain;
                 Ok(DeviceConfig::Airspy(cfg))
             }
+            #[cfg(feature = "hackrf")]
+            "hackrf" => {
+                // Parse: hackrf://[device_index]?freq=...&rate=...&gain=...&amp=...&bias_tee=...
+                let (device_part, query) = if let Some(q_pos) = rest.find('?') {
+                    (&rest[..q_pos], &rest[q_pos + 1..])
+                } else {
+                    (rest, "")
+                };
+
+                let device_index = if device_part.is_empty() {
+                    0
+                } else {
+                    device_part.parse::<usize>().map_err(|_| {
+                        Error::other(format!("Invalid hackrf device index: {}", device_part))
+                    })?
+                };
+
+                // Parse query parameters
+                let mut center_freq: Option<u64> = None;
+                let mut sample_rate: Option<u32> = None;
+                let mut gain = Gain::Auto;
+                let mut amp_enable = false;
+                let mut bias_tee = false;
+
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let kv: Vec<&str> = param.splitn(2, '=').collect();
+                    if kv.len() != 2 {
+                        continue;
+                    }
+                    match kv[0] {
+                        "freq" | "frequency" => {
+                            center_freq = Some(parse_si_value(kv[1])?);
+                        }
+                        "rate" | "sample_rate" => {
+                            sample_rate = Some(parse_si_value(kv[1])?);
+                        }
+                        "gain" => {
+                            gain = Gain::parse(kv[1])?;
+                        }
+                        "amp" | "amp_enable" => {
+                            amp_enable = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
+                        "bias_tee" | "bias-tee" => {
+                            bias_tee = kv[1].to_lowercase() == "true" || kv[1] == "1";
+                        }
+                        _ => {} // Ignore unknown parameters
+                    }
+                }
+
+                let center_freq = center_freq
+                    .ok_or_else(|| Error::other("Missing freq parameter".to_string()))?;
+                let sample_rate = sample_rate
+                    .ok_or_else(|| Error::other("Missing rate parameter".to_string()))?;
+
+                Ok(DeviceConfig::HackRf(hackrf::HackRfConfig {
+                    device_index,
+                    center_freq,
+                    sample_rate,
+                    gain,
+                    amp_enable,
+                    bias_tee,
+                }))
+            }
             _ => Err(Error::other(format!("Unknown device scheme: {}", scheme))),
         }
     }
@@ -772,6 +842,9 @@ pub enum IqSource {
     /// Airspy-based IQ source (requires "airspy" feature)
     #[cfg(feature = "airspy")]
     Airspy(airspy::AirspySdrReader),
+    /// HackRF-based IQ source (requires "hackrf" feature)
+    #[cfg(feature = "hackrf")]
+    HackRf(hackrf::HackRfReader),
 }
 
 impl Iterator for IqSource {
@@ -790,6 +863,8 @@ impl Iterator for IqSource {
             IqSource::SoapySdr(source) => source.next(),
             #[cfg(feature = "airspy")]
             IqSource::Airspy(source) => source.next(),
+            #[cfg(feature = "hackrf")]
+            IqSource::HackRf(source) => source.next(),
         }
     }
 }
@@ -888,6 +963,11 @@ impl IqSource {
             DeviceConfig::Airspy(cfg) => {
                 let source = airspy::AirspySdrReader::new(&cfg)?;
                 Ok(IqSource::Airspy(source))
+            }
+            #[cfg(feature = "hackrf")]
+            DeviceConfig::HackRf(cfg) => {
+                let source = hackrf::HackRfReader::new(&cfg)?;
+                Ok(IqSource::HackRf(source))
             }
         }
     }
@@ -993,6 +1073,9 @@ pub enum IqAsyncSource {
     /// Airspy-based IQ source (requires "airspy" feature)
     #[cfg(feature = "airspy")]
     Airspy(airspy::AsyncAirspySdrReader),
+    /// HackRF-based IQ source (requires "hackrf" feature)
+    #[cfg(feature = "hackrf")]
+    HackRf(hackrf::AsyncHackRfReader),
 }
 
 impl IqAsyncSource {
@@ -1003,8 +1086,10 @@ impl IqAsyncSource {
             IqAsyncSource::RtlSdr(source) => source.tune(_center_freq),
             #[cfg(feature = "airspy")]
             IqAsyncSource::Airspy(source) => source.tune(_center_freq),
+            #[cfg(feature = "hackrf")]
+            IqAsyncSource::HackRf(source) => source.tune(_center_freq as u64),
             _ => Err(error::Error::other(
-                "Retune is only supported for RTL-SDR/Airspy async sources".to_string(),
+                "Retune is only supported for RTL-SDR/Airspy/HackRF async sources".to_string(),
             )),
         }
     }
@@ -1020,6 +1105,8 @@ impl IqAsyncSource {
             IqAsyncSource::Airspy(source) => {
                 source.adjust(crate::airspy::AirspyMessage::Gain(_gain))
             }
+            #[cfg(feature = "hackrf")]
+            IqAsyncSource::HackRf(source) => source.set_gain(_gain),
             _ => Ok(()),
         }
     }
@@ -1211,7 +1298,8 @@ impl IqAsyncSource {
         feature = "rtlsdr",
         feature = "pluto",
         feature = "soapy",
-        feature = "airspy"
+        feature = "airspy",
+        feature = "hackrf"
     ))]
     pub async fn from_device_config(config: &DeviceConfig) -> error::Result<Self> {
         match config {
@@ -1235,6 +1323,11 @@ impl IqAsyncSource {
                 let async_reader = airspy::AsyncAirspySdrReader::new(cfg)?;
                 Ok(IqAsyncSource::Airspy(async_reader))
             }
+            #[cfg(feature = "hackrf")]
+            DeviceConfig::HackRf(cfg) => {
+                let async_reader = hackrf::AsyncHackRfReader::new(cfg)?;
+                Ok(IqAsyncSource::HackRf(async_reader))
+            }
         }
     }
 }
@@ -1255,6 +1348,8 @@ impl Stream for IqAsyncSource {
             IqAsyncSource::SoapySdr(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "airspy")]
             IqAsyncSource::Airspy(source) => Pin::new(source).poll_next(cx),
+            #[cfg(feature = "hackrf")]
+            IqAsyncSource::HackRf(source) => Pin::new(source).poll_next(cx),
         }
     }
 }

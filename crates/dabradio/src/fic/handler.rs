@@ -104,7 +104,9 @@ pub fn process_fic(fic_soft_bits: &[Vec<i8>]) -> Vec<[u8; FIB_LENGTH]> {
         let depunctured = fec::eep::depuncture_fic(subblock);
 
         // Step 2: Viterbi decode → 774 hard bits (768 data + 6 tail)
-        let (decoded_bits, path_metric) = fec::viterbi::viterbi_decode_with_metric(&depunctured);
+        // FIC uses tail-terminated convolutional code (6 tail bits drive encoder to state 0),
+        // so we trace back from state 0 for correct decoding of the last ~30 bits.
+        let (decoded_bits, path_metric) = fec::viterbi::viterbi_decode_state0(&depunctured);
 
         // Debug: log Viterbi metric for FIC sub-blocks
         let achievable: i32 = depunctured.iter().map(|&x| (x as i32).abs()).sum();

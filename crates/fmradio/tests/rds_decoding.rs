@@ -24,6 +24,7 @@ use fmradio::rds::{RdsDecoder, RdsGroupJson, RdsResamplerCustom, StereoDecoderPL
 use std::f32::consts::PI;
 use std::io::Read;
 use std::path::Path;
+use tracing::trace;
 
 const SAMPLE_RATE: u32 = 1_102_500;
 const FM_BANDWIDTH: f32 = 240_000.0;
@@ -46,7 +47,7 @@ fn decode_rds(offset_hz: i32) -> Vec<RdsGroupJson> {
 
     let mut stereo = StereoDecoderPLL::new(actual_mpx_rate);
     let mut rds_resampler = RdsResamplerCustom::new(actual_mpx_rate, RDS_TARGET_RATE);
-    let mut rds = RdsDecoder::new(RDS_TARGET_RATE, false);
+    let mut rds = RdsDecoder::new(RDS_TARGET_RATE, true);
     rds.set_print_json_output(false);
 
     // Lowpass not used in stereo path but keeps the chain consistent with main.rs
@@ -58,6 +59,12 @@ fn decode_rds(offset_hz: i32) -> Vec<RdsGroupJson> {
     let chunk_samples = 65_536usize;
     let chunk_bytes = chunk_samples * 2; // cu8: 2 bytes per IQ sample
     let mut groups: Vec<RdsGroupJson> = Vec::new();
+    let mut chunk_idx = 0usize;
+
+    trace!(
+        "[DIAG] factor={}, actual_mpx_rate={}",
+        factor, actual_mpx_rate
+    );
 
     loop {
         let mut buf = vec![0u8; chunk_bytes];
@@ -81,11 +88,83 @@ fn decode_rds(offset_hz: i32) -> Vec<RdsGroupJson> {
         let phase = phase_extractor.process(&decimated);
         let (_, _, pilot_phases) = stereo.process(&phase);
         let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
+
+        if chunk_idx < 3 {
+            let phase_rms =
+                (phase.iter().map(|x| x * x).sum::<f32>() / phase.len().max(1) as f32).sqrt();
+            // Check 19 kHz pilot energy via pilot_phases rate of change
+            let mut pilot_freq_sum = 0.0_f64;
+            let mut pilot_count = 0usize;
+            for i in 1..pilot_phases.len().min(1000) {
+                let mut delta = pilot_phases[i] - pilot_phases[i - 1];
+                if delta > std::f64::consts::PI {
+                    delta -= 2.0 * std::f64::consts::PI;
+                }
+                if delta < -std::f64::consts::PI {
+                    delta += 2.0 * std::f64::consts::PI;
+                }
+                pilot_freq_sum += delta;
+                pilot_count += 1;
+            }
+            let pilot_freq = if pilot_count > 0 {
+                pilot_freq_sum / pilot_count as f64 * actual_mpx_rate as f64
+                    / (2.0 * std::f64::consts::PI)
+            } else {
+                0.0
+            };
+
+            let rds_i_rms = if !rds_i.is_empty() {
+                (rds_i.iter().map(|x| x * x).sum::<f32>() / rds_i.len() as f32).sqrt()
+            } else {
+                0.0
+            };
+            let rds_q_rms = if !rds_q.is_empty() {
+                (rds_q.iter().map(|x| x * x).sum::<f32>() / rds_q.len() as f32).sqrt()
+            } else {
+                0.0
+            };
+
+            trace!(
+                "[DIAG] chunk {}: samples={}, decimated={}, phase={}, pilot_phases={}, pilot_freq={:.1}Hz, phase_rms={:.4}, rds_i_len={}, rds_i_rms={:.6}, rds_q_rms={:.6}",
+                chunk_idx,
+                samples.len(),
+                decimated.len(),
+                phase.len(),
+                pilot_phases.len(),
+                pilot_freq,
+                phase_rms,
+                rds_i.len(),
+                rds_i_rms,
+                rds_q_rms
+            );
+        }
+
         if !rds_i.is_empty() {
             rds.process_iq(&rds_i, &rds_q);
         }
         groups.extend(rds.take_json_outputs());
+
+        // Print intermediate stats after chunk 50
+        if chunk_idx == 50 {
+            let (bits_pushed, blocks_received, groups_decoded, _) = rds.stats();
+            trace!(
+                "[DIAG] After chunk 50: bits_pushed={}, blocks={}, groups={}",
+                bits_pushed, blocks_received, groups_decoded
+            );
+        }
+
+        chunk_idx += 1;
     }
+
+    let (bits_pushed, blocks_received, groups_decoded, _) = rds.stats();
+    trace!(
+        "[DIAG] Final: {} chunks, {} groups, bits_pushed={}, blocks={}, groups_decoded={}",
+        chunk_idx,
+        groups.len(),
+        bits_pushed,
+        blocks_received,
+        groups_decoded
+    );
 
     groups
 }

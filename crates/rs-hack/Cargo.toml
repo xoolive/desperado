@@ -1,0 +1,19 @@
+[package]
+name = "rs-hack"
+description = "A pure Rust library for HackRF One SDR devices"
+keywords = ["hackrf", "sdr", "radio"]
+readme = "readme.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+nusb = "0.2"
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

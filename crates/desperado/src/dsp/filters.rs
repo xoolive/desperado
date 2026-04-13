@@ -91,7 +91,7 @@ impl LowPassFir {
         assert!(taps > 0, "Number of taps must be greater than 0");
         assert!(sample_rate > 0.0, "Sample rate must be greater than 0");
 
-        let norm_cutoff = cutoff_freq / (sample_rate / 2.0);
+        let norm_cutoff = cutoff_freq / sample_rate;
         let fir = design_fir_filter(norm_cutoff, taps, WindowType::Blackman);
 
         Self { fir }
@@ -322,6 +322,88 @@ mod tests {
             low_max < high_max,
             "Lower cutoff should have smaller peak coefficient"
         );
+    }
+}
+
+/// Stateful FIR low-pass filter that maintains inter-block continuity.
+///
+/// Unlike [`LowPassFir`] which zero-pads at block boundaries, this filter keeps a ring
+/// buffer of past samples so that consecutive `process()` calls produce the same output
+/// as filtering the concatenation of all input blocks in one pass. This is essential for
+/// any application where a PLL or other feedback loop depends on the filtered output,
+/// since zero-padding artifacts at block edges would disturb the loop.
+///
+/// # Example
+///
+/// ```
+/// use desperado::dsp::filters::StatefulLowPassFir;
+///
+/// let mut filter = StatefulLowPassFir::new(15_000.0, 240_000.0, 257);
+/// let block1 = vec![1.0_f32; 1024];
+/// let block2 = vec![1.0_f32; 1024];
+/// let out1 = filter.process(&block1);
+/// let out2 = filter.process(&block2); // no edge artifact between blocks
+/// ```
+pub struct StatefulLowPassFir {
+    fir: Vec<f32>,
+    /// Ring buffer holding past input samples (length = number of taps).
+    buffer: Vec<f32>,
+    /// Write position in ring buffer.
+    write_pos: usize,
+}
+
+impl StatefulLowPassFir {
+    /// Create a new stateful low-pass FIR filter.
+    ///
+    /// # Arguments
+    ///
+    /// * `cutoff_freq` - Cutoff frequency in Hz
+    /// * `sample_rate` - Sample rate in Hz
+    /// * `taps` - Number of filter taps (must be > 0)
+    pub fn new(cutoff_freq: f32, sample_rate: f32, taps: usize) -> Self {
+        assert!(taps > 0, "Number of taps must be greater than 0");
+        assert!(sample_rate > 0.0, "Sample rate must be greater than 0");
+
+        let norm_cutoff = cutoff_freq / sample_rate;
+        let fir = super::window::design_fir_filter(
+            norm_cutoff,
+            taps,
+            super::window::WindowType::Blackman,
+        );
+
+        Self {
+            fir,
+            buffer: vec![0.0; taps],
+            write_pos: 0,
+        }
+    }
+
+    /// Process a block of samples through the filter (maintains state between calls).
+    pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(samples.len());
+        for &x in samples {
+            self.buffer[self.write_pos] = x;
+            self.write_pos = (self.write_pos + 1) % self.buffer.len();
+
+            let mut acc = 0.0_f32;
+            let len = self.fir.len();
+            for i in 0..len {
+                let buf_idx = (self.write_pos + len - 1 - i) % len;
+                acc += self.buffer[buf_idx] * self.fir[i];
+            }
+            out.push(acc);
+        }
+        out
+    }
+
+    /// Get the number of filter taps.
+    pub fn taps(&self) -> usize {
+        self.fir.len()
+    }
+
+    /// Get the filter coefficients.
+    pub fn coefficients(&self) -> &[f32] {
+        &self.fir
     }
 }
 

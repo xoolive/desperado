@@ -41,7 +41,7 @@ use desperado::dsp::{
     rotate::Rotate,
 };
 use fmradio::fm::{DeemphasisFilter, PhaseExtractor};
-use fmradio::rds::{RdsDecoder, RdsResamplerCustom};
+use fmradio::rds::{RdsDecoder, RdsResamplerCustom, StereoDecoderPLL};
 use futures::StreamExt;
 use ratatui::style::{Color, Modifier, Style};
 use std::f32::consts::PI;
@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{Level, debug, info, warn};
+use tracing::{Level, info, warn};
 use tracing_subscriber::prelude::*;
 
 use clap::{ArgAction, Parser};
@@ -500,8 +500,9 @@ async fn main() -> desperado::Result<()> {
     }));
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_thread = if args.tui {
-        let can_hard_retune =
-            args.source.starts_with("rtlsdr://") || args.source.starts_with("airspy://");
+        let can_hard_retune = args.source.starts_with("rtlsdr://")
+            || args.source.starts_with("airspy://")
+            || args.source.starts_with("hackrf://");
         Some(spawn_inline_tui(
             tui_state.clone(),
             app_running.clone(),
@@ -646,6 +647,7 @@ fn is_device_uri(input: &str) -> bool {
     input.starts_with("rtlsdr://")
         || input.starts_with("soapy://")
         || input.starts_with("airspy://")
+        || input.starts_with("hackrf://")
 }
 
 fn is_file_like_source(input: &str) -> bool {
@@ -679,20 +681,24 @@ fn ensure_tuning_query(
         }
         out.push_str(&format!("rate={sample_rate}"));
     }
-    if let Some(g) = gain
-        && !has_gain
-    {
+    if !has_gain {
         if !out.ends_with('?') && !out.ends_with('&') {
             out.push('&');
         }
-        // Backward compatibility: fmradio historically treated RTL-SDR gain
-        // CLI values as tenths of dB (e.g. -g 300 => 30.0 dB).
-        // Keep that behavior for rtlsdr:// while preserving raw values for
-        // other backends.
-        if uri.starts_with("rtlsdr://") {
-            out.push_str(&format!("gain={:.1}", f64::from(g) / 10.0));
-        } else {
-            out.push_str(&format!("gain={g}"));
+        if let Some(g) = gain {
+            // Backward compatibility: fmradio historically treated RTL-SDR gain
+            // CLI values as tenths of dB (e.g. -g 300 => 30.0 dB).
+            // Keep that behavior for rtlsdr:// while preserving raw values for
+            // other backends.
+            if uri.starts_with("rtlsdr://") {
+                out.push_str(&format!("gain={:.1}", f64::from(g) / 10.0));
+            } else {
+                out.push_str(&format!("gain={g}"));
+            }
+        } else if uri.starts_with("rtlsdr://") {
+            // RTL-SDR hardware AGC clips strong FM signals. Default to 29.7 dB
+            // manual gain which works well for FM broadcast reception.
+            out.push_str("gain=29.7");
         }
     }
 
@@ -1059,29 +1065,6 @@ async fn run_stereo(
             };
 
             // Convert f32 to signed 16-bit PCM and write to stdout
-            // rtl_fm outputs samples scaled similarly to audio - we need to find the right scale
-            // Debug: print min/max of first batch
-            static DBG_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let dbg_cnt = DBG_RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if dbg_cnt == 0 && !samples_to_output.is_empty() {
-                let min = samples_to_output
-                    .iter()
-                    .cloned()
-                    .fold(f32::INFINITY, f32::min);
-                let max = samples_to_output
-                    .iter()
-                    .cloned()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let mean = samples_to_output.iter().sum::<f32>() / samples_to_output.len() as f32;
-                debug!(
-                    "[RAW-DBG] Phase signal: min={:.4}, max={:.4}, mean={:.4}, len={}",
-                    min,
-                    max,
-                    mean,
-                    samples_to_output.len()
-                );
-            }
-
             // Scale: Phase extractor outputs ~±π for FM deviation.
             // rtl_fm seems to scale to small i16 values (most samples near 0)
             // Scale so that full deviation maps to ~25000 (leaving headroom)
@@ -1106,12 +1089,13 @@ async fn run_stereo(
         // RDS: Resample MPX to 171 kHz using pilot-coherent carrier mixing
         // This uses the 19 kHz pilot phase × 3 for perfect 57 kHz carrier lock
         let (rds_i, rds_q) = rds_resampler.process_with_pilot(&phase, &pilot_phases);
+
         if !rds_i.is_empty() {
             rds.process_iq(&rds_i, &rds_q);
             if let Some(state) = &tui_state
                 && let Ok(mut s) = state.lock()
             {
-                let (total, valid, groups) = rds.stats();
+                let (total, valid, groups, _) = rds.stats();
                 s.rds_total_blocks = total;
                 s.rds_valid_blocks = u64::from(valid);
                 s.rds_groups = u64::from(groups);
@@ -1166,6 +1150,24 @@ async fn run_stereo(
                 }
             }
         }
+    }
+
+    // Print RDS summary at exit
+    {
+        let (bits_pushed, blocks_received, groups, blocks_checked) = rds.stats();
+        let bler = if blocks_checked > 0 {
+            (100.0 * (1.0 - blocks_received as f64 / blocks_checked as f64)).max(0.0)
+        } else {
+            0.0
+        };
+        tracing::info!(
+            rds_blocks_received = blocks_received,
+            rds_blocks_checked = blocks_checked,
+            rds_groups = groups,
+            rds_bits_pushed = bits_pushed,
+            rds_bler_pct = format!("{:.1}", bler),
+            "RDS decode summary"
+        );
     }
 
     Ok(())
@@ -1342,127 +1344,5 @@ impl AudioAdaptiveResampler {
         }
 
         output
-    }
-}
-
-/// Stereo decoder using a complex PLL locked to the 19 kHz pilot tone.
-pub struct StereoDecoderPLL {
-    sample_rate: f32,
-    pll_phase: f64,
-    pll_freq: f64,
-    nominal_freq: f64,
-    kp: f64,
-    ki: f64,
-    error_lpf_state: f64, // IIR lowpass state for phase error filtering
-    error_lpf_alpha: f64, // IIR lowpass coefficient
-    pilot_hi: LowPassFir,
-    pilot_lo: LowPassFir,
-    diff_lowpass: LowPassFir,
-}
-
-impl StereoDecoderPLL {
-    pub fn new(sample_rate: f32) -> Self {
-        let nominal = 19_000.0_f64;
-        // IIR lowpass for phase error: fc ~ 50 Hz, alpha = 2*pi*fc / (fs + 2*pi*fc)
-        // This filters out the 2*f_pilot component from the multiplier phase detector
-        let fc = 50.0; // Phase error filter cutoff (Hz)
-        let error_lpf_alpha = 2.0 * std::f64::consts::PI * fc
-            / (sample_rate as f64 + 2.0 * std::f64::consts::PI * fc);
-
-        Self {
-            sample_rate,
-            pll_phase: 0.0,
-            pll_freq: nominal,
-            nominal_freq: nominal,
-            // PLL gains: kp for proportional (phase), ki for integral (frequency)
-            // These are tuned for tracking a stable 19 kHz pilot
-            kp: 0.01, // Proportional gain - controls phase response speed
-            ki: 5e-6, // Integral gain - controls frequency acquisition
-            error_lpf_state: 0.0,
-            error_lpf_alpha,
-            pilot_hi: LowPassFir::new(19_700.0, sample_rate, 257),
-            pilot_lo: LowPassFir::new(18_300.0, sample_rate, 257),
-            diff_lowpass: LowPassFir::new(15_000.0, sample_rate, 257),
-        }
-    }
-
-    /// Process input samples and return (left, right, pilot_phases)
-    /// pilot_phases contains the 19 kHz pilot PLL phase at each sample (for RDS carrier recovery)
-    pub fn process(&mut self, input: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f64>) {
-        let n = input.len();
-        let pilot_hi = self.pilot_hi.process(input);
-        let pilot_lo = self.pilot_lo.process(input);
-        let mut pilot_band = Vec::with_capacity(n);
-        for i in 0..n {
-            pilot_band.push(pilot_hi[i] - pilot_lo[i]);
-        }
-
-        let mut lmr_raw = Vec::with_capacity(n);
-        let mut pilot_phases = Vec::with_capacity(n);
-        let phase_inc = 2.0 * std::f64::consts::PI / self.sample_rate as f64;
-
-        for &p in &pilot_band {
-            let p = p as f64;
-
-            // Multiplier phase detector for real sinusoid:
-            // If pilot = A*cos(ω*t + φ) and NCO = sin(pll_phase), then
-            // product = A*cos(ω*t + φ) * sin(pll_phase)
-            //         = A/2 * [sin(pll_phase - ω*t - φ) + sin(pll_phase + ω*t + φ)]
-            // After lowpass filtering, we get: A/2 * sin(phase_error)
-            // where phase_error = pll_phase - (ω*t + φ)
-            // When locked: phase_error → 0, so error → 0
-            let raw_error = p * self.pll_phase.sin();
-
-            // IIR lowpass filter to remove 2*f_pilot component
-            self.error_lpf_state += self.error_lpf_alpha * (raw_error - self.error_lpf_state);
-            let error = self.error_lpf_state;
-
-            // Second-order PLL update: frequency integrator + phase
-            self.pll_freq += self.ki * error;
-            self.pll_freq = self
-                .pll_freq
-                .clamp(self.nominal_freq * 0.99, self.nominal_freq * 1.01);
-
-            // Phase update: NCO advance + proportional correction
-            self.pll_phase += phase_inc * self.pll_freq + self.kp * error;
-
-            // Keep phase in [-π, π]
-            while self.pll_phase > std::f64::consts::PI {
-                self.pll_phase -= 2.0 * std::f64::consts::PI;
-            }
-            while self.pll_phase < -std::f64::consts::PI {
-                self.pll_phase += 2.0 * std::f64::consts::PI;
-            }
-
-            // Store the pilot phase at this sample AFTER the PLL update
-            pilot_phases.push(self.pll_phase);
-
-            let carrier_38 = (2.0 * self.pll_phase).sin();
-            lmr_raw.push(input[lmr_raw.len()] as f64 * carrier_38);
-        }
-
-        let lmr_f32: Vec<f32> = lmr_raw.iter().map(|&v| v as f32).collect();
-        let lmr = self.diff_lowpass.process(&lmr_f32);
-
-        let mut left = Vec::with_capacity(n);
-        let mut right = Vec::with_capacity(n);
-        for i in 0..n {
-            let lpr = input[i];
-            let lmr_val = lmr[i];
-            left.push(0.5 * (lpr + lmr_val));
-            right.push(0.5 * (lpr - lmr_val));
-        }
-        (left, right, pilot_phases)
-    }
-
-    /// Get the current PLL phase (for 19 kHz pilot)
-    /// Multiply by 3 to get phase for 57 kHz RDS carrier
-    pub fn pilot_phase(&self) -> f64 {
-        self.pll_phase
-    }
-
-    /// Get the current PLL frequency (should be ~19 kHz when locked)
-    pub fn pilot_freq(&self) -> f64 {
-        self.pll_freq
     }
 }

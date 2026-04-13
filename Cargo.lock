@@ -776,6 +776,7 @@ dependencies = [
  "num-complex",
  "plotters",
  "pluto-sdr",
+ "rs-hack",
  "rs-rtl",
  "rs-spy",
  "rusb",
@@ -2372,6 +2373,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "rs-hack"
+version = "0.3.0"
+dependencies = [
+ "nusb",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

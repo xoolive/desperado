@@ -501,7 +501,7 @@ impl OfdmProcessor {
                 "freq estimation"
             );
             if self.last_prs_snr > 20.0 || self.frame_count == 0 {
-                self.coarse_freq_carriers = coarse;
+                self.coarse_freq_carriers += coarse;
             }
         }
 

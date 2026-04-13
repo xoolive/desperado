@@ -483,6 +483,8 @@ pub struct RdsParser {
     pub(super) groups_decoded: u32,
     /// Count of valid blocks received (for debugging)
     blocks_received: u32,
+    /// Count of blocks checked at block boundaries while synced (for BLER)
+    blocks_checked: u32,
     /// Count of bits pushed (for debugging)
     bits_pushed: u64,
     /// Block synchronization state
@@ -574,6 +576,7 @@ impl RdsParser {
             station_info: StationInfo::default(),
             groups_decoded: 0,
             blocks_received: 0,
+            blocks_checked: 0,
             bits_pushed: 0,
             is_synced: false,
             expected_offset: 'A',
@@ -588,9 +591,14 @@ impl RdsParser {
         }
     }
 
-    /// Get debugging statistics
-    pub fn stats(&self) -> (u64, u32, u32) {
-        (self.bits_pushed, self.blocks_received, self.groups_decoded)
+    /// Get debugging statistics: (bits_pushed, blocks_received, groups_decoded, blocks_checked)
+    pub fn stats(&self) -> (u64, u32, u32, u32) {
+        (
+            self.bits_pushed,
+            self.blocks_received,
+            self.groups_decoded,
+            self.blocks_checked,
+        )
     }
 
     /// Enable JSON output mode (outputs RDS groups as JSON to stdout)
@@ -783,6 +791,7 @@ impl RdsParser {
 
     /// Process block when we're synced and at a block boundary
     fn process_block_at_boundary(&mut self) {
+        self.blocks_checked += 1;
         let synd = rds_syndrome(self.shift);
         let detected_offset = rds_offset_for_syndrome(synd);
 

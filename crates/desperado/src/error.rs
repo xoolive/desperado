@@ -33,6 +33,10 @@ pub enum Error {
     #[cfg(feature = "pluto")]
     PlutoSdr(String),
 
+    /// HackRF specific error (requires "hackrf" feature)
+    #[cfg(feature = "hackrf")]
+    HackRf(rs_hack::Error),
+
     /// Generic error with custom message
     Other(String),
 }
@@ -49,6 +53,8 @@ impl fmt::Display for Error {
             Error::SoapySdr(err) => write!(f, "SoapySDR error: {}", err),
             #[cfg(feature = "pluto")]
             Error::PlutoSdr(msg) => write!(f, "Pluto SDR error: {}", msg),
+            #[cfg(feature = "hackrf")]
+            Error::HackRf(err) => write!(f, "HackRF error: {}", err),
             Error::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -62,6 +68,8 @@ impl std::error::Error for Error {
             Error::RtlSdr(err) => Some(err),
             #[cfg(feature = "soapy")]
             Error::SoapySdr(err) => Some(err),
+            #[cfg(feature = "hackrf")]
+            Error::HackRf(err) => Some(err),
             _ => None,
         }
     }
@@ -98,6 +106,13 @@ impl From<rs_rtl::Error> for Error {
 impl From<soapysdr::Error> for Error {
     fn from(err: soapysdr::Error) -> Self {
         Error::SoapySdr(err)
+    }
+}
+
+#[cfg(feature = "hackrf")]
+impl From<rs_hack::Error> for Error {
+    fn from(err: rs_hack::Error) -> Self {
+        Error::HackRf(err)
     }
 }
 
