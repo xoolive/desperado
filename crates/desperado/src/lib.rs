@@ -663,6 +663,7 @@ impl std::str::FromStr for DeviceConfig {
                 let mut lna_gain: Option<u8> = None;
                 let mut mixer_gain: Option<u8> = None;
                 let mut vga_gain: Option<u8> = None;
+                let mut gain_mode = airspy::AirspyGainMode::default();
 
                 for param in query.split('&') {
                     if param.is_empty() {
@@ -707,6 +708,20 @@ impl std::str::FromStr for DeviceConfig {
                             })?;
                             vga_gain = Some(v);
                         }
+                        "gain_mode" | "gain-mode" => match kv[1].to_lowercase().as_str() {
+                            "linearity" | "linear" => {
+                                gain_mode = airspy::AirspyGainMode::Linearity;
+                            }
+                            "sensitivity" | "sensitive" => {
+                                gain_mode = airspy::AirspyGainMode::Sensitivity;
+                            }
+                            _ => {
+                                return Err(Error::other(format!(
+                                    "Invalid gain_mode '{}': expected 'linearity' or 'sensitivity'",
+                                    kv[1]
+                                )));
+                            }
+                        },
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -721,6 +736,7 @@ impl std::str::FromStr for DeviceConfig {
                 cfg.lna_gain = lna_gain;
                 cfg.mixer_gain = mixer_gain;
                 cfg.vga_gain = vga_gain;
+                cfg.gain_mode = gain_mode;
                 Ok(DeviceConfig::Airspy(cfg))
             }
             #[cfg(feature = "hackrf")]
@@ -1285,6 +1301,7 @@ impl IqAsyncSource {
             lna_gain,
             mixer_gain,
             vga_gain,
+            gain_mode: airspy::AirspyGainMode::default(),
         };
         let async_reader = airspy::AsyncAirspySdrReader::new(&config)?;
         Ok(IqAsyncSource::Airspy(async_reader))

@@ -747,14 +747,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open IQ source (file or live SDR URI)
     // - stdin/file: use --sample-rate when provided
-    // - airspy://: 3.0 MS/s IQ; set_sample_rate_hz(3M, iq_mode=true) doubles the value sent to
-    //   firmware → 6000 kHz hardware real rate; rs-spy IqConverter halves to 3 Msps complex IQ.
-    //   (welle.io uses 4096k with libairspy FLOAT32_IQ which does NOT decimate — that approach
-    //   requires 4096 kHz firmware support, not in [6M, 3M] for Airspy Mini)
+    // - airspy://: 4.096 MS/s IQ (matching welle.io's approach).
+    //   4096000 is not in firmware's supported list [6M, 3M], so the kHz fallback
+    //   sends 4096000*2/1000 = 8192 kHz to firmware. ADC runs at 8.192 MHz real,
+    //   IqConverter decimates 2:1 → 4.096M complex IQ.
+    //   DabResampler::Half then does 2:1 pair-averaging → 2.048M (DAB native rate).
+    //   This avoids fractional resampling, giving clean OFDM sync.
     // - others default: 2.048 MS/s
     let default_input_rate = cli.sample_rate.unwrap_or_else(|| {
         if source.starts_with("airspy://") {
-            3_000_000
+            4_096_000
         } else {
             constants::SAMPLE_RATE
         }
@@ -983,13 +985,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let samples = {
             let mut samples = samples;
             if let Some(ref mut resampler) = iq_resampler {
-                if main_loop_iter <= 10 {
-                    debug!(n = samples.len(), "resampling");
-                }
                 samples = resampler.process(&samples);
-                if main_loop_iter <= 10 {
-                    debug!(n = samples.len(), "resampled");
-                }
                 if samples.is_empty() {
                     continue;
                 }
@@ -1058,6 +1054,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if soft_bits.len() >= constants::FIC_SYMBOLS {
                 let fic_symbols: Vec<Vec<i8>> = soft_bits[..constants::FIC_SYMBOLS].to_vec();
                 let fibs = fic::handler::process_fic(&fic_symbols);
+
+                // Feed FIC decode ratio back to OFDM processor for coarse freq gating.
+                // Each frame has 4 subblocks × 3 FIBs = 12 expected FIBs.
+                // Matches welle.io's ficHandler.getFicDecodeRatioPercent() feedback loop.
+                let fic_ratio = ((fibs.len() as f32 / 12.0) * 100.0).round().min(100.0) as u8;
+                ofdm_processor.set_fic_decode_ratio(fic_ratio);
 
                 for fib in &fibs {
                     fib_count += 1;
@@ -1652,6 +1654,8 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> Stri
     let has_query = uri.contains('?');
     let has_freq = uri.contains("freq=") || uri.contains("frequency=");
     let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
+    let has_gain = uri.contains("gain=");
+    let has_gain_mode = uri.contains("gain_mode=") || uri.contains("gain-mode=");
 
     let mut out = uri.to_string();
     if !has_query {
@@ -1669,6 +1673,34 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> Stri
         }
         out.push_str(&format!("rate={sample_rate}"));
     }
+
+    // For Airspy devices doing DAB, default to linearity gain mode with gain=40
+    // Linearity mode is critical for OFDM: it optimizes for low intermodulation
+    // distortion across all sub-carriers, whereas sensitivity mode optimizes for
+    // weak-signal reception and can cause OFDM sync failures.
+    if uri.starts_with("airspy://") {
+        if !has_gain_mode {
+            if !out.ends_with('?') && !out.ends_with('&') {
+                out.push('&');
+            }
+            out.push_str("gain_mode=linearity");
+        }
+        if !has_gain {
+            if !out.ends_with('?') && !out.ends_with('&') {
+                out.push('&');
+            }
+            out.push_str("gain=40");
+        }
+    }
+
+    // For RTL-SDR devices, default to gain=28 for balanced reception
+    if uri.starts_with("rtlsdr://") && !has_gain {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str("gain=28");
+    }
+
     out
 }
 

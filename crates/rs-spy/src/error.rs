@@ -58,23 +58,31 @@ impl AirspyErrorCode {
 /// Errors that can occur during Airspy operations.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// USB operation failed.
-    #[error("USB error: {0}")]
-    Usb(#[from] rusb::Error),
+    /// Failed to open USB device.
+    #[error("failed to open USB device: {0}")]
+    OpenFailed(#[source] nusb::Error),
+
+    /// Failed to claim USB interface.
+    #[error("failed to claim USB interface: {0}")]
+    ClaimFailed(#[source] nusb::Error),
+
+    /// USB control transfer failed.
+    #[error("control transfer failed: {0}")]
+    ControlTransfer(#[source] nusb::transfer::TransferError),
+
+    /// USB bulk transfer failed.
+    #[error("bulk transfer failed: {0}")]
+    BulkTransfer(#[source] nusb::transfer::TransferError),
 
     /// No Airspy device found.
     #[error("No Airspy device found")]
     DeviceNotFound,
 
-    /// Failed to open device.
-    #[error("Failed to open device: {0}")]
-    OpenFailed(String),
-
     /// Device configuration failed.
     #[error("Configuration failed: {0}")]
     ConfigFailed(String),
 
-    /// Control transfer failed.
+    /// Control transfer failed (with context message).
     #[error("Control transfer failed: {0}")]
     ControlTransferFailed(String),
 

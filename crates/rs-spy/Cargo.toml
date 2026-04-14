@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 num-complex = "0.4"
-rusb = "0.9"
+nusb = "0.2"
 thiserror = "2.0"
 tracing = "0.1"
 

@@ -791,6 +791,7 @@ async fn run_mono(
 
         let shifted = rotate.process(&chunk);
         let decimated = decimator.process(&shifted);
+
         if let Some(state) = &tui_state
             && let Ok(mut s) = state.lock()
         {
@@ -807,7 +808,6 @@ async fn run_mono(
         let deemphasized = deemphasis.process(&filtered);
 
         let audio = audio_resample.process(&deemphasized);
-
         let chunk_max = audio.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
 
         if chunk_max > 0.0001 {
@@ -1203,6 +1203,7 @@ struct AudioAdaptiveResampler {
     adjustment_counter: usize,
     leftover: Vec<f32>,
     resample_ratio: f64,
+    nominal_ratio: f64,
     channels: usize,
     show_status_meter: bool,
 }
@@ -1230,15 +1231,16 @@ impl AudioAdaptiveResampler {
         Self {
             resampler,
             target_fill: if channels == 1 { 0.3 } else { 0.4 },
-            alpha: if channels == 1 { 0.95 } else { 0.9 },
-            k_p: if channels == 1 { 0.0001 } else { 0.002 },
-            k_i: if channels == 1 { 1e-7 } else { 5e-6 },
+            alpha: if channels == 1 { 0.92 } else { 0.9 },
+            k_p: if channels == 1 { 0.002 } else { 0.004 },
+            k_i: if channels == 1 { 1e-4 } else { 2e-4 },
             smoothed_error: 0.0,
             integral_error: 0.0,
             adjustment_interval,
             adjustment_counter: 0,
             leftover: Vec::new(),
             resample_ratio: initial_ratio,
+            nominal_ratio: initial_ratio,
             channels,
             show_status_meter,
         }
@@ -1249,25 +1251,36 @@ impl AudioAdaptiveResampler {
         if self.adjustment_counter >= self.adjustment_interval {
             self.adjustment_counter = 0;
 
+            // error > 0 means buffer is below target (need more output → increase ratio)
+            // error < 0 means buffer is above target (need less output → decrease ratio)
             let error = self.target_fill - buffer_fill;
 
+            // Exponential smoothing — fast enough to track, slow enough to filter noise
             self.smoothed_error = self.alpha * self.smoothed_error + (1.0 - self.alpha) * error;
 
-            if self.smoothed_error.abs() < 0.01 {
-                self.smoothed_error = 0.0;
-            }
+            let min_ratio = self.nominal_ratio * 0.95;
+            let max_ratio = self.nominal_ratio * 1.05;
 
-            if self.smoothed_error.abs() < 0.15 {
+            // Compute unclamped output
+            let unclamped = self.nominal_ratio
+                + self.k_p * self.smoothed_error
+                + self.k_i * self.integral_error;
+
+            // Anti-windup: only integrate when NOT saturated in the same direction.
+            // If the output would be clamped high and error is positive (pushing higher),
+            // don't accumulate. Same logic for the low side.
+            let saturated_high = unclamped > max_ratio && self.smoothed_error > 0.0;
+            let saturated_low = unclamped < min_ratio && self.smoothed_error < 0.0;
+
+            if !saturated_high && !saturated_low {
                 self.integral_error += self.smoothed_error;
-                self.integral_error = self.integral_error.clamp(-100.0, 100.0);
+                self.integral_error = self.integral_error.clamp(-500.0, 500.0);
             }
 
-            self.resample_ratio += self.k_p * self.smoothed_error + self.k_i * self.integral_error;
-
-            let nominal = AUDIO_RATE as f64 / FM_BANDWIDTH as f64;
-            let min_ratio = nominal * 0.97;
-            let max_ratio = nominal * 1.02;
-
+            // Recompute with potentially updated integral
+            self.resample_ratio = self.nominal_ratio
+                + self.k_p * self.smoothed_error
+                + self.k_i * self.integral_error;
             self.resample_ratio = self.resample_ratio.clamp(min_ratio, max_ratio);
 
             self.resampler
@@ -1276,10 +1289,10 @@ impl AudioAdaptiveResampler {
 
             if self.channels == 1 && self.show_status_meter {
                 print!(
-                    "\rBuf: {:.1}% | Ratio: {:.6} (nom: {:.6}) | Err: {:.3} | smooth: {:.3} | integral: {:.3}      ",
+                    "\rBuf: {:.1}% | Ratio: {:.6} (nom: {:.6}) | Err: {:.3} | smooth: {:.3} | integral: {:.1}      ",
                     buffer_fill * 100.0,
                     self.resample_ratio,
-                    nominal,
+                    self.nominal_ratio,
                     error,
                     self.smoothed_error,
                     self.integral_error

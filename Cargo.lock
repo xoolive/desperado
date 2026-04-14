@@ -2400,7 +2400,7 @@ name = "rs-spy"
 version = "0.3.0"
 dependencies = [
  "num-complex",
- "rusb",
+ "nusb",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

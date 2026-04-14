@@ -39,9 +39,34 @@
 use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, AirspyGainStages, IqConverter, RECOMMENDED_BUFFER_SIZE};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{Gain, GainElementName, error};
+
+/// Airspy gain preset mode
+///
+/// Controls which gain lookup tables are used when `Gain::Manual(dB)` is applied.
+///
+/// - **Sensitivity** (default): Optimizes for weak-signal reception (e.g. FM radio).
+///   Uses `set_sensitivity_gain()` internally.
+/// - **Linearity**: Optimizes for signal linearity, important for multi-carrier
+///   modulation such as OFDM/DAB where intermodulation distortion matters more than
+///   raw sensitivity. Uses `set_linearity_gain()` internally.
+///   welle.io defaults to linearity gain 10 for Airspy DAB reception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirspyGainMode {
+    /// Sensitivity-optimized gain presets (default, best for FM)
+    Sensitivity,
+    /// Linearity-optimized gain presets (best for DAB/OFDM)
+    Linearity,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for AirspyGainMode {
+    fn default() -> Self {
+        AirspyGainMode::Sensitivity
+    }
+}
 
 /// Device selector for Airspy devices
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +111,8 @@ pub struct AirspyConfig {
     pub mixer_gain: Option<u8>,
     /// VGA gain (0-15), None for default/auto
     pub vga_gain: Option<u8>,
+    /// Gain preset mode (Sensitivity vs Linearity)
+    pub gain_mode: AirspyGainMode,
 }
 
 impl AirspyConfig {
@@ -108,6 +135,7 @@ impl AirspyConfig {
             lna_gain: None,
             mixer_gain: None,
             vga_gain: None,
+            gain_mode: AirspyGainMode::default(),
         }
     }
 
@@ -123,6 +151,7 @@ impl AirspyConfig {
             lna_gain: None,
             mixer_gain: None,
             vga_gain: None,
+            gain_mode: AirspyGainMode::default(),
         }
     }
 }
@@ -234,10 +263,11 @@ fn open_device_with_selector(selector: &DeviceSelector) -> error::Result<Airspy>
     }
 }
 
-/// Configure gain on Airspy device based on Gain enum
+/// Configure gain on Airspy device based on Gain enum and gain mode
 fn configure_gain(
     device: &Airspy,
     gain: &Gain,
+    gain_mode: AirspyGainMode,
     lna: Option<u8>,
     mixer: Option<u8>,
     vga: Option<u8>,
@@ -287,12 +317,23 @@ fn configure_gain(
                 .map_err(|e| error::Error::device(format!("Failed to set VGA gain: {}", e)))?;
         }
         Gain::Manual(db) => {
-            // Map dB value (0-50 range typical) to Airspy's sensitivity preset (0-21)
+            // Map dB value (0-50 range typical) to Airspy's gain preset (0-21)
             // This is an approximation; actual dB depends on frequency and other factors
             let level = ((*db / 50.0) * 21.0).clamp(0.0, 21.0) as u8;
-            device.set_sensitivity_gain(level).map_err(|e| {
-                error::Error::device(format!("Failed to set sensitivity gain: {}", e))
-            })?;
+            match gain_mode {
+                AirspyGainMode::Linearity => {
+                    device.set_linearity_gain(level).map_err(|e| {
+                        error::Error::device(format!("Failed to set linearity gain: {}", e))
+                    })?;
+                    info!(level, "Airspy linearity gain set");
+                }
+                AirspyGainMode::Sensitivity => {
+                    device.set_sensitivity_gain(level).map_err(|e| {
+                        error::Error::device(format!("Failed to set sensitivity gain: {}", e))
+                    })?;
+                    info!(level, "Airspy sensitivity gain set");
+                }
+            }
         }
         Gain::Elements(elements) => {
             // Disable AGC when using element-based gain
@@ -396,6 +437,7 @@ impl AirspySdrReader {
         configure_gain(
             &device,
             &config.gain,
+            config.gain_mode,
             config.lna_gain,
             config.mixer_gain,
             config.vga_gain,
@@ -539,6 +581,7 @@ pub enum AirspyMessage {
 /// Convert a `Gain` to raw `AirspyGainStages` for the control channel.
 fn gain_to_stages(
     gain: &Gain,
+    gain_mode: AirspyGainMode,
     lna: Option<u8>,
     mixer: Option<u8>,
     vga: Option<u8>,
@@ -552,25 +595,48 @@ fn gain_to_stages(
             vga: vga.unwrap_or(15),
         },
         Gain::Manual(db) => {
-            // Map 0–50 dB to sensitivity preset 0–21; matches configure_gain()
+            // Map 0–50 dB to gain preset 0–21; matches configure_gain()
             let level = ((*db as u32 * 21) / 50).min(21) as u8;
-            // Look up from the same SENSITIVITY tables used at init time
-            const SENSITIVITY_VGA: [u8; 22] = [
-                13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-            ];
-            const SENSITIVITY_MIXER: [u8; 22] = [
-                12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0,
-            ];
-            const SENSITIVITY_LNA: [u8; 22] = [
-                14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1, 0,
-            ];
             let idx = (21 - level) as usize;
-            AirspyGainStages {
-                lna_agc: false,
-                mixer_agc: false,
-                lna: SENSITIVITY_LNA[idx],
-                mixer: SENSITIVITY_MIXER[idx],
-                vga: SENSITIVITY_VGA[idx],
+            match gain_mode {
+                AirspyGainMode::Linearity => {
+                    const LINEARITY_VGA: [u8; 22] = [
+                        13, 12, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 8, 7, 6,
+                        5, 4,
+                    ];
+                    const LINEARITY_MIXER: [u8; 22] = [
+                        12, 12, 11, 9, 8, 7, 6, 6, 5, 0, 0, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0,
+                    ];
+                    const LINEARITY_LNA: [u8; 22] = [
+                        14, 14, 14, 13, 12, 10, 9, 9, 8, 9, 8, 6, 5, 3, 1, 0, 0, 0, 0, 0, 0, 0,
+                    ];
+                    AirspyGainStages {
+                        lna_agc: false,
+                        mixer_agc: false,
+                        lna: LINEARITY_LNA[idx],
+                        mixer: LINEARITY_MIXER[idx],
+                        vga: LINEARITY_VGA[idx],
+                    }
+                }
+                AirspyGainMode::Sensitivity => {
+                    const SENSITIVITY_VGA: [u8; 22] = [
+                        13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+                    ];
+                    const SENSITIVITY_MIXER: [u8; 22] = [
+                        12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0,
+                    ];
+                    const SENSITIVITY_LNA: [u8; 22] = [
+                        14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1,
+                        0,
+                    ];
+                    AirspyGainStages {
+                        lna_agc: false,
+                        mixer_agc: false,
+                        lna: SENSITIVITY_LNA[idx],
+                        mixer: SENSITIVITY_MIXER[idx],
+                        vga: SENSITIVITY_VGA[idx],
+                    }
+                }
             }
         }
         Gain::Elements(elements) => {
@@ -619,6 +685,7 @@ fn gain_to_stages(
 pub struct AsyncAirspySdrReader {
     rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
     ctrl: rs_spy::transport::AsyncReadControlHandle,
+    gain_mode: AirspyGainMode,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -648,6 +715,7 @@ impl AsyncAirspySdrReader {
         configure_gain(
             &device,
             &cfg.gain,
+            cfg.gain_mode,
             cfg.lna_gain,
             cfg.mixer_gain,
             cfg.vga_gain,
@@ -704,29 +772,25 @@ impl AsyncAirspySdrReader {
                         }
 
                         let num_samples = convert_airspy_real_to_f32(&bytes, &mut float_buf);
+
                         let samples =
                             iq_converter.process_to_complex(&mut float_buf[..num_samples]);
                         chunk_count += 1;
                         if chunk_count <= 5 {
                             debug!(
                                 chunk = chunk_count,
+                                bytes = bytes.len(),
+                                num_samples,
                                 iq_samples = samples.len(),
                                 "Airspy sending chunk"
                             );
                         }
-                        match tx.try_send(Ok(samples)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
-                                warn!(chunk = chunk_count, "Airspy channel full, blocking");
-                                if tx.blocking_send(v).is_err() {
-                                    error!("Airspy blocking_send failed, exiting");
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                debug!("Airspy channel closed, exiting");
-                                break;
-                            }
+                        // Use blocking_send for backpressure (lesson 20.1:
+                        // never use try_send in real-time signal processing
+                        // pipelines — dropped samples corrupt protocol framing).
+                        if tx.blocking_send(Ok(samples)).is_err() {
+                            debug!("Airspy channel closed, exiting");
+                            break;
                         }
                     }
                     Err(e) => {
@@ -742,6 +806,7 @@ impl AsyncAirspySdrReader {
         Ok(Self {
             rx,
             ctrl,
+            gain_mode: cfg.gain_mode,
             _handle: handle,
         })
     }
@@ -758,7 +823,7 @@ impl AsyncAirspySdrReader {
                 .tune(freq)
                 .map_err(|e| error::Error::device(format!("Airspy async tune failed: {}", e))),
             AirspyMessage::Gain(gain) => {
-                let stages = gain_to_stages(&gain, None, None, None);
+                let stages = gain_to_stages(&gain, self.gain_mode, None, None, None);
                 self.ctrl.set_gain(stages).map_err(|e| {
                     error::Error::device(format!("Airspy async set_gain failed: {}", e))
                 })

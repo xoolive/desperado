@@ -2,7 +2,8 @@
 
 use crate::error::{Error, Result};
 use crate::{AIRSPY_PID, AIRSPY_VID};
-use rusb::{Context, Device, DeviceHandle, UsbContext};
+use nusb::MaybeFuture;
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -83,28 +84,6 @@ pub struct AirspyGainStages {
     pub lna: u8,   // 0-14
     pub mixer: u8, // 0-15
     pub vga: u8,   // 0-15
-}
-
-/// A cloneable handle for concurrent bulk reads from multiple threads.
-///
-/// Each clone wraps the same underlying `rusb::DeviceHandle` (which is both
-/// `Send` and `Sync`), so all copies submit independent bulk transfers that are
-/// in-flight simultaneously — the same technique libairspy uses internally with
-/// its USB transfer/event thread.
-pub struct SharedBulkHandle(Arc<DeviceHandle<Context>>);
-
-impl SharedBulkHandle {
-    pub fn read_bulk(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        self.0
-            .read_bulk(BULK_ENDPOINT_IN, buf, timeout)
-            .map_err(|e| Error::StreamingError(e.to_string()))
-    }
-}
-
-impl Clone for SharedBulkHandle {
-    fn clone(&self) -> Self {
-        SharedBulkHandle(Arc::clone(&self.0))
-    }
 }
 
 pub struct AsyncReadHandle {
@@ -202,11 +181,13 @@ static SENSITIVITY_LNA_GAINS: [u8; GAIN_COUNT] = [
 
 /// Airspy device handle.
 ///
-/// The USB handle is stored in an `Arc` so that `into_multi_transfer_reader`
-/// can hand out `SharedBulkHandle` clones to concurrent reader threads while
-/// the control thread retains ownership of the `Airspy` for configuration.
+/// Uses nusb for USB communication. The `nusb::Interface` is internally
+/// Arc-backed and Clone, so no explicit Arc wrapping is needed.
 pub struct Airspy {
-    device: Arc<DeviceHandle<Context>>,
+    iface: nusb::Interface,
+    /// Keep the nusb::Device alive so the interface remains valid.
+    #[allow(dead_code)]
+    usb_device: nusb::Device,
 }
 
 impl Airspy {
@@ -218,14 +199,11 @@ impl Airspy {
     /// - `Err(Error::DeviceNotFound)` if no Airspy device is connected
     /// - `Err(Error::OpenFailed)` if the device could not be opened
     pub fn open_first() -> Result<Self> {
-        let context = Context::new()?;
-        let devices = context.devices()?;
+        let devices = nusb::list_devices().wait().map_err(Error::OpenFailed)?;
 
-        for device in devices.iter() {
-            let desc = device.device_descriptor()?;
-
-            if desc.vendor_id() == AIRSPY_VID && desc.product_id() == AIRSPY_PID {
-                return Self::open_device(&device);
+        for dev_info in devices {
+            if dev_info.vendor_id() == AIRSPY_VID && dev_info.product_id() == AIRSPY_PID {
+                return Self::open_device_info(dev_info);
             }
         }
 
@@ -238,16 +216,13 @@ impl Airspy {
     ///
     /// * `index` - Zero-based device index (in order of enumeration)
     pub fn open_by_index(index: usize) -> Result<Self> {
-        let context = Context::new()?;
-        let devices = context.devices()?;
+        let devices = nusb::list_devices().wait().map_err(Error::OpenFailed)?;
 
         let mut count = 0;
-        for device in devices.iter() {
-            let desc = device.device_descriptor()?;
-
-            if desc.vendor_id() == AIRSPY_VID && desc.product_id() == AIRSPY_PID {
+        for dev_info in devices {
+            if dev_info.vendor_id() == AIRSPY_VID && dev_info.product_id() == AIRSPY_PID {
                 if count == index {
-                    return Self::open_device(&device);
+                    return Self::open_device_info(dev_info);
                 }
                 count += 1;
             }
@@ -258,18 +233,15 @@ impl Airspy {
 
     /// List all available Airspy devices.
     pub fn list_devices() -> Result<Vec<String>> {
-        let context = Context::new()?;
-        let devices = context.devices()?;
+        let devices = nusb::list_devices().wait().map_err(Error::OpenFailed)?;
         let mut result = Vec::new();
 
-        for device in devices.iter() {
-            let desc = device.device_descriptor()?;
-
-            if desc.vendor_id() == AIRSPY_VID && desc.product_id() == AIRSPY_PID {
+        for dev_info in devices {
+            if dev_info.vendor_id() == AIRSPY_VID && dev_info.product_id() == AIRSPY_PID {
                 let serial = format!(
-                    "Bus {:03} Device {:03}",
-                    device.bus_number(),
-                    device.address()
+                    "Bus {} Device {:03}",
+                    dev_info.bus_id(),
+                    dev_info.device_address()
                 );
                 result.push(serial);
             }
@@ -278,47 +250,28 @@ impl Airspy {
         Ok(result)
     }
 
-    /// Open a device handle.
+    /// Open a device from nusb DeviceInfo.
     ///
     /// This follows the libairspy initialization sequence:
     /// 1. Open the USB device
     /// 2. Detach kernel driver (Linux only)
-    /// 3. Set configuration to 1
-    /// 4. Claim interface 0
-    fn open_device(device: &Device<Context>) -> Result<Self> {
-        let handle = device.open()?;
+    /// 3. Claim interface 0
+    fn open_device_info(dev_info: nusb::DeviceInfo) -> Result<Self> {
+        let usb_device = dev_info.open().wait().map_err(Error::OpenFailed)?;
 
         // On Linux, detach kernel driver if attached to interface 0
         #[cfg(target_os = "linux")]
         {
-            if handle.kernel_driver_active(0).unwrap_or(false) {
-                tracing::debug!("Detaching kernel driver from interface 0");
-                if let Err(e) = handle.detach_kernel_driver(0) {
-                    tracing::warn!("Failed to detach kernel driver: {}", e);
-                }
-            }
-        }
-
-        // Set configuration to 1
-        if let Err(e) = handle.set_active_configuration(1) {
-            tracing::debug!("Failed to set configuration (may already be set): {}", e);
+            let _ = usb_device.detach_kernel_driver(0);
         }
 
         // Claim interface 0
-        handle.claim_interface(0)?;
+        let iface = usb_device
+            .claim_interface(0)
+            .wait()
+            .map_err(Error::ClaimFailed)?;
 
-        Ok(Airspy {
-            device: Arc::new(handle),
-        })
-    }
-
-    /// Return a handle suitable for concurrent bulk reads from multiple threads.
-    ///
-    /// `rusb::DeviceHandle` is both `Send` and `Sync` (libusb is thread-safe),
-    /// so each clone can call `read_bulk` simultaneously — the same effect as
-    /// libairspy's internal multi-transfer USB event loop.
-    pub fn shared_bulk_handle(&self) -> SharedBulkHandle {
-        SharedBulkHandle(Arc::clone(&self.device))
+        Ok(Airspy { iface, usb_device })
     }
 
     /// Get the firmware version string.
@@ -327,24 +280,13 @@ impl Airspy {
     ///
     /// A version string like "AirSpy MINI v1.0.0-rc10-0-g946184a 2016-09-19".
     pub fn version(&self) -> Result<String> {
-        let mut buffer = vec![0u8; 128];
+        let data = self.control_in(AirspyCommand::VersionStringRead.as_u8(), 0, 0, 128)?;
 
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::VersionStringRead.as_u8(),
-            0,
-            0,
-            &mut buffer,
-        )?;
-
-        if n == 0 {
+        if data.is_empty() {
             return Err(Error::InvalidResponse("Version response empty".to_string()));
         }
 
-        // Parse the null-terminated string
-        let version_bytes = &buffer[..n];
-        let version_str = String::from_utf8_lossy(version_bytes)
+        let version_str = String::from_utf8_lossy(&data)
             .trim_end_matches('\0')
             .to_string();
 
@@ -357,25 +299,21 @@ impl Airspy {
     ///
     /// A numeric board identifier (e.g., 0 for AIRSPY, 1 for AIRSPY MINI).
     pub fn board_id(&self) -> Result<u32> {
-        let mut buffer = [0u8; 4];
+        let data = self.control_in(AirspyCommand::BoardIdRead.as_u8(), 0, 0, 4)?;
 
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
-        let n = self.control_in(0xC0, AirspyCommand::BoardIdRead.as_u8(), 0, 0, &mut buffer)?;
+        tracing::debug!("board_id response length: {}", data.len());
+        tracing::debug!("board_id buffer: {:02X?}", &data);
 
-        tracing::debug!("board_id response length: {}", n);
-        tracing::debug!("board_id buffer: {:02X?}", &buffer[..n.min(buffer.len())]);
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::InvalidResponse(
                 "Board ID response empty".to_string(),
             ));
         }
 
-        // The response might be a single byte, let's handle that
-        let id = if n >= 4 {
-            u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]])
+        let id = if data.len() >= 4 {
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]])
         } else {
-            buffer[0] as u32
+            data[0] as u32
         };
 
         Ok(id)
@@ -396,44 +334,23 @@ impl Airspy {
         //     uint32_t serial_no[4]; // 16 bytes
         // } airspy_read_partid_serialno_t;
         // Total: 24 bytes
-        let mut buffer = [0u8; 24];
+        match self.control_in(AirspyCommand::BoardPartidSerialnrRead.as_u8(), 0, 0, 24) {
+            Ok(data) => {
+                tracing::debug!("board_partid_serialno response length: {}", data.len());
+                tracing::debug!("board_partid_serialno buffer: {:02X?}", &data);
 
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE = 0xC0
-        // This is command AIRSPY_BOARD_PARTID_SERIALNO_READ = 11
-        match self.control_in(
-            0xC0,
-            AirspyCommand::BoardPartidSerialnrRead.as_u8(),
-            0,
-            0,
-            &mut buffer,
-        ) {
-            Ok(n) => {
-                tracing::debug!("board_partid_serialno response length: {}", n);
-                tracing::debug!(
-                    "board_partid_serialno buffer: {:02X?}",
-                    &buffer[..n.min(buffer.len())]
-                );
-
-                if n < 24 {
+                if data.len() < 24 {
                     return Err(Error::InvalidResponse(format!(
                         "Board partid/serialno response incomplete: got {} bytes, expected 24",
-                        n
+                        data.len()
                     )));
                 }
 
-                let part_id_1 = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-                let part_id_2 = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+                let part_id_1 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let part_id_2 = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
 
-                // Serial number is 4 u32 values. Looking at libairspy's airspy_info output,
-                // the serial is displayed as a single 64-bit hex value.
-                // The format appears to be: (serial_no[2] << 32) | serial_no[3] for high bits,
-                // but we need to check the actual layout.
-                // From the C code, it just reads the struct and prints it.
-                // Let's combine serial_no[2] and serial_no[3] as high/low parts of a 64-bit serial.
-                let serial_no_2 =
-                    u32::from_le_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]);
-                let serial_no_3 =
-                    u32::from_le_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]);
+                let serial_no_2 = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+                let serial_no_3 = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
 
                 // Combine into 64-bit serial (serial_no[2] is high, serial_no[3] is low)
                 let serial_no = ((serial_no_2 as u64) << 32) | (serial_no_3 as u64);
@@ -441,8 +358,6 @@ impl Airspy {
                 Ok((part_id_1, part_id_2, serial_no))
             }
             Err(e) => {
-                // The partid_serialno command may not be supported on all devices
-                // or may have different behavior, so we provide a more informative error
                 tracing::debug!(
                     "Board partid/serialno command failed (may not be supported): {}",
                     e
@@ -458,27 +373,17 @@ impl Airspy {
     ///
     /// A vector of sample rates in Hz (e.g., [6000000, 3000000])
     pub fn supported_sample_rates(&self) -> Result<Vec<u32>> {
-        // According to libairspy, we need to:
-        // 1. First call with wIndex=0 to get the count
-        // 2. Then call with wIndex=count to get all rates
+        // Step 1: Get the count (wIndex=0)
+        let count_data = self.control_in(AirspyCommand::GetSamplerates.as_u8(), 0, 0, 4)?;
 
-        // Step 1: Get the count
-        let mut count_buffer = [0u32; 1];
-        let n = self.control_in_u32(
-            0xC0,
-            AirspyCommand::GetSamplerates.as_u8(),
-            0,
-            0,
-            &mut count_buffer,
-        )?;
-
-        if n < 1 {
+        if count_data.len() < 4 {
             return Err(Error::InvalidResponse(
-                "Sample rates count response empty".to_string(),
+                "Sample rates count response too short".to_string(),
             ));
         }
 
-        let count = count_buffer[0] as usize;
+        let count = u32::from_le_bytes([count_data[0], count_data[1], count_data[2], count_data[3]])
+            as usize;
         tracing::debug!("supported_sample_rates count: {}", count);
 
         if count == 0 {
@@ -492,26 +397,36 @@ impl Airspy {
             )));
         }
 
-        // Step 2: Get all the rates
-        let mut rates_buffer = vec![0u32; count];
-        let n = self.control_in_u32_slice(
-            0xC0,
+        // Step 2: Get all the rates (wIndex=count)
+        let rates_data = self.control_in(
             AirspyCommand::GetSamplerates.as_u8(),
             0,
             count as u16,
-            &mut rates_buffer,
+            (count * 4) as u16,
         )?;
 
-        tracing::debug!("supported_sample_rates response length: {}", n);
+        let n_rates = rates_data.len() / 4;
+        tracing::debug!("supported_sample_rates response: {} rates", n_rates);
 
-        if n < count {
+        if n_rates < count {
             return Err(Error::InvalidResponse(format!(
                 "Sample rates response incomplete: expected {} rates, got {}",
-                count, n
+                count, n_rates
             )));
         }
 
-        Ok(rates_buffer)
+        let mut rates = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = i * 4;
+            rates.push(u32::from_le_bytes([
+                rates_data[offset],
+                rates_data[offset + 1],
+                rates_data[offset + 2],
+                rates_data[offset + 3],
+            ]));
+        }
+
+        Ok(rates)
     }
 
     // ========================================================================
@@ -524,29 +439,13 @@ impl Airspy {
     ///
     /// * `freq_hz` - Frequency in Hz (e.g., 100_000_000 for 100 MHz)
     ///
-    /// # Returns
-    ///
-    /// * `Ok(())` on success
-    /// * `Err(Error::ControlTransferFailed)` if the command fails
-    ///
     /// # Notes
     ///
     /// The Airspy Mini supports 24 MHz to 1.8 GHz.
     /// The frequency is sent as a little-endian u32 in the data payload.
     pub fn set_freq(&self, freq_hz: u32) -> Result<()> {
-        // libairspy sends freq_hz as a 4-byte little-endian payload
         let freq_bytes = freq_hz.to_le_bytes();
-
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
-        let n = self.control_out(0x40, AirspyCommand::SetFreq.as_u8(), 0, 0, &freq_bytes)?;
-
-        if n < 4 {
-            return Err(Error::ControlTransferFailed(format!(
-                "SET_FREQ: expected to write 4 bytes, wrote {}",
-                n
-            )));
-        }
-
+        self.control_out(AirspyCommand::SetFreq.as_u8(), 0, 0, &freq_bytes)?;
         tracing::debug!("Set frequency to {} Hz", freq_hz);
         Ok(())
     }
@@ -558,39 +457,25 @@ impl Airspy {
     /// * `rate_index` - Index into the supported sample rates list (0 = first rate)
     ///
     /// Use `supported_sample_rates()` to get the list of available rates.
-    ///
-    /// # Notes
-    ///
-    /// libairspy also supports setting sample rate by value (if >= 1_000_000),
-    /// but this implementation uses index-based selection for simplicity.
-    ///
-    /// **Important:** This command may fail with "Pipe error" if called before
-    /// streaming is started. In libairspy, sample rate is typically set as part
-    /// of the streaming initialization sequence. Use `start_rx()` to begin
-    /// streaming, which properly initializes the USB endpoints.
     pub fn set_sample_rate(&self, rate_index: u8) -> Result<()> {
         tracing::debug!("set_sample_rate: rate_index={}", rate_index);
 
-        // libairspy calls libusb_clear_halt(device->usb_device, LIBUSB_ENDPOINT_IN | 1)
-        // before the control transfer. LIBUSB_ENDPOINT_IN | 1 = 0x81
-        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+        // libairspy calls clear_halt before the control transfer
+        if let Err(e) = self.clear_halt() {
             tracing::trace!(
                 "clear_halt before set_sample_rate: {:?} (may be expected)",
                 e
             );
         }
 
-        let mut retval = [0u8; 1];
-
-        let n = self.control_in(
-            0xC0,
+        let data = self.control_in(
             AirspyCommand::SetSamplerate.as_u8(),
             0,
             rate_index as u16,
-            &mut retval,
+            1,
         )?;
 
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_SAMPLERATE: no response".to_string(),
             ));
@@ -599,54 +484,73 @@ impl Airspy {
         tracing::debug!(
             "set_sample_rate: Successfully set to index {}, response: {:02x}",
             rate_index,
-            retval[0]
+            data[0]
         );
         Ok(())
     }
 
     /// Set sample rate for host-side IQ output, matching libairspy behavior.
     ///
-    /// Since [`IqConverter`] halves the real sample rate (N real → N/2 complex IQ),
-    /// the hardware must run at `iq_rate_hz * 2`. This method:
+    /// The Airspy firmware stores supported rates as IQ-mode output rates
+    /// (half the real ADC rate). Our [`IqConverter`] decimates N real samples
+    /// to N/2 complex IQ samples, so the host receives at the firmware rate.
     ///
-    /// 1. Looks up `iq_rate_hz * 2` in the supported rates list (libairspy primary method)
+    /// This method:
+    /// 1. Looks up `iq_rate_hz` in the firmware's supported rates list
     /// 2. If found, uses index-based [`set_sample_rate`] (firmware-safe)
-    /// 3. If not found, falls back to sending `iq_rate_hz * 2 / 1000` kHz directly
+    /// 3. If not found, falls back to sending `iq_rate_hz * 2 / 1000` kHz
+    ///    directly — the doubling is required because the firmware expects the
+    ///    real ADC rate in kHz for the fallback path (matching libairspy's
+    ///    `airspy_set_samplerate` which does `samplerate *= 2` for IQ mode
+    ///    before `/= 1000`).
     ///
     /// # Arguments
-    /// * `iq_rate_hz` - Desired IQ output rate in Hz (e.g., `3_000_000` → hardware 6 Msps)
+    /// * `iq_rate_hz` - Desired IQ output rate in Hz (e.g., `4_096_000` for DAB)
+    ///
+    /// # Example: welle.io DAB with Airspy Mini
+    /// `set_sample_rate_for_iq(4_096_000)`:
+    /// - 4.096M not in firmware list [6M, 3M] → fallback
+    /// - Sends `4_096_000 * 2 / 1000 = 8192` kHz to firmware
+    /// - ADC runs at 8.192 MHz real → IqConverter → 4.096M complex IQ
     ///
     /// [`IqConverter`]: rs_spy::IqConverter
     pub fn set_sample_rate_for_iq(&self, iq_rate_hz: u32) -> Result<()> {
-        let hardware_rate = iq_rate_hz.saturating_mul(2);
-        tracing::debug!(iq_rate_hz, hardware_rate, "set_sample_rate_for_iq");
+        tracing::debug!(iq_rate_hz, "set_sample_rate_for_iq");
 
-        // Primary: index-based lookup (matches libairspy's airspy_set_samplerate)
+        // Primary: index-based lookup.
+        // Firmware stores IQ-mode rates directly (e.g. [6M, 3M] for Mini),
+        // so we match iq_rate_hz without doubling. The firmware internally
+        // knows these correspond to 2× ADC rates and configures accordingly.
         if let Ok(supported) = self.supported_sample_rates()
-            && let Some(idx) = supported.iter().position(|&r| r == hardware_rate)
+            && let Some(idx) = supported.iter().position(|&r| r == iq_rate_hz)
         {
-            tracing::debug!(hardware_rate, idx, "set_sample_rate_for_iq: using index");
+            tracing::debug!(iq_rate_hz, idx, "set_sample_rate_for_iq: using index");
             return self.set_sample_rate(idx as u8);
         }
 
-        // Fallback: send hardware rate in kHz directly (libairspy fallback path)
-        tracing::debug!(hardware_rate, "set_sample_rate_for_iq: kHz fallback");
-        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+        // Fallback: send real ADC rate in kHz to firmware.
+        // libairspy does `samplerate *= 2` for IQ mode then `/= 1000`.
+        // The doubling converts from desired IQ rate to real ADC rate,
+        // since IqConverter will decimate 2:1 back to the IQ rate.
+        let adc_rate_khz = (iq_rate_hz * 2) / 1000;
+        tracing::debug!(
+            iq_rate_hz,
+            adc_rate_khz,
+            "set_sample_rate_for_iq: kHz fallback"
+        );
+
+        if let Err(e) = self.clear_halt() {
             tracing::trace!("clear_halt before set_sample_rate_for_iq: {:?}", e);
         }
 
-        let mut retval = [0u8; 1];
-        let khz = hardware_rate / 1000;
-
-        let n = self.control_in(
-            0xC0,
+        let data = self.control_in(
             AirspyCommand::SetSamplerate.as_u8(),
             0,
-            khz as u16,
-            &mut retval,
+            adc_rate_khz as u16,
+            1,
         )?;
 
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_SAMPLERATE: no response".to_string(),
             ));
@@ -654,9 +558,9 @@ impl Airspy {
 
         tracing::debug!(
             iq_rate_hz,
-            hardware_rate,
-            response = retval[0],
-            "set_sample_rate_for_iq: success"
+            adc_rate_khz,
+            response = data[0],
+            "set_sample_rate_for_iq: kHz fallback success"
         );
         Ok(())
     }
@@ -666,22 +570,11 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `gain` - Gain value 0-14 (clamped if out of range)
-    ///
-    /// Higher values = more gain. The LNA is the first amplifier in the signal chain.
     pub fn set_lna_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(14); // Clamp to valid range
-        let mut retval = [0u8; 1];
+        let gain = gain.min(14);
+        let data = self.control_in(AirspyCommand::SetLnaGain.as_u8(), 0, gain as u16, 1)?;
 
-        // wIndex contains the gain value
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetLnaGain.as_u8(),
-            0,
-            gain as u16,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_LNA_GAIN: no response".to_string(),
             ));
@@ -696,21 +589,11 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `gain` - Gain value 0-15 (clamped if out of range)
-    ///
-    /// The mixer amplifies the signal after downconversion.
     pub fn set_mixer_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15); // Clamp to valid range
-        let mut retval = [0u8; 1];
+        let gain = gain.min(15);
+        let data = self.control_in(AirspyCommand::SetMixerGain.as_u8(), 0, gain as u16, 1)?;
 
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetMixerGain.as_u8(),
-            0,
-            gain as u16,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_MIXER_GAIN: no response".to_string(),
             ));
@@ -725,21 +608,11 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `gain` - Gain value 0-15 (clamped if out of range)
-    ///
-    /// The VGA is the final amplifier before the ADC.
     pub fn set_vga_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15); // Clamp to valid range
-        let mut retval = [0u8; 1];
+        let gain = gain.min(15);
+        let data = self.control_in(AirspyCommand::SetVgaGain.as_u8(), 0, gain as u16, 1)?;
 
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetVgaGain.as_u8(),
-            0,
-            gain as u16,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_VGA_GAIN: no response".to_string(),
             ));
@@ -750,26 +623,11 @@ impl Airspy {
     }
 
     /// Enable or disable LNA AGC (Automatic Gain Control).
-    ///
-    /// # Arguments
-    ///
-    /// * `enabled` - true to enable AGC, false to disable
-    ///
-    /// When AGC is enabled, the hardware automatically adjusts LNA gain.
-    /// Disable AGC when using manual gain control.
     pub fn set_lna_agc(&self, enabled: bool) -> Result<()> {
-        let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
+        let data = self.control_in(AirspyCommand::SetLnaAgc.as_u8(), 0, value, 1)?;
 
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetLnaAgc.as_u8(),
-            0,
-            value,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_LNA_AGC: no response".to_string(),
             ));
@@ -780,23 +638,11 @@ impl Airspy {
     }
 
     /// Enable or disable mixer AGC (Automatic Gain Control).
-    ///
-    /// # Arguments
-    ///
-    /// * `enabled` - true to enable AGC, false to disable
     pub fn set_mixer_agc(&self, enabled: bool) -> Result<()> {
-        let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
+        let data = self.control_in(AirspyCommand::SetMixerAgc.as_u8(), 0, value, 1)?;
 
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetMixerAgc.as_u8(),
-            0,
-            value,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_MIXER_AGC: no response".to_string(),
             ));
@@ -811,19 +657,12 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `gain` - Gain level 0-21 (0 = minimum, 21 = maximum)
-    ///
-    /// This sets LNA, mixer, and VGA gains using lookup tables optimized
-    /// for linear response (low distortion). Good for strong signals.
     pub fn set_linearity_gain(&self, gain: u8) -> Result<()> {
         let gain = gain.min((GAIN_COUNT - 1) as u8);
-        // libairspy inverts the index: GAIN_COUNT - 1 - value
         let index = GAIN_COUNT - 1 - gain as usize;
 
-        // Disable AGC first
         self.set_mixer_agc(false)?;
         self.set_lna_agc(false)?;
-
-        // Set individual gains from lookup table
         self.set_vga_gain(LINEARITY_VGA_GAINS[index])?;
         self.set_mixer_gain(LINEARITY_MIXER_GAINS[index])?;
         self.set_lna_gain(LINEARITY_LNA_GAINS[index])?;
@@ -837,18 +676,12 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `gain` - Gain level 0-21 (0 = minimum, 21 = maximum)
-    ///
-    /// This sets LNA, mixer, and VGA gains using lookup tables optimized
-    /// for sensitivity (low noise). Good for weak signals.
     pub fn set_sensitivity_gain(&self, gain: u8) -> Result<()> {
         let gain = gain.min((GAIN_COUNT - 1) as u8);
         let index = GAIN_COUNT - 1 - gain as usize;
 
-        // Disable AGC first
         self.set_mixer_agc(false)?;
         self.set_lna_agc(false)?;
-
-        // Set individual gains from lookup table
         self.set_vga_gain(SENSITIVITY_VGA_GAINS[index])?;
         self.set_mixer_gain(SENSITIVITY_MIXER_GAINS[index])?;
         self.set_lna_gain(SENSITIVITY_LNA_GAINS[index])?;
@@ -859,37 +692,20 @@ impl Airspy {
 
     /// Enable or disable RF bias (Bias-T).
     ///
-    /// # Arguments
-    ///
-    /// * `enabled` - true to enable Bias-T (DC on antenna port), false to disable
-    ///
     /// # Warning
     ///
     /// Enabling Bias-T puts DC voltage on the antenna connector.
     /// Only use with devices that require DC power (like some LNAs or active antennas).
-    /// **Do not enable with passive antennas or devices that don't expect DC!**
     pub fn set_rf_bias(&self, enabled: bool) -> Result<()> {
-        // RF bias is controlled via GPIO: PORT1, PIN13
         let value = if enabled { 1u8 } else { 0u8 };
-
-        // GPIO port/pin encoding: (port << 5) | pin
         let port_pin = ((GPIO_PORT1 as u16) << 5) | (GPIO_PIN13 as u16);
 
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
-        // wValue = GPIO value (0 or 1)
-        // wIndex = port_pin encoding
-        let n = self.control_out(
-            0x40,
+        self.control_out(
             AirspyCommand::GpioWrite.as_u8(),
             value as u16,
             port_pin,
             &[],
         )?;
-
-        // GPIO write returns 0 bytes on success
-        if n != 0 {
-            tracing::warn!("GPIO_WRITE returned {} bytes (expected 0)", n);
-        }
 
         tracing::debug!("Set RF bias (Bias-T) to {}", enabled);
         Ok(())
@@ -900,27 +716,11 @@ impl Airspy {
     /// # Arguments
     ///
     /// * `enabled` - true to enable 12-bit packing, false for 16-bit samples
-    ///
-    /// When packing is enabled, samples are packed as 12-bit values to
-    /// reduce USB bandwidth. This increases maximum sample rate but requires
-    /// unpacking on the host side.
-    ///
-    /// # Notes
-    ///
-    /// Should not be called while streaming is active.
     pub fn set_packing(&self, enabled: bool) -> Result<()> {
-        let mut retval = [0u8; 1];
         let value = if enabled { 1u16 } else { 0u16 };
+        let data = self.control_in(AirspyCommand::SetPacking.as_u8(), 0, value, 1)?;
 
-        let n = self.control_in(
-            0xC0,
-            AirspyCommand::SetPacking.as_u8(),
-            0,
-            value,
-            &mut retval,
-        )?;
-
-        if n < 1 {
+        if data.is_empty() {
             return Err(Error::ControlTransferFailed(
                 "SET_PACKING: no response".to_string(),
             ));
@@ -937,23 +737,13 @@ impl Airspy {
     /// Start receiving samples from the device.
     ///
     /// This enables the receiver and prepares the device for bulk transfers.
-    /// After calling this, use `read_sync()` to read samples.
-    ///
-    /// # Notes
-    ///
-    /// The streaming sequence follows libairspy:
-    /// 1. Set receiver mode to OFF (reset state)
-    /// 2. Clear any stale data on the bulk endpoint
-    /// 3. Set receiver mode to RX (start streaming)
     pub fn start_rx(&self) -> Result<()> {
         // First, ensure receiver is off
         self.set_receiver_mode(RECEIVER_MODE_OFF)?;
 
         // Clear the bulk endpoint to remove any stale data
-        // This is important for sample rate changes to take effect
-        if let Err(e) = self.device.clear_halt(BULK_ENDPOINT_IN) {
+        if let Err(e) = self.clear_halt() {
             tracing::debug!("Failed to clear halt on bulk endpoint: {}", e);
-            // Continue anyway - the endpoint might not have been halted
         }
 
         // Enable the receiver
@@ -964,8 +754,6 @@ impl Airspy {
     }
 
     /// Stop receiving samples from the device.
-    ///
-    /// This disables the receiver. Any in-progress bulk transfers may be aborted.
     pub fn stop_rx(&self) -> Result<()> {
         self.set_receiver_mode(RECEIVER_MODE_OFF)?;
         tracing::debug!("Stopped RX streaming");
@@ -977,9 +765,6 @@ impl Airspy {
     /// Note: This only checks the receiver mode, not whether data is actively
     /// being transferred. For true streaming status, track this in your application.
     pub fn is_streaming(&self) -> bool {
-        // We don't have a way to query the device state directly,
-        // so this would need to be tracked by the caller.
-        // For now, this is a placeholder that always returns false.
         false
     }
 
@@ -992,165 +777,89 @@ impl Airspy {
     /// # Returns
     ///
     /// * `Ok(n)` - Number of bytes actually read
-    /// * `Err(Error::StreamingError)` - If the bulk transfer fails
+    /// * `Err(Error::BulkTransfer)` - If the bulk transfer fails
     ///
     /// # Notes
     ///
     /// - Call `start_rx()` before reading samples
     /// - The buffer should be at least 16KB for efficient transfers
-    /// - Samples are 16-bit unsigned integers (0-4095 in upper 12 bits)
-    /// - For best performance, use a buffer size that is a multiple of 512 bytes
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rs_spy::Airspy;
-    ///
-    /// let airspy = Airspy::open_first().unwrap();
-    /// airspy.set_freq(100_000_000).unwrap();
-    /// airspy.set_sensitivity_gain(15).unwrap();
-    /// airspy.start_rx().unwrap();
-    ///
-    /// let mut buf = vec![0u8; 262144]; // 256 KB buffer
-    /// loop {
-    ///     let n = airspy.read_sync(&mut buf).unwrap();
-    ///     // Process n bytes of sample data...
-    /// }
-    /// ```
     pub fn read_sync(&self, buf: &mut [u8]) -> Result<usize> {
-        // Bulk read timeout - longer than control transfers for large data
         let timeout = Duration::from_millis(1000);
 
-        match self.device.read_bulk(BULK_ENDPOINT_IN, buf, timeout) {
-            Ok(n) => {
+        let mut ep_in = self
+            .iface
+            .endpoint::<Bulk, In>(BULK_ENDPOINT_IN)
+            .map_err(|e| Error::StreamingError(format!("failed to open bulk endpoint: {}", e)))?;
+
+        ep_in.submit(Buffer::new(buf.len()));
+
+        match ep_in.wait_next_complete(timeout) {
+            Some(completion) => {
+                completion.status.map_err(Error::BulkTransfer)?;
+                let n = completion.actual_len.min(buf.len());
+                buf[..n].copy_from_slice(&completion.buffer[..n]);
+                ep_in.cancel_all();
+                while ep_in.pending() > 0 {
+                    let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+                }
                 tracing::trace!("Bulk read: {} bytes", n);
                 Ok(n)
             }
-            Err(e) => {
-                tracing::debug!("Bulk read failed: {}", e);
-                Err(Error::StreamingError(e.to_string()))
+            None => {
+                ep_in.cancel_all();
+                while ep_in.pending() > 0 {
+                    let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+                }
+                Err(Error::Timeout)
             }
         }
     }
 
     /// Read samples synchronously with a custom timeout.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - Buffer to fill with raw sample data
-    /// * `timeout` - Maximum time to wait for data
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(n)` - Number of bytes actually read
-    /// * `Err(Error::StreamingError)` - If the bulk transfer fails or times out
     pub fn read_sync_timeout(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        match self.device.read_bulk(BULK_ENDPOINT_IN, buf, timeout) {
-            Ok(n) => {
+        let mut ep_in = self
+            .iface
+            .endpoint::<Bulk, In>(BULK_ENDPOINT_IN)
+            .map_err(|e| Error::StreamingError(format!("failed to open bulk endpoint: {}", e)))?;
+
+        ep_in.submit(Buffer::new(buf.len()));
+
+        match ep_in.wait_next_complete(timeout) {
+            Some(completion) => {
+                completion.status.map_err(Error::BulkTransfer)?;
+                let n = completion.actual_len.min(buf.len());
+                buf[..n].copy_from_slice(&completion.buffer[..n]);
+                ep_in.cancel_all();
+                while ep_in.pending() > 0 {
+                    let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+                }
                 tracing::trace!("Bulk read: {} bytes", n);
                 Ok(n)
             }
-            Err(e) => {
-                tracing::debug!("Bulk read failed: {}", e);
-                Err(Error::StreamingError(e.to_string()))
+            None => {
+                ep_in.cancel_all();
+                while ep_in.pending() > 0 {
+                    let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+                }
+                Err(Error::Timeout)
             }
         }
     }
 
-    /// Start a callback-like async reader loop in a dedicated thread.
+    /// Start a multi-transfer async reader using nusb's endpoint queue.
     ///
-    /// This keeps USB reads off the caller thread and publishes chunks through
-    /// a bounded queue with backpressure.
-    pub fn into_async_reader(self, queue_len: usize, buf_len: usize) -> Result<AsyncReadHandle> {
-        let qlen = if queue_len == 0 {
-            DEFAULT_ASYNC_QUEUE_LEN
-        } else {
-            queue_len
-        };
-        let read_len = if buf_len == 0 {
-            RECOMMENDED_BUFFER_SIZE
-        } else {
-            buf_len
-        };
-
-        if !read_len.is_multiple_of(512) {
-            return Err(Error::StreamingError(format!(
-                "Invalid async buffer length {} (must be multiple of 512)",
-                read_len
-            )));
-        }
-
-        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(qlen);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<AsyncReadControl>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let dropped = Arc::new(AtomicU64::new(0));
-        let stop_thread = stop.clone();
-
-        let thread = thread::spawn(move || {
-            let dev = self;
-            let mut buf = vec![0u8; read_len];
-
-            while !stop_thread.load(Ordering::Relaxed) {
-                while let Ok(cmd) = ctrl_rx.try_recv() {
-                    match cmd {
-                        AsyncReadControl::Tune(center_freq) => {
-                            if let Err(e) = dev.set_freq(center_freq) {
-                                let _ = tx.try_send(Err(e));
-                                return;
-                            }
-                        }
-                        AsyncReadControl::SetGain(stages) => {
-                            if let Err(e) = apply_gain_stages(&dev, stages) {
-                                tracing::warn!("Airspy set gain failed during streaming: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                match dev.read_sync(&mut buf) {
-                    Ok(n) => {
-                        if n == 0 {
-                            continue;
-                        }
-                        let chunk = buf[..n].to_vec();
-                        if tx.send(Ok(chunk)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
-                }
-            }
-
-            let _ = dev.stop_rx();
-        });
-
-        Ok(AsyncReadHandle {
-            rx,
-            ctrl_tx,
-            stop,
-            dropped,
-            thread: Some(thread),
-        })
-    }
-
-    /// Start a multi-transfer async reader with `buf_num` concurrent bulk transfers.
-    ///
-    /// This mirrors how libairspy works internally: multiple USB bulk transfers are
-    /// kept in-flight simultaneously so the device FIFO never overflows between
-    /// transfers.  At 6 Msps (16-bit real samples = 12 MB/s), a single sequential
-    /// reader leaves the FIFO exposed for ~21 ms between each 256 KB read; with N
-    /// concurrent readers the gap shrinks to ~21/N ms.
+    /// This replaces the old multi-thread SharedBulkHandle approach with nusb's
+    /// native multi-transfer bulk I/O through its `Endpoint` queue. Multiple USB
+    /// transfers are kept in-flight simultaneously in a single thread, eliminating
+    /// the inter-transfer gap that causes device FIFO overflow at high sample rates.
     ///
     /// Architecture:
     /// ```text
-    ///   buf_num reader threads  ──sync_channel(buf_num*4)──▶  control/bridge thread
-    ///   (each calls read_bulk)                                  (tune / set_gain)
+    ///   streaming thread (nusb endpoint queue)  ──sync_channel──▶  consumer
+    ///     └── control commands via mpsc channel   (tune / set_gain)
     /// ```
     ///
-    /// Returns the same `AsyncReadHandle` as `into_async_reader`.
+    /// Returns an `AsyncReadHandle` for receiving data and sending control commands.
     pub fn into_multi_transfer_reader(
         self,
         buf_num: usize,
@@ -1174,83 +883,19 @@ impl Airspy {
             )));
         }
 
-        // buf_num * 4 gives the same headroom as RTL-SDR's implementation.
-        // Reader threads drop chunks rather than blocking so the USB loop never stalls.
+        // Use blocking send for backpressure (lesson 20.1: never try_send in
+        // real-time signal processing pipelines — dropped samples corrupt
+        // protocol framing).
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(buf_num * 4);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<AsyncReadControl>();
         let stop = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
 
-        let shared = self.shared_bulk_handle();
-        let stop_readers = Arc::clone(&stop);
+        let iface = self.iface.clone();
+        let stop_thread = Arc::clone(&stop);
 
-        // Spawn buf_num independent reader threads.
-        // Each holds a clone of SharedBulkHandle and loops on read_bulk.
-        for _ in 0..buf_num {
-            let handle = shared.clone();
-            let tx = tx.clone();
-            let stop_r = Arc::clone(&stop_readers);
-            let dropped_ctr = Arc::clone(&dropped);
-            thread::spawn(move || {
-                let mut buf = vec![0u8; buf_len];
-                let mut first = true;
-                while !stop_r.load(Ordering::Relaxed) {
-                    match handle.read_bulk(&mut buf, Duration::from_millis(1000)) {
-                        Ok(0) => {
-                            if first {
-                                eprintln!("[rs-spy] read_bulk Ok(0)");
-                                first = false;
-                            }
-                            continue;
-                        }
-                        Ok(n) => {
-                            if first {
-                                eprintln!("[rs-spy] read_bulk Ok({n})");
-                                first = false;
-                            }
-                            let chunk = buf[..n].to_vec();
-                            if tx.try_send(Ok(chunk)).is_err() {
-                                dropped_ctr.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[rs-spy] read_bulk Err: {e}");
-                            // Timeout is expected on stop; only log other errors.
-                            if !stop_r.load(Ordering::Relaxed) {
-                                tracing::warn!("Airspy bulk read error: {}", e);
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        // The control thread owns `self` (Airspy) for configuration calls.
-        // It uses recv_timeout so it notices the stop flag promptly on shutdown.
-        let dev = self;
-        let stop_ctrl = Arc::clone(&stop);
         let thread = thread::spawn(move || {
-            loop {
-                if stop_ctrl.load(Ordering::Relaxed) {
-                    break;
-                }
-                match ctrl_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(AsyncReadControl::Tune(freq)) => {
-                        if let Err(e) = dev.set_freq(freq) {
-                            tracing::warn!("Airspy retune to {} Hz failed: {}", freq, e);
-                        }
-                    }
-                    Ok(AsyncReadControl::SetGain(stages)) => {
-                        if let Err(e) = apply_gain_stages(&dev, stages) {
-                            tracing::warn!("Airspy set gain failed: {}", e);
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            let _ = dev.stop_rx();
+            streaming_thread(self, iface, tx, stop_thread, ctrl_rx, buf_len, buf_num);
         });
 
         Ok(AsyncReadHandle {
@@ -1262,24 +907,20 @@ impl Airspy {
         })
     }
 
-    /// Set the receiver mode (internal command).
+    /// Start a callback-like async reader loop in a dedicated thread.
     ///
-    /// # Arguments
-    ///
-    /// * `mode` - RECEIVER_MODE_OFF (0) or RECEIVER_MODE_RX (1)
-    fn set_receiver_mode(&self, mode: u16) -> Result<()> {
-        // REQUEST_TYPE_VENDOR | RECIPIENT_DEVICE | OUT = 0x40
-        // wValue = mode, wIndex = 0, no data payload
-        let result = self.device.write_control(
-            0x40,
-            AirspyCommand::ReceiverMode.as_u8(),
-            mode,
-            0,
-            &[],
-            USB_TIMEOUT,
-        );
+    /// This is a simpler alternative to `into_multi_transfer_reader` that uses
+    /// fewer in-flight transfers. For high sample rates, prefer
+    /// `into_multi_transfer_reader`.
+    pub fn into_async_reader(self, queue_len: usize, buf_len: usize) -> Result<AsyncReadHandle> {
+        // Use the same nusb endpoint queue approach but with fewer transfers
+        let num_transfers = if queue_len == 0 { 4 } else { queue_len.min(8) };
+        self.into_multi_transfer_reader(num_transfers, buf_len)
+    }
 
-        match result {
+    /// Set the receiver mode (internal command).
+    fn set_receiver_mode(&self, mode: u16) -> Result<()> {
+        match self.control_out(AirspyCommand::ReceiverMode.as_u8(), mode, 0, &[]) {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::debug!("Set receiver mode failed: {}", e);
@@ -1291,105 +932,208 @@ impl Airspy {
         }
     }
 
+    /// Clear halt on the bulk IN endpoint.
+    ///
+    /// nusb does not expose a direct clear_halt API on Interface; the endpoint
+    /// queue handles stale state through the submit/complete cycle. This is
+    /// kept as a no-op to preserve the libairspy initialization sequence
+    /// comments without changing behavior.
+    fn clear_halt(&self) -> Result<()> {
+        // nusb handles endpoint state internally — no explicit clear_halt needed
+        Ok(())
+    }
+
     // ========================================================================
     // Private helper methods
     // ========================================================================
 
-    /// Perform a control IN transfer.
-    fn control_in(
-        &self,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        buf: &mut [u8],
-    ) -> Result<usize> {
-        match self
-            .device
-            .read_control(request_type, request, value, index, buf, USB_TIMEOUT)
-        {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                tracing::debug!(
-                    "Control IN transfer failed: req={}, val={}, idx={}, error={}",
+    /// Perform a control IN transfer using nusb.
+    ///
+    /// Returns the received data bytes.
+    fn control_in(&self, request: u8, value: u16, index: u16, length: u16) -> Result<Vec<u8>> {
+        let data = self
+            .iface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
                     request,
                     value,
                     index,
-                    e
-                );
-                Err(Error::ControlTransferFailed(e.to_string()))
-            }
-        }
+                    length,
+                },
+                USB_TIMEOUT,
+            )
+            .wait()
+            .map_err(Error::ControlTransfer)?;
+
+        Ok(data)
     }
 
-    /// Perform a control IN transfer that returns u32 values.
-    /// Returns the number of u32 elements read.
-    fn control_in_u32(
-        &self,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        buf: &mut [u32],
-    ) -> Result<usize> {
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of_val(buf))
-        };
-
-        let n = self.control_in(request_type, request, value, index, byte_buf)?;
-        Ok(n / std::mem::size_of::<u32>())
-    }
-
-    /// Perform a control IN transfer that reads multiple u32 values.
-    /// Returns the number of u32 elements read.
-    fn control_in_u32_slice(
-        &self,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        buf: &mut [u32],
-    ) -> Result<usize> {
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of_val(buf))
-        };
-
-        let n = self.control_in(request_type, request, value, index, byte_buf)?;
-        Ok(n / std::mem::size_of::<u32>())
-    }
-
-    /// Perform a control OUT transfer.
-    #[allow(dead_code)]
-    fn control_out(
-        &self,
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        buf: &[u8],
-    ) -> Result<usize> {
-        match self
-            .device
-            .write_control(request_type, request, value, index, buf, USB_TIMEOUT)
-        {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                tracing::debug!(
-                    "Control OUT transfer failed: req={}, val={}, idx={}, error={}",
+    /// Perform a control OUT transfer using nusb.
+    fn control_out(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
+        self.iface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
                     request,
                     value,
                     index,
-                    e
-                );
-                Err(Error::ControlTransferFailed(e.to_string()))
+                    data,
+                },
+                USB_TIMEOUT,
+            )
+            .wait()
+            .map_err(Error::ControlTransfer)
+    }
+}
+
+/// The streaming thread function.
+///
+/// Uses nusb's Endpoint queue to keep multiple USB bulk transfers in-flight
+/// simultaneously. This is the core improvement over the old rusb-based
+/// multi-thread SharedBulkHandle approach: there is no gap between transfers,
+/// so the device's internal FIFO never overflows.
+///
+/// The thread loops:
+/// 1. Wait for the next completed transfer
+/// 2. Process any pending control commands (tune, gain)
+/// 3. Send the data to the consumer via the bounded channel (blocking for backpressure)
+/// 4. Re-submit the buffer for another transfer
+fn streaming_thread(
+    dev: Airspy,
+    iface: nusb::Interface,
+    tx: mpsc::SyncSender<Result<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    ctrl_rx: mpsc::Receiver<AsyncReadControl>,
+    transfer_size: usize,
+    num_transfers: usize,
+) {
+    tracing::debug!(
+        "streaming thread started: transfer_size={}, num_transfers={}",
+        transfer_size,
+        num_transfers
+    );
+
+    // Open the bulk IN endpoint
+    let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(BULK_ENDPOINT_IN) else {
+        tracing::warn!("failed to open bulk endpoint 0x{:02x}", BULK_ENDPOINT_IN);
+        return;
+    };
+
+    // Pre-fill the queue with transfers
+    for _ in 0..num_transfers {
+        ep_in.submit(Buffer::new(transfer_size));
+    }
+
+    tracing::debug!("submitted {} initial transfers", num_transfers);
+
+    // Consecutive transfer error counter for disconnect detection.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+    let mut consecutive_errors: u32 = 0;
+
+    // Main streaming loop
+    while !stop.load(Ordering::Relaxed) {
+        // Process any pending control commands (non-blocking)
+        while let Ok(cmd) = ctrl_rx.try_recv() {
+            match cmd {
+                AsyncReadControl::Tune(freq) => {
+                    tracing::debug!("streaming thread: tuning to {} Hz", freq);
+                    if let Err(e) = dev.set_freq(freq) {
+                        tracing::warn!("Airspy retune to {} Hz failed: {}", freq, e);
+                    }
+                }
+                AsyncReadControl::SetGain(stages) => {
+                    if let Err(e) = apply_gain_stages(&dev, stages) {
+                        tracing::warn!("Airspy set gain failed: {}", e);
+                    }
+                }
             }
         }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Wait for the next completed transfer
+        let completion = match ep_in.wait_next_complete(Duration::from_millis(500)) {
+            Some(c) => c,
+            None => {
+                // Timeout — check stop flag and retry
+                tracing::trace!("streaming: transfer timeout, retrying");
+                continue;
+            }
+        };
+
+        // Check for transfer errors
+        if let Err(ref e) = completion.status {
+            consecutive_errors += 1;
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                tracing::warn!(
+                    "dongle disconnected ({} consecutive transfer errors: {})",
+                    consecutive_errors,
+                    e
+                );
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            tracing::warn!(
+                "bulk transfer error ({}/{}): {}",
+                consecutive_errors,
+                MAX_CONSECUTIVE_ERRORS,
+                e
+            );
+            // Re-submit and continue (transient errors are common)
+            ep_in.submit(Buffer::new(transfer_size));
+            continue;
+        }
+
+        // Successful transfer — reset error counter
+        consecutive_errors = 0;
+
+        // Extract the data
+        let data = completion.buffer[..completion.actual_len].to_vec();
+
+        if data.is_empty() {
+            ep_in.submit(Buffer::new(transfer_size));
+            continue;
+        }
+
+        // Send data to the consumer (blocking — provides backpressure).
+        // IMPORTANT: We use blocking send here to provide backpressure.
+        // Lesson 20.1: never use try_send in real-time signal processing
+        // pipelines — dropped samples corrupt protocol framing.
+        match tx.send(Ok(data)) {
+            Ok(()) => {}
+            Err(_) => {
+                // Channel closed — consumer is gone
+                tracing::debug!("streaming: consumer disconnected");
+                break;
+            }
+        }
+
+        // Re-submit a new transfer to keep the queue full
+        ep_in.submit(Buffer::new(transfer_size));
     }
+
+    // Stop the receiver
+    let _ = dev.stop_rx();
+
+    // Cancel all pending transfers
+    ep_in.cancel_all();
+
+    // Drain remaining completions
+    while ep_in.pending() > 0 {
+        let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+    }
+
+    tracing::debug!("streaming thread exited");
 }
 
 /// Apply gain stages from an `AirspyGainStages` value to an open device.
 ///
-/// Called from both the single-reader and multi-transfer control loops.
+/// Called from the streaming thread's control command handler.
 fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
     dev.set_lna_agc(stages.lna_agc)?;
     dev.set_mixer_agc(stages.mixer_agc)?;
@@ -1401,27 +1145,4 @@ fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
     }
     dev.set_vga_gain(stages.vga)?;
     Ok(())
-}
-
-impl Drop for Airspy {
-    fn drop(&mut self) {
-        // IMPORTANT: Must release the USB interface and close the device properly.
-        // This matches libairspy's airspy_open_exit() cleanup sequence.
-        // Without this, the device becomes unavailable until USB reset.
-
-        // Release interface 0 before closing
-        if let Err(e) = self.device.release_interface(0) {
-            tracing::debug!("Failed to release USB interface: {}", e);
-        }
-
-        // Reset the device to ensure clean state for next open
-        // This is more aggressive than libairspy but ensures the device
-        // is in a known good state.
-        if let Err(e) = self.device.reset() {
-            tracing::debug!("Failed to reset USB device: {}", e);
-        }
-
-        // DeviceHandle will automatically close the device when dropped
-        tracing::debug!("Airspy device cleaned up");
-    }
 }

@@ -17,6 +17,15 @@ use std::sync::Arc;
 
 use tracing::{debug, trace};
 
+/// Search range for coarse frequency estimation (in carriers).
+/// Matches welle.io's `#define SEARCH_RANGE (2 * 36)`.
+const SEARCH_RANGE: usize = 2 * 36;
+
+/// Number of adjacent-carrier phase differences to correlate against the
+/// PRS reference in the phase-difference coarse frequency estimator.
+/// Matches welle.io's `#define CORRELATION_LENGTH 24`.
+const CORRELATION_LENGTH: usize = 24;
+
 /// One DAB transmission frame worth of frequency-domain symbols.
 /// `symbols[0]` = Phase Reference Symbol (PRS), `symbols[1..=75]` = data symbols.
 pub struct OfdmFrame {
@@ -44,6 +53,10 @@ pub struct OfdmProcessor {
     ifft: Arc<dyn Fft<f32>>,
     /// PRS reference in frequency domain, conjugated for correlation.
     prs_ref_conj: Vec<Complex<f32>>,
+    /// Phase-difference reference for coarse frequency estimation.
+    /// `ref_arg[j]` = `arg(prs_ref[T_u + j] * conj(prs_ref[T_u + j + 1]))` for
+    /// `j` in `0..CORRELATION_LENGTH`. This matches welle.io's `refArg`.
+    ref_arg: Vec<f32>,
     buffer: Vec<Complex<f32>>,
     state: SyncState,
     frame_count: usize,
@@ -61,6 +74,23 @@ pub struct OfdmProcessor {
     from_null_detect: bool,
     /// Count of consecutive PRS correlation failures (for re-acquisition).
     prs_fail_count: u32,
+    /// FIC decode ratio (0–100%), set by external code.
+    /// Used to gate coarse frequency correction: only apply coarse when FIC
+    /// decoding is poor (< 50%), matching welle.io's approach.
+    /// This prevents a reception glitch from corrupting an already-working
+    /// frequency estimate.
+    fic_decode_ratio: u8,
+    /// Whether initial coarse correction has been applied (from getMiddle or
+    /// phase-difference method). Reset on sync loss.
+    initial_coarse_applied: bool,
+    /// Long-term average signal level (L1 norm), used for null detection.
+    /// Matches welle.io's `sLevel` which is computed with exponential smoothing.
+    s_level: f32,
+    /// Whether initial warm-up has been done (discard first samples for AGC settling).
+    /// Matches welle.io's initial `for (i = 0; i < T_F / 2; i++) getSample(0)`.
+    warmup_done: bool,
+    /// Total number of samples consumed (for warm-up tracking).
+    samples_consumed: usize,
 }
 
 impl OfdmProcessor {
@@ -73,10 +103,22 @@ impl OfdmProcessor {
         let prs_ref = phase_reference_table();
         let prs_ref_conj: Vec<Complex<f32>> = prs_ref.iter().map(|c| c.conj()).collect();
 
+        // Build phase-difference reference for coarse frequency estimation.
+        // ref_arg[j] = arg(prs_ref[(T_u + j) % T_u] * conj(prs_ref[(T_u + j + 1) % T_u]))
+        // This matches welle.io's refArg initialization (ofdm-processor.cpp:97-101).
+        let ref_arg: Vec<f32> = (0..CORRELATION_LENGTH)
+            .map(|j| {
+                let a = prs_ref[(T_U + j) % T_U];
+                let b = prs_ref[(T_U + j + 1) % T_U];
+                (a * b.conj()).arg()
+            })
+            .collect();
+
         Self {
             fft,
             ifft,
             prs_ref_conj,
+            ref_arg,
             buffer: Vec::with_capacity(T_F * 2),
             state: SyncState::NeedNullDetect,
             frame_count: 0,
@@ -86,7 +128,19 @@ impl OfdmProcessor {
             running_phase: 0.0,
             from_null_detect: true,
             prs_fail_count: 0,
+            fic_decode_ratio: 0,
+            initial_coarse_applied: false,
+            s_level: 0.0,
+            warmup_done: false,
+            samples_consumed: 0,
         }
+    }
+
+    /// Update the FIC decode ratio (0–100%). Call this after each frame's FIC
+    /// processing to allow the OFDM processor to gate coarse frequency correction.
+    /// Matches welle.io's `ficHandler.getFicDecodeRatioPercent()` feedback loop.
+    pub fn set_fic_decode_ratio(&mut self, ratio_percent: u8) {
+        self.fic_decode_ratio = ratio_percent.min(100);
     }
 
     /// Apply frequency correction to a slice of samples in-place.
@@ -145,35 +199,202 @@ impl OfdmProcessor {
         phase * SAMPLE_RATE as f32 / (2.0 * PI * T_U as f32)
     }
 
-    /// Estimate coarse (integer carrier) frequency offset from PRS.
+    /// Estimate coarse (integer carrier) frequency offset from PRS using
+    /// phase-difference correlation (welle.io's CorrelatePRS method).
     ///
-    /// Searches carrier offsets in [-36, +36] and picks the offset that maximises
-    /// `|Σ recv[k+d] · conj(ref[k])|²` over all 1536 active carriers.
-    fn estimate_coarse_freq(&self, prs_spectrum: &[Complex<f32>]) -> i32 {
+    /// Instead of correlating carrier values directly (which is destroyed by
+    /// timing offsets that add linear phase across carriers), this computes
+    /// `arg(fft[k] * conj(fft[k+1]))` — the phase difference between adjacent
+    /// carriers — and correlates that pattern with a precomputed reference.
+    /// Phase differences are insensitive to linear phase ramps from timing
+    /// offsets.
+    ///
+    /// Searches carrier offsets in `[-SEARCH_RANGE/2, +SEARCH_RANGE/2)`.
+    fn estimate_coarse_freq_phase_diff(&self, prs_spectrum: &[Complex<f32>]) -> i32 {
         if prs_spectrum.len() != T_U {
             return 0;
         }
 
-        const SEARCH_RANGE: i32 = 36;
+        // Compute phase differences for the search window.
+        // welle.io: correlationVector[i] = arg(fft[baseIndex] * conj(fft[baseIndex+1]))
+        //   where baseIndex = T_u - SEARCH_RANGE/2 + i
+        let mut corr_vec = vec![0.0f32; SEARCH_RANGE + CORRELATION_LENGTH];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..(SEARCH_RANGE + CORRELATION_LENGTH) {
+            let base = T_U + i - SEARCH_RANGE / 2;
+            let a = prs_spectrum[base % T_U];
+            let b = prs_spectrum[(base + 1) % T_U];
+            corr_vec[i] = (a * b.conj()).arg();
+        }
 
-        let mut best_offset = 0i32;
-        let mut best_corr = 0.0f32;
-
-        for offset in -SEARCH_RANGE..=SEARCH_RANGE {
-            let corr = self.correlate_prs_at_offset(prs_spectrum, offset);
-            if corr > best_corr {
-                best_corr = corr;
-                best_offset = offset;
+        // Slide the reference pattern across the correlation vector to find best match.
+        // welle.io: sum += abs(refArg[j] * correlationVector[i + j])
+        let mut best_sum = 0.0f32;
+        let mut best_index = 0usize;
+        for i in 0..SEARCH_RANGE {
+            let mut sum = 0.0f32;
+            for j in 0..CORRELATION_LENGTH {
+                sum += (self.ref_arg[j] * corr_vec[i + j]).abs();
+                // welle.io updates best inside the inner loop (slightly different
+                // semantics — it picks the partial sum that first exceeds the max).
+                // We match that behavior for compatibility.
+                if sum > best_sum {
+                    best_sum = sum;
+                    best_index = i;
+                }
             }
         }
 
-        best_offset
+        // Map index back to carrier offset.
+        // welle.io: return T_u - SEARCH_RANGE/2 + index - T_u
+        //         = index - SEARCH_RANGE/2
+        let offset = best_index as i32 - (SEARCH_RANGE as i32) / 2;
+
+        trace!(
+            best_index,
+            best_sum = format!("{:.2}", best_sum),
+            offset,
+            "estimate_coarse_freq_phase_diff"
+        );
+
+        offset
+    }
+
+    /// Estimate coarse frequency offset by finding where spectral energy is
+    /// concentrated — no reference needed. This is welle.io's `getMiddle` method.
+    ///
+    /// Computes a sliding K-wide window sum of `|fft[k]|` and finds the maximum.
+    /// The offset of that maximum relative to the expected center gives the
+    /// coarse carrier offset.
+    ///
+    /// This is the most robust initial sync method because it needs no PRS
+    /// reference — just the knowledge that DAB has K=1536 active carriers.
+    fn get_middle(prs_spectrum: &[Complex<f32>]) -> i32 {
+        if prs_spectrum.len() != T_U {
+            return 0;
+        }
+
+        // Compute initial sum over K carriers starting at index 40 relative to center.
+        let mut sum: f32 = 0.0;
+        for i in 40..(K + 40) {
+            sum += prs_spectrum[(T_U / 2 + i) % T_U].norm();
+        }
+
+        let mut max_sum = sum;
+        let mut max_index = 40i32;
+
+        // Slide the window: remove one carrier from the left, add one on the right.
+        for i in 41..(T_U - (K - 40)) {
+            sum -= prs_spectrum[(T_U / 2 + i - 1) % T_U].norm();
+            sum += prs_spectrum[(T_U / 2 + i - 1 + K) % T_U].norm();
+            if sum > max_sum {
+                max_sum = sum;
+                max_index = i as i32;
+            }
+        }
+
+        // Expected center of active carriers: (T_U - K) / 2
+        let expected = (T_U - K) / 2;
+        let offset = max_index - expected as i32;
+
+        trace!(
+            max_index,
+            expected,
+            max_sum = format!("{:.1}", max_sum),
+            offset,
+            "get_middle"
+        );
+
+        offset
+    }
+
+    /// Brute-force search for the best coarse frequency offset by trying
+    /// PRS IFFT correlation at each candidate offset from -5 to +5 and
+    /// returning the one with the highest SNR.
+    ///
+    /// This is used as a fallback when `getMiddle` returns an implausible
+    /// result (e.g., on noisy/partial PRS data). More expensive than
+    /// `getMiddle` but works even on weak signals because it uses the
+    /// PRS reference for correlation.
+    ///
+    /// Returns `Some(offset)` if a clear winner is found (SNR > 5 and at
+    /// least 2x better than the next candidate), or `None` if inconclusive.
+    fn brute_force_coarse_search(
+        prs_spectrum: &[Complex<f32>],
+        prs_ref_conj: &[Complex<f32>],
+        ifft: &Arc<dyn Fft<f32>>,
+    ) -> Option<i32> {
+        if prs_spectrum.len() != T_U {
+            return None;
+        }
+
+        let mut best_snr = 0.0f32;
+        let mut best_offset = 0i32;
+        let mut second_snr = 0.0f32;
+
+        for d in -5..=5i32 {
+            // Build correlation buffer with this candidate offset
+            let mut corr_buf: Vec<Complex<f32>> = (0..T_U)
+                .map(|k| {
+                    let ref_idx = ((k as i32 - d).rem_euclid(T_U as i32)) as usize;
+                    prs_spectrum[k] * prs_ref_conj[ref_idx]
+                })
+                .collect();
+            ifft.process(&mut corr_buf);
+
+            // Find peak and compute SNR
+            let mut peak_mag = 0.0f32;
+            let mut sum_mag = 0.0f32;
+            for c in corr_buf.iter() {
+                let mag = c.norm_sqr();
+                sum_mag += mag.sqrt();
+                if mag > peak_mag {
+                    peak_mag = mag;
+                }
+            }
+            let avg_mag = sum_mag / T_U as f32;
+            let snr = if avg_mag > 0.0 {
+                peak_mag.sqrt() / avg_mag
+            } else {
+                0.0
+            };
+
+            trace!(d, snr = format!("{:.2}", snr), "brute_force_coarse_search");
+
+            if snr > best_snr {
+                second_snr = best_snr;
+                best_snr = snr;
+                best_offset = d;
+            } else if snr > second_snr {
+                second_snr = snr;
+            }
+        }
+
+        // Require the best to be clearly better than the second-best
+        // and have a reasonable absolute SNR
+        if best_snr > 5.0 && (second_snr < 1.0 || best_snr > second_snr * 1.5) {
+            debug!(
+                best_offset,
+                best_snr = format!("{:.1}", best_snr),
+                second_snr = format!("{:.1}", second_snr),
+                "brute_force_coarse_search: clear winner"
+            );
+            Some(best_offset)
+        } else {
+            debug!(
+                best_snr = format!("{:.1}", best_snr),
+                second_snr = format!("{:.1}", second_snr),
+                "brute_force_coarse_search: inconclusive"
+            );
+            None
+        }
     }
 
     /// Feed IQ samples into the processor. Call repeatedly with chunks.
     /// Returns complete frames when enough data has been accumulated and synced.
     ///
     /// Frame processing follows welle.io's architecture:
+    /// - Initial warm-up: discard first T_F/2 samples while computing s_level
     /// - Initial sync: null detect → PRS correlate → process frame
     /// - Subsequent frames: consume null samples → PRS correlate → process frame
     /// - Frequency correction phase is continuous across all operations
@@ -181,9 +402,48 @@ impl OfdmProcessor {
         self.buffer.extend_from_slice(samples);
         let mut frames = Vec::new();
 
+        // --- Warm-up phase (matches welle.io's initial sLevel computation) ---
+        // Discard the first T_F/2 samples to let the hardware's AGC settle.
+        // Use these samples to compute the long-term signal level (s_level)
+        // needed for null detection.
+        if !self.warmup_done {
+            let warmup_target = T_F / 2;
+            let remaining = warmup_target - self.samples_consumed;
+            let available = self.buffer.len().min(remaining);
+            if available > 0 {
+                // Accumulate L1 sum for fast mean-based initialization.
+                // Using arithmetic mean instead of EMA with tiny alpha (0.00001)
+                // because the EMA only converges to ~63% of the true level after
+                // T_F/2 samples. The mean gives exact convergence immediately.
+                for s in &self.buffer[..available] {
+                    let l1 = s.re.abs() + s.im.abs();
+                    self.s_level += l1;
+                }
+                self.samples_consumed += available;
+                self.buffer.drain(..available);
+            }
+            if self.samples_consumed < warmup_target {
+                return frames; // Need more samples for warm-up
+            }
+            // Convert accumulated sum to mean L1 norm per sample.
+            self.s_level /= self.samples_consumed as f32;
+            self.warmup_done = true;
+            debug!(
+                s_level = format!("{:.4}", self.s_level),
+                warmup_samples = self.samples_consumed,
+                "AGC warm-up complete"
+            );
+        }
+
         loop {
             match self.state {
                 SyncState::NeedNullDetect => {
+                    // Reset initial coarse flag so getMiddle runs again on re-acquisition.
+                    // Also reset frequency estimates — if we lost sync, the old estimates
+                    // may be wildly wrong and would poison the next acquisition attempt.
+                    self.initial_coarse_applied = false;
+                    self.coarse_freq_carriers = 0;
+                    self.fine_freq_hz = 0.0;
                     if !self.find_null_symbol() {
                         break;
                     }
@@ -207,8 +467,67 @@ impl OfdmProcessor {
                         "Entering PRS correlation state"
                     );
 
+                    // -------------------------------------------------------
+                    // Initial coarse frequency estimation using getMiddle.
+                    //
+                    // On first acquisition (or re-acquisition after sync loss),
+                    // find where spectral energy is concentrated BEFORE doing
+                    // PRS correlation. This breaks the chicken-and-egg problem
+                    // where PRS correlation needs coarse correction but coarse
+                    // correction needs good PRS correlation.
+                    //
+                    // getMiddle needs no PRS reference — just the knowledge
+                    // that DAB has K=1536 active carriers — so it works even
+                    // with large frequency offsets that destroy IFFT-based PRS
+                    // correlation.
+                    // -------------------------------------------------------
+                    if self.from_null_detect && !self.initial_coarse_applied {
+                        // Need at least T_G + T_U samples to FFT the PRS
+                        if self.buffer.len() >= T_G + T_U {
+                            let mut prs_spec: Vec<Complex<f32>> =
+                                self.buffer[T_G..T_G + T_U].to_vec();
+                            self.fft.process(&mut prs_spec);
+
+                            let middle_offset = Self::get_middle(&prs_spec);
+                            // Sanity check: real hardware offsets are at most a few
+                            // carriers. getMiddle can return wild values (100+) when
+                            // it sees a partial/misaligned PRS or noise. Clamp to ±5
+                            // to prevent catastrophic divergence while still covering
+                            // any realistic tuner frequency offset.
+                            if middle_offset != 0 && middle_offset.abs() <= 5 {
+                                debug!(middle_offset, "Initial coarse freq from getMiddle");
+                                self.coarse_freq_carriers += middle_offset;
+                            } else if middle_offset.abs() > 5 {
+                                debug!(
+                                    middle_offset,
+                                    "getMiddle implausible, trying brute-force PRS search"
+                                );
+                                // getMiddle failed (noisy data). Fall back to trying
+                                // PRS IFFT correlation at each candidate coarse offset
+                                // from -5 to +5 and picking the one with best SNR.
+                                // This is more expensive but very robust.
+                                let best = Self::brute_force_coarse_search(
+                                    &prs_spec,
+                                    &self.prs_ref_conj,
+                                    &self.ifft,
+                                );
+                                if let Some(offset) = best {
+                                    debug!(offset, "Brute-force PRS search found coarse offset");
+                                    self.coarse_freq_carriers += offset;
+                                }
+                            }
+                            self.initial_coarse_applied = true;
+                        }
+                    }
+
                     // Use PRS correlation to find exact timing
                     let (prs_start, prs_snr) = self.find_prs_start();
+                    debug!(
+                        prs_start,
+                        prs_snr = format!("{:.2}", prs_snr),
+                        from_null_detect = self.from_null_detect,
+                        "PRS correlation"
+                    );
                     if prs_start == i32::MIN {
                         // Not enough data — wait for more
                         break;
@@ -246,7 +565,7 @@ impl OfdmProcessor {
                         //
                         // Fall back to re-acquisition only if PRS SNR is extremely
                         // poor AND the lag suggests we're completely lost.
-                        if prs_snr > 10.0 && best_lag.abs() < 100 {
+                        if prs_snr > 10.0 && best_lag.abs() < 300 {
                             // Good PRS correlation, use for fine timing
                             self.prs_fail_count = 0;
                             prs_start as usize
@@ -480,7 +799,9 @@ impl OfdmProcessor {
             let mut prs_spec: Vec<Complex<f32>> = corrected[..T_U].to_vec();
             self.fft.process(&mut prs_spec);
 
-            let coarse = self.estimate_coarse_freq(&prs_spec);
+            // Use phase-difference approach (robust to timing offsets) instead
+            // of the old coherent-sum method.
+            let coarse = self.estimate_coarse_freq_phase_diff(&prs_spec);
 
             trace!(
                 frame = self.frame_count,
@@ -498,10 +819,33 @@ impl OfdmProcessor {
                 raw_fine_hz = format!("{:.1}", raw_fine_freq),
                 fine_hz = format!("{:.1}", self.fine_freq_hz),
                 coarse_carriers = self.coarse_freq_carriers,
+                fic_ratio = self.fic_decode_ratio,
                 "freq estimation"
             );
-            if self.last_prs_snr > 20.0 || self.frame_count == 0 {
-                self.coarse_freq_carriers += coarse;
+
+            // Gate coarse correction:
+            // - Only when FIC decoding is poor (< 50%), matching welle.io.
+            // - The phase-diff estimator is robust to timing offsets but can
+            //   give noisy results when PRS SNR is very low. Require SNR > 5
+            //   (much lower than the old > 15 gate that caused the chicken-and-egg
+            //   problem — getMiddle handles the initial large offset).
+            // - Limit per-frame correction to ±3 carriers. The phase-diff method
+            //   should only need small adjustments. Large jumps indicate noise.
+            if self.fic_decode_ratio < 50
+                && coarse != 0
+                && self.last_prs_snr > 5.0
+                && coarse.abs() <= 3
+            {
+                // Sanity: don't apply corrections that would push total
+                // coarse beyond ±35 carriers (35 kHz), matching welle.io.
+                let new_coarse = self.coarse_freq_carriers + coarse;
+                if new_coarse.abs() <= 35 {
+                    debug!(
+                        correction = coarse,
+                        new_coarse, "applying coarse freq correction"
+                    );
+                    self.coarse_freq_carriers = new_coarse;
+                }
             }
         }
 
@@ -540,6 +884,7 @@ impl OfdmProcessor {
     }
 
     /// Compute PRS correlation magnitude-squared at a specific carrier offset.
+    #[allow(dead_code)] // Retained for testing; production uses phase-diff method
     fn correlate_prs_at_offset(&self, prs_spectrum: &[Complex<f32>], offset: i32) -> f32 {
         let mut corr = Complex::new(0.0f32, 0.0);
         for k in 1..=(K / 2) as i32 {
@@ -562,6 +907,10 @@ impl OfdmProcessor {
     /// Returns `(sample_offset, snr)` where sample_offset is from buffer[0] to the PRS
     /// useful-part start, or `(i32::MIN, 0.0)` if not enough data yet.
     /// May return negative values if the PRS start was already passed (caller should re-acquire).
+    ///
+    /// Accounts for `coarse_freq_carriers` by shifting the PRS reference so that
+    /// the correlation works even with a coarse frequency offset (where the FFT
+    /// bins are shifted by the offset amount).
     fn find_prs_start(&self) -> (i32, f32) {
         if self.buffer.len() < T_S + T_G {
             return (i32::MIN, 0.0);
@@ -575,20 +924,21 @@ impl OfdmProcessor {
         let win_start = T_G;
         let mut fft_buf: Vec<Complex<f32>> = self.buffer[win_start..win_start + T_U].to_vec();
 
-        // No frequency correction for PRS correlation. The frequency offset (~100-200 Hz)
-        // is much smaller than the carrier spacing (1000 Hz), so it only adds a phase
-        // rotation to each carrier without shifting the FFT bins. The IFFT correlation
-        // magnitude is unaffected by this rotation.
-
         // Debug: compute signal power in the window
         let window_power: f32 = fft_buf.iter().map(|c| c.norm_sqr()).sum::<f32>() / T_U as f32;
 
         self.fft.process(&mut fft_buf);
 
-        let mut corr_buf: Vec<Complex<f32>> = fft_buf
-            .iter()
-            .zip(self.prs_ref_conj.iter())
-            .map(|(a, b)| a * b)
+        // Build correlation buffer accounting for coarse frequency offset.
+        // When the signal has a coarse offset of `d` carriers, FFT bin `k` in the
+        // received signal corresponds to reference bin `k - d`. So we correlate:
+        //   corr[k] = fft_buf[k] * prs_ref_conj[(k - d) mod T_U]
+        let d = self.coarse_freq_carriers;
+        let mut corr_buf: Vec<Complex<f32>> = (0..T_U)
+            .map(|k| {
+                let ref_idx = ((k as i32 - d).rem_euclid(T_U as i32)) as usize;
+                fft_buf[k] * self.prs_ref_conj[ref_idx]
+            })
             .collect();
         self.ifft.process(&mut corr_buf);
 
@@ -641,104 +991,167 @@ impl OfdmProcessor {
         (prs_start, snr)
     }
 
-    /// Find the null symbol by detecting a power drop (initial acquisition only).
-    /// Consumes samples up to and including the null symbol.
+    /// Find the null symbol using welle.io's two-phase approach:
+    /// 1. Scan for a power dip (null symbol) where the 50-sample average drops
+    ///    below 50% of the long-term signal level
+    /// 2. Then find the end of the null (power rises above 75% of s_level)
     ///
     /// After detection, buffer[0] ≈ start of PRS guard interval.
+    /// Uses and updates `self.s_level` throughout for adaptive thresholding.
     fn find_null_symbol(&mut self) -> bool {
-        if self.buffer.len() < T_NULL + T_S + T_F / 4 {
+        // Need enough samples to search through (at least one frame)
+        if self.buffer.len() < T_NULL + T_S {
             return false;
         }
 
-        let window = 128;
-        let search_len = self.buffer.len().min(T_F * 2).saturating_sub(T_NULL + T_S);
-        if search_len < window * 2 {
+        let window = 50usize;
+        let search_limit = self.buffer.len().min(T_F * 2);
+
+        // Phase 1: Build initial window and find the null dip
+        if search_limit < window + T_NULL {
             return false;
         }
 
-        let mut best_pos = 0usize;
-        let mut best_ratio = 0.0f32;
+        // Initialize the sliding window sum over the first `window` samples
+        let mut current_strength: f32 = 0.0;
+        for i in 0..window {
+            current_strength += self.buffer[i].re.abs() + self.buffer[i].im.abs();
+        }
 
-        for pos in (T_NULL / 2..search_len).step_by(window / 4) {
-            if pos < window || pos + window > self.buffer.len() {
-                continue;
+        // Update s_level from these initial samples too
+        for i in 0..window {
+            let l1 = self.buffer[i].re.abs() + self.buffer[i].im.abs();
+            self.s_level = 0.00001 * l1 + (1.0 - 0.00001) * self.s_level;
+        }
+
+        // Scan for null dip: sliding window average < 0.60 * s_level
+        // We use 0.60 instead of welle.io's 0.50 because our push-based model
+        // doesn't apply frequency correction during null scanning, resulting in
+        // a higher noise floor in the null period (null/signal ratio ~0.51-0.55
+        // for Airspy Mini live data vs ~0.20 in file recordings).
+        let mut pos = window;
+        let mut found_null = false;
+        let mut counter = 0u32;
+        while pos < search_limit {
+            let sample = self.buffer[pos];
+            let l1 = sample.re.abs() + sample.im.abs();
+            self.s_level = 0.00001 * l1 + (1.0 - 0.00001) * self.s_level;
+
+            // Update sliding window: add new, remove oldest
+            current_strength += l1;
+            if pos >= window {
+                current_strength -=
+                    self.buffer[pos - window].re.abs() + self.buffer[pos - window].im.abs();
             }
-            let before_power: f32 = self.buffer[pos - window..pos]
-                .iter()
-                .map(|s| s.norm_sqr())
-                .sum();
-            let after_power: f32 = self.buffer[pos..pos + window]
-                .iter()
-                .map(|s| s.norm_sqr())
-                .sum();
 
-            if before_power > 0.0 {
-                let ratio = after_power / before_power;
-                if ratio > best_ratio {
-                    best_ratio = ratio;
-                    best_pos = pos;
+            pos += 1;
+            counter += 1;
+
+            let window_avg = current_strength / window as f32;
+            if self.s_level > 0.0 && window_avg <= 0.60 * self.s_level {
+                found_null = true;
+                break;
+            }
+
+            if counter > T_F as u32 {
+                // Hopeless — no null found in one full frame
+                debug!(
+                    s_level = format!("{:.4}", self.s_level),
+                    counter, "null detect: no null dip found"
+                );
+                // Discard some samples and try again
+                let discard = self.buffer.len().min(T_F / 2);
+                self.buffer.drain(..discard);
+                return false;
+            }
+        }
+
+        if !found_null {
+            // Not enough samples to find null
+            return false;
+        }
+
+        let null_start_pos = pos;
+        trace!(
+            null_start_pos,
+            s_level = format!("{:.4}", self.s_level),
+            window_avg = format!("{:.4}", current_strength / window as f32),
+            "null detect: found null dip"
+        );
+
+        // Phase 2: Find end of null (power rises above 0.75 * s_level)
+        // IMPORTANT: Do NOT update s_level during null period scanning.
+        // The null period has very low power which would drag s_level down,
+        // lowering the end-of-null threshold and causing false triggers on
+        // noise spikes within the null. Freeze s_level at its pre-null value.
+        let s_level_frozen = self.s_level;
+        let mut null_counter = 0u32;
+        while pos < search_limit {
+            let sample = self.buffer[pos];
+            let l1 = sample.re.abs() + sample.im.abs();
+            // Continue updating s_level for phase 1 consistency in future calls,
+            // but use the frozen value for threshold comparison.
+            self.s_level = 0.00001 * l1 + (1.0 - 0.00001) * self.s_level;
+
+            current_strength += l1;
+            if pos >= window {
+                current_strength -=
+                    self.buffer[pos - window].re.abs() + self.buffer[pos - window].im.abs();
+            }
+
+            pos += 1;
+            null_counter += 1;
+
+            if s_level_frozen > 0.0 && current_strength / window as f32 >= 0.75 * s_level_frozen {
+                // Validate null length: must be close to T_NULL (2656 samples).
+                // Accept >= 50% of T_NULL to account for timing jitter and
+                // the sliding window lag (~50 samples). Values like 137 or 411
+                // are clearly false triggers on noise.
+                let min_null_len = (T_NULL / 2) as u32;
+                if null_counter < min_null_len {
+                    debug!(
+                        null_start = null_start_pos,
+                        null_len = null_counter,
+                        min_null_len,
+                        "null detect: null period too short, false trigger"
+                    );
+                    // This was a false null dip (e.g. AGC transient, noise dip).
+                    // Continue scanning from here — don't discard samples.
+                    // Reset to phase 1 scanning by breaking out and returning false
+                    // so we retry with more data next time.
+                    let discard = pos.min(self.buffer.len());
+                    self.buffer.drain(..discard);
+                    return false;
                 }
+
+                debug!(
+                    null_start = null_start_pos,
+                    null_end = pos,
+                    null_len = null_counter,
+                    s_level = format!("{:.4}", s_level_frozen),
+                    "null detect OK"
+                );
+
+                // Drain everything up to the end-of-null position.
+                // The PRS guard interval starts approximately here.
+                self.buffer.drain(..pos);
+                return true;
+            }
+
+            if null_counter > (T_NULL + T_NULL / 4) as u32 {
+                // Null period too long — probably not a real null
+                debug!(
+                    null_start = null_start_pos,
+                    null_counter, "null detect: null period too long, re-syncing"
+                );
+                let discard = self.buffer.len().min(T_F / 2);
+                self.buffer.drain(..discard);
+                return false;
             }
         }
 
-        trace!(
-            buffer_len = self.buffer.len(),
-            search_len,
-            best_pos,
-            best_ratio = format!("{:.2}", best_ratio),
-            "find_null_symbol"
-        );
-
-        debug!(
-            buf = self.buffer.len(),
-            search = search_len,
-            best_ratio = format!("{:.2}", best_ratio),
-            best_pos,
-            "find_null_symbol"
-        );
-
-        if best_ratio < 2.0 {
-            let discard = self.buffer.len().min(T_F / 2);
-            // Advance phase for discarded samples to maintain continuity
-            let total_freq_hz =
-                self.fine_freq_hz + self.coarse_freq_carriers as f32 * CARRIER_DIFF as f32;
-            let phase_step = -2.0 * PI * total_freq_hz / SAMPLE_RATE as f32;
-            self.running_phase += phase_step * discard as f32;
-            self.running_phase = self.running_phase.rem_euclid(2.0 * PI);
-            if self.running_phase > PI {
-                self.running_phase -= 2.0 * PI;
-            }
-            self.buffer.drain(..discard);
-            return false;
-        }
-
-        if best_pos >= self.buffer.len() {
-            return false;
-        }
-
-        // CRITICAL: Advance running_phase for all drained samples to maintain phase
-        // continuity. Without this, the frequency correction applied in process_frame()
-        // starts with the wrong phase, causing constellation rotation that gets worse
-        // for later symbols (MSC).
-        let total_freq_hz =
-            self.fine_freq_hz + self.coarse_freq_carriers as f32 * CARRIER_DIFF as f32;
-        let phase_step = -2.0 * PI * total_freq_hz / SAMPLE_RATE as f32;
-        self.running_phase += phase_step * best_pos as f32;
-        // Wrap to [-PI, PI) for numerical stability
-        self.running_phase = self.running_phase.rem_euclid(2.0 * PI);
-        if self.running_phase > PI {
-            self.running_phase -= 2.0 * PI;
-        }
-
-        trace!(
-            drained = best_pos,
-            phase_advance = format!("{:.4}", phase_step * best_pos as f32),
-            running_phase = format!("{:.4}", self.running_phase),
-            "find_null_symbol: advancing phase for drained samples"
-        );
-
-        self.buffer.drain(..best_pos);
-        true
+        // Not enough samples to find end of null
+        false
     }
 }
 
