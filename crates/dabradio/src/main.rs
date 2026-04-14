@@ -28,6 +28,13 @@ use desperado::DeviceConfig;
     feature = "airspy",
     feature = "hackrf"
 ))]
+use desperado::Gain;
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "soapy",
+    feature = "airspy",
+    feature = "hackrf"
+))]
 use desperado::IqAsyncSource;
 use desperado::dsp::DspBlock;
 #[cfg(feature = "resampler")]
@@ -126,6 +133,20 @@ impl IqChunkSource {
             }
         }
     }
+
+    /// Adjust tuner gain on live SDR sources. No-op for file/stdin sources.
+    #[cfg(any(
+        feature = "rtlsdr",
+        feature = "soapy",
+        feature = "airspy",
+        feature = "hackrf"
+    ))]
+    fn set_gain(&self, gain: Gain) -> desperado::error::Result<()> {
+        match self {
+            IqChunkSource::Sync(_) => Ok(()),
+            IqChunkSource::Async { source, .. } => source.set_gain(gain),
+        }
+    }
 }
 
 const AUDIO_RATE: usize = 48_000;
@@ -157,6 +178,9 @@ struct TuiState {
     save_message: String,  // transient feedback after (S) save
     audio_q_fill: usize,
     status: String,
+    // Gain
+    gain: Option<f64>,                // current gain in dB; None = auto/unknown
+    gain_change_request: Option<f64>, // written by TUI thread, consumed by main loop
 }
 
 struct TuiGuard {
@@ -178,6 +202,8 @@ fn spawn_dab_tui(
     running: Arc<AtomicBool>,
     keyboard_available: bool,
     inline_image_support: bool,
+    can_adjust_gain: bool,
+    gain_steps: Vec<f64>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let _ = enable_raw_mode();
@@ -263,7 +289,11 @@ fn spawn_dab_tui(
 
                     // ── Footer ──
                     let controls = if keyboard_available {
-                        "  (↑↓) navigate   (↵) select   (S) save image   (q/Esc) quit"
+                        if can_adjust_gain {
+                            "  (↑↓) navigate   (↵) select   (+/-) gain   (S) save image   (q/Esc) quit"
+                        } else {
+                            "  (↑↓) navigate   (↵) select   (S) save image   (q/Esc) quit"
+                        }
                     } else {
                         "  Ctrl-C to quit  (stdin piped)"
                     };
@@ -324,29 +354,41 @@ fn spawn_dab_tui(
 
                     // ── Info + MOT panel ──
                     let right_inner = right.width.saturating_sub(4) as usize;
+                    let gain_str = match s.gain {
+                        None => "auto".to_string(),
+                        Some(db) => format!("{:.1} dB", db),
+                    };
+                    let iq_color = if s.iq_level_dbfs > -10.0 {
+                        Style::default().fg(Color::Red)
+                    } else if s.iq_level_dbfs > -30.0 {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    };
                     let right_lines = vec![
+                        Line::from(vec![
+                            Span::raw(format!(
+                                " IQ: {}  ",
+                                level_bar(s.iq_level_dbfs, -60.0, 0.0, 14),
+                            )),
+                            Span::styled(format!("{:.1} dBFS", s.iq_level_dbfs), iq_color),
+                            Span::raw(format!(
+                                "   Audio buffer: {} {}",
+                                level_bar(s.audio_q_fill as f32, 0.0, AUDIO_QUEUE_MAX as f32, 14),
+                                s.audio_q_fill,
+                            )),
+                        ]),
                         Line::from(format!(
-                            " IQ: {}  {:.1} dBFS   Audio buffer: {} {}",
-                            level_bar(s.iq_level_dbfs, -60.0, 0.0, 14),
-                            s.iq_level_dbfs,
-                            level_bar(s.audio_q_fill as f32, 0.0, AUDIO_QUEUE_MAX as f32, 14),
-                            s.audio_q_fill,
-                        )),
-                        Line::from(format!(
-                            " In: {:.3} MHz  →  {} Hz",
+                            " In: {:.3} MHz  →  {} Hz   Gain: {}",
                             s.input_rate_hz as f64 / 1_000_000.0,
                             s.output_rate_hz,
+                            gain_str,
                         )),
                         Line::from(""),
-                        Line::from(format!(
-                            " {}",
-                            one_line(&s.service, right_inner.saturating_sub(1))
-                        )),
                         Line::from(format!(
                             " DLS: {}",
                             one_line(&s.dls, right_inner.saturating_sub(6))
                         )),
-                        Line::from(""),
                         Line::from(format!(
                             " MOT: {}  ·  {}",
                             s.mot_count,
@@ -442,6 +484,20 @@ fn spawn_dab_tui(
                                 save_message_until = Some(Instant::now() + Duration::from_secs(4));
                             }
                         }
+                        KeyCode::Char('+') if can_adjust_gain => {
+                            if let Ok(mut s) = state.lock() {
+                                let new_db = next_gain_up(s.gain.unwrap_or(30.0), &gain_steps);
+                                s.gain = Some(new_db);
+                                s.gain_change_request = Some(new_db);
+                            }
+                        }
+                        KeyCode::Char('-') if can_adjust_gain => {
+                            if let Ok(mut s) = state.lock() {
+                                let new_db = next_gain_down(s.gain.unwrap_or(30.0), &gain_steps);
+                                s.gain = Some(new_db);
+                                s.gain_change_request = Some(new_db);
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -467,15 +523,14 @@ fn draw_tui_image(path: &str, area: Rect) {
     // Layout inside right panel (with border):
     //   row 0: top border
     //   row 1: IQ bar
-    //   row 2: rates
+    //   row 2: rates + gain
     //   row 3: blank
-    //   row 4: service name
-    //   row 5: DLS
-    //   row 6: blank
-    //   row 7: MOT info
-    //   row 8+: image area
+    //   row 4: DLS
+    //   row 5: blank
+    //   row 6: MOT info
+    //   row 7+: image area
     //   row last: bottom border
-    let image_y_offset = 8u16;
+    let image_y_offset = 7u16;
     let overhead = image_y_offset + 1; // +1 for bottom border
     let cfg = viuer::Config {
         absolute_offset: true,
@@ -762,9 +817,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let is_rtlsdr_uri = source.starts_with("rtlsdr://");
+    let source_uri = source.to_string();
 
     let chunk_size = constants::T_F; // One frame's worth of samples
-    let (mut source, is_file_source, input_sample_rate) = open_iq_source(
+    let (mut source, is_file_source, input_sample_rate, effective_gain) = open_iq_source(
         source,
         center_freq,
         default_input_rate,
@@ -834,10 +890,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         input_rate_hz: input_sample_rate,
         output_rate_hz: constants::SAMPLE_RATE,
         iq_level_dbfs: -60.0,
+        gain: effective_gain,
         status: "starting".to_string(),
         ..Default::default()
     }));
     let _tui_guard = if tui_enabled {
+        let gain_steps = gain_steps_for_source(&source_uri);
         Some(TuiGuard {
             running: app_running.clone(),
             handle: Some(spawn_dab_tui(
@@ -845,6 +903,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app_running.clone(),
                 keyboard_available,
                 inline_image_support,
+                !is_file_source,
+                gain_steps,
             )),
         })
     } else {
@@ -1210,6 +1270,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Gain change request from TUI +/- keys
+            #[cfg(any(
+                feature = "rtlsdr",
+                feature = "soapy",
+                feature = "airspy",
+                feature = "hackrf"
+            ))]
+            if tui_enabled {
+                let gain_req = tui_state
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut s| s.gain_change_request.take());
+                if let Some(db) = gain_req
+                    && let Err(e) = source.set_gain(Gain::Manual(db))
+                {
+                    warn!(gain = db, error = %e, "Failed to set gain");
+                }
+            }
+
             // Feed MSC symbols to handler (symbols 3..74 are MSC, i.e. soft_bits[3..75])
             if let Some(ref mut handler) = msc_handler {
                 let msc_start = constants::FIC_SYMBOLS; // 3
@@ -1518,16 +1597,26 @@ async fn open_iq_source(
     sample_rate: u32,
     chunk_size: usize,
     iq_format: IqFormat,
-) -> Result<(IqChunkSource, bool, u32), Box<dyn std::error::Error>> {
+) -> Result<(IqChunkSource, bool, u32, Option<f64>), Box<dyn std::error::Error>> {
     // File and stdin: use synchronous IqSource (simple, reliable)
     if input == "-" {
         let source = IqSource::from_stdin(center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(Box::new(source)), true, sample_rate));
+        return Ok((
+            IqChunkSource::Sync(Box::new(source)),
+            true,
+            sample_rate,
+            None,
+        ));
     }
 
     if !is_device_uri(input) {
         let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
-        return Ok((IqChunkSource::Sync(Box::new(source)), true, sample_rate));
+        return Ok((
+            IqChunkSource::Sync(Box::new(source)),
+            true,
+            sample_rate,
+            None,
+        ));
     }
 
     // Live SDR: use sync IqSource in a dedicated reader thread.
@@ -1559,16 +1648,11 @@ async fn open_iq_source(
         }
     }
 
-    let configured_uri = ensure_tuning_query(input, center_freq, sample_rate);
+    #[allow(unused_variables)]
+    let (configured_uri, effective_gain) = ensure_tuning_query(input, center_freq, sample_rate);
     info!("Opening live SDR source: {}", configured_uri);
+    #[allow(unused_variables)]
     let input_rate = detect_device_sample_rate(&configured_uri)?;
-    #[cfg(not(any(
-        feature = "rtlsdr",
-        feature = "soapy",
-        feature = "airspy",
-        feature = "hackrf"
-    )))]
-    let _ = input_rate;
 
     #[cfg(any(
         feature = "rtlsdr",
@@ -1587,6 +1671,7 @@ async fn open_iq_source(
             },
             false,
             input_rate,
+            effective_gain,
         ))
     }
 
@@ -1650,7 +1735,7 @@ fn is_device_uri(input: &str) -> bool {
         || input.starts_with("hackrf://")
 }
 
-fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> String {
+fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> (String, Option<f64>) {
     let has_query = uri.contains('?');
     let has_freq = uri.contains("freq=") || uri.contains("frequency=");
     let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
@@ -1693,15 +1778,31 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> Stri
         }
     }
 
-    // For RTL-SDR devices, default to gain=28 for balanced reception
+    // For RTL-SDR devices, default to gain=29.7 for balanced reception
     if uri.starts_with("rtlsdr://") && !has_gain {
         if !out.ends_with('?') && !out.ends_with('&') {
             out.push('&');
         }
-        out.push_str("gain=28");
+        out.push_str("gain=29.7");
     }
 
-    out
+    // For HackRF devices, default to gain=72 for balanced reception
+    if uri.starts_with("hackrf://") && !has_gain {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str("gain=72");
+    }
+
+    // Extract effective gain from the final URI
+    let effective_gain = out.split('?').nth(1).and_then(|qs| {
+        qs.split('&')
+            .find(|p| p.starts_with("gain="))
+            .and_then(|p| p.strip_prefix("gain="))
+            .and_then(|v| v.parse::<f64>().ok())
+    });
+
+    (out, effective_gain)
 }
 
 fn print_channels(json: bool) {
@@ -1888,4 +1989,48 @@ fn print_services(ensemble: &fic::fib::EnsembleInfo, json: bool) {
             svc.protection.as_deref().unwrap_or(""),
         );
     }
+}
+
+/// Return the discrete gain steps (in dB) supported by the hardware behind `uri`.
+fn gain_steps_for_source(uri: &str) -> Vec<f64> {
+    if uri.starts_with("rtlsdr://") {
+        // R820T tuner gain table (tenths-of-dB → dB)
+        vec![
+            0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7, 16.6, 19.7, 20.7, 22.9, 25.4,
+            28.0, 29.7, 32.8, 33.8, 36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6,
+        ]
+    } else if uri.starts_with("airspy://") {
+        // 22 preset levels (0-21), mapped to dB as level * 50 / 21
+        (0..=21)
+            .map(|l| (l as f64 * 50.0 / 21.0 * 10.0).round() / 10.0)
+            .collect()
+    } else if uri.starts_with("hackrf://") {
+        // LNA 0-40 dB (8 dB steps) + VGA 0-62 dB (2 dB steps), effective 2 dB steps
+        (0..=51).map(|i| i as f64 * 2.0).collect()
+    } else {
+        // Unknown device — fall back to 1 dB steps over 0-50
+        (0..=50).map(|i| i as f64).collect()
+    }
+}
+
+/// Find the next gain step above `current` (or the max if already at/above the top).
+fn next_gain_up(current: f64, steps: &[f64]) -> f64 {
+    const EPS: f64 = 0.05;
+    for &s in steps {
+        if s > current + EPS {
+            return s;
+        }
+    }
+    steps.last().copied().unwrap_or(current)
+}
+
+/// Find the next gain step below `current` (or the min if already at/below the bottom).
+fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
+    const EPS: f64 = 0.05;
+    for &s in steps.iter().rev() {
+        if s < current - EPS {
+            return s;
+        }
+    }
+    steps.first().copied().unwrap_or(current)
 }

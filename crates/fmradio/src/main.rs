@@ -64,7 +64,7 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 use rubato::{
@@ -178,6 +178,7 @@ fn spawn_inline_tui(
     stereo_enabled: Arc<AtomicBool>,
     adjust_tx: tokio::sync::mpsc::UnboundedSender<RtlSdrMessage>,
     can_hard_retune: bool,
+    gain_steps: Vec<f64>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let _ = enable_raw_mode();
@@ -243,20 +244,43 @@ fn spawn_inline_tui(
                         Some(db) => format!("{:.1} dB", db),
                     };
                     let lines = vec![
-                        Line::from(format!(" Source: {}", src)),
-                        Line::from(format!(
-                            " In: {} Hz   MPX: {:.0} Hz   ({})   Gain: {}",
-                            s.sample_rate_hz, s.mpx_rate_hz, s.mode, gain_str
+                        Line::from(Span::styled(
+                            format!(" Source: {}", src),
+                            Style::default().add_modifier(Modifier::DIM),
                         )),
-                        Line::from(""),
+                        Line::from(Span::styled(
+                            format!(
+                                " In: {} Hz   MPX: {:.0} Hz   ({})   Gain: {}",
+                                s.sample_rate_hz, s.mpx_rate_hz, s.mode, gain_str
+                            ),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )),
+                        Line::from(Span::styled(
+                            " ─────────────────────────────",
+                            Style::default().add_modifier(Modifier::DIM),
+                        )),
                         Line::from(format!(" RDS PS: {}", ps)),
                         Line::from(format!(" RDS RT: {}", rt)),
                         Line::from(format!(" RDS PI: {}", pi_str)),
                         Line::from(format!(" RDS Clock: {}", time)),
                         Line::from(format!(" RDS AF List: {}", af_list_str)),
-                        Line::from(""),
-                        Line::from(" Metrics:"),
-                        Line::from(format!(" IQ Level: {:+6.1} dBFS  {}", s.iq_level_dbfs, bar)),
+                        Line::from(Span::styled(
+                            " ─────────────────────────────",
+                            Style::default().add_modifier(Modifier::DIM),
+                        )),
+                        Line::from(vec![
+                            Span::styled(
+                                format!(" IQ Level: {:+6.1} dBFS  ", s.iq_level_dbfs),
+                                if s.iq_level_dbfs > -10.0 {
+                                    Style::default().fg(Color::Red)
+                                } else if s.iq_level_dbfs > -30.0 {
+                                    Style::default().fg(Color::Green)
+                                } else {
+                                    Style::default().fg(Color::Yellow)
+                                },
+                            ),
+                            Span::raw(bar.clone()),
+                        ]),
                         Line::from(format!(" Audio Buffer: {} samples", s.audio_buf_fill)),
                         Line::from(format!(
                             " RDS Blocks: valid={} total={}  BLER={:5.1}%",
@@ -277,7 +301,11 @@ fn spawn_inline_tui(
                     } else {
                         "(Esc/Q) quit | (S) stereo"
                     };
-                    let footer_widget = Paragraph::new(Line::from(controls)).centered();
+                    let footer_widget = Paragraph::new(Line::from(Span::styled(
+                        controls,
+                        Style::default().add_modifier(Modifier::DIM),
+                    )))
+                    .centered();
                     f.render_widget(footer_widget, footer);
                 });
             }
@@ -299,16 +327,14 @@ fn spawn_inline_tui(
                         }
                         KeyCode::Char('+') if can_hard_retune => {
                             if let Ok(mut s) = state.lock() {
-                                let new_db = s.gain.unwrap_or(30.0) + 1.0;
-                                let new_db = new_db.min(49.6);
+                                let new_db = next_gain_up(s.gain.unwrap_or(30.0), &gain_steps);
                                 s.gain = Some(new_db);
                                 let _ = adjust_tx.send(RtlSdrMessage::Gain(Gain::Manual(new_db)));
                             }
                         }
                         KeyCode::Char('-') if can_hard_retune => {
                             if let Ok(mut s) = state.lock() {
-                                let new_db = s.gain.unwrap_or(30.0) - 1.0;
-                                let new_db = new_db.max(0.0);
+                                let new_db = next_gain_down(s.gain.unwrap_or(30.0), &gain_steps);
                                 s.gain = Some(new_db);
                                 let _ = adjust_tx.send(RtlSdrMessage::Gain(Gain::Manual(new_db)));
                             }
@@ -434,7 +460,7 @@ async fn main() -> desperado::Result<()> {
 
     // Create IQ source based on selected type
     let mut current_center_hz = args.center_freq.0;
-    let mut iq_source = build_iq_source(
+    let (mut iq_source, effective_gain) = build_iq_source(
         &args,
         tuning_freq_from_center(current_center_hz, args.offset_freq),
     )
@@ -496,19 +522,21 @@ async fn main() -> desperado::Result<()> {
         rds_valid_blocks: 0,
         rds_groups: 0,
         rds_ct: String::new(),
-        gain: args.gain.map(|g| g as f64 / 10.0),
+        gain: effective_gain,
     }));
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_thread = if args.tui {
         let can_hard_retune = args.source.starts_with("rtlsdr://")
             || args.source.starts_with("airspy://")
             || args.source.starts_with("hackrf://");
+        let gain_steps = gain_steps_for_source(&args.source);
         Some(spawn_inline_tui(
             tui_state.clone(),
             app_running.clone(),
             stereo_enabled.clone(),
             adjust_tx.clone(),
             can_hard_retune,
+            gain_steps,
         ))
     } else {
         None
@@ -610,37 +638,49 @@ async fn main() -> desperado::Result<()> {
     run_result
 }
 
-async fn build_iq_source(args: &Args, tuning_freq: u32) -> desperado::Result<IqAsyncSource> {
+/// Build the IQ source and return `(source, effective_gain_db)`.
+/// `effective_gain_db` is `Some(db)` when a manual gain is in effect (either
+/// from the CLI or from a backend-specific default), or `None` for auto-gain.
+async fn build_iq_source(
+    args: &Args,
+    tuning_freq: u32,
+) -> desperado::Result<(IqAsyncSource, Option<f64>)> {
     if args.source == "-" {
         let format = IqFormat::from_str(&args.format)
             .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
-        return Ok(IqAsyncSource::from_stdin(
-            tuning_freq,
-            args.sample_rate_hz(),
-            16384,
-            format,
+        let gain = args.gain.map(|g| g as f64 / 10.0);
+        return Ok((
+            IqAsyncSource::from_stdin(tuning_freq, args.sample_rate_hz(), 16384, format),
+            gain,
         ));
     }
 
     if !is_device_uri(&args.source) {
         let format = IqFormat::from_str(&args.format)
             .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
-        return IqAsyncSource::from_file(
-            &args.source,
-            tuning_freq,
-            args.sample_rate_hz(),
-            16384,
-            format,
-        )
-        .await;
+        let gain = args.gain.map(|g| g as f64 / 10.0);
+        return Ok((
+            IqAsyncSource::from_file(
+                &args.source,
+                tuning_freq,
+                args.sample_rate_hz(),
+                16384,
+                format,
+            )
+            .await?,
+            gain,
+        ));
     }
 
-    let configured_uri =
+    let (configured_uri, effective_gain) =
         ensure_tuning_query(&args.source, tuning_freq, args.sample_rate_hz(), args.gain);
     let config = DeviceConfig::from_str(&configured_uri)
         .map_err(|e| std::io::Error::other(format!("Invalid SDR URI: {}", e)))?;
 
-    IqAsyncSource::from_device_config(&config).await
+    Ok((
+        IqAsyncSource::from_device_config(&config).await?,
+        effective_gain,
+    ))
 }
 
 fn is_device_uri(input: &str) -> bool {
@@ -654,12 +694,15 @@ fn is_file_like_source(input: &str) -> bool {
     input == "-" || !is_device_uri(input)
 }
 
+/// Build the full URI with tuning parameters.
+/// Returns `(configured_uri, effective_gain_db)` so the TUI can display the
+/// actual gain even when a backend-specific default was injected.
 fn ensure_tuning_query(
     uri: &str,
     center_freq_hz: u32,
     sample_rate: u32,
     gain: Option<i32>,
-) -> String {
+) -> (String, Option<f64>) {
     let has_query = uri.contains('?');
     let has_freq = uri.contains("freq=") || uri.contains("frequency=");
     let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
@@ -681,6 +724,15 @@ fn ensure_tuning_query(
         }
         out.push_str(&format!("rate={sample_rate}"));
     }
+
+    let mut effective_gain: Option<f64> = gain.map(|g| {
+        if uri.starts_with("rtlsdr://") {
+            f64::from(g) / 10.0
+        } else {
+            f64::from(g)
+        }
+    });
+
     if !has_gain {
         if !out.ends_with('?') && !out.ends_with('&') {
             out.push('&');
@@ -699,10 +751,17 @@ fn ensure_tuning_query(
             // RTL-SDR hardware AGC clips strong FM signals. Default to 29.7 dB
             // manual gain which works well for FM broadcast reception.
             out.push_str("gain=29.7");
+            effective_gain = Some(29.7);
+        } else if uri.starts_with("airspy://") {
+            out.push_str("gain=40");
+            effective_gain = Some(40.0);
+        } else if uri.starts_with("hackrf://") {
+            out.push_str("gain=72");
+            effective_gain = Some(72.0);
         }
     }
 
-    out
+    (out, effective_gain)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1358,4 +1417,48 @@ impl AudioAdaptiveResampler {
 
         output
     }
+}
+
+/// Return the discrete gain steps (in dB) supported by the hardware behind `uri`.
+fn gain_steps_for_source(uri: &str) -> Vec<f64> {
+    if uri.starts_with("rtlsdr://") {
+        // R820T tuner gain table (tenths-of-dB → dB)
+        vec![
+            0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7, 16.6, 19.7, 20.7, 22.9, 25.4,
+            28.0, 29.7, 32.8, 33.8, 36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6,
+        ]
+    } else if uri.starts_with("airspy://") {
+        // 22 preset levels (0-21), mapped to dB as level * 50 / 21
+        (0..=21)
+            .map(|l| (l as f64 * 50.0 / 21.0 * 10.0).round() / 10.0)
+            .collect()
+    } else if uri.starts_with("hackrf://") {
+        // LNA 0-40 dB (8 dB steps) + VGA 0-62 dB (2 dB steps), effective 2 dB steps
+        (0..=51).map(|i| i as f64 * 2.0).collect()
+    } else {
+        // Unknown device — fall back to 1 dB steps over 0-50
+        (0..=50).map(|i| i as f64).collect()
+    }
+}
+
+/// Find the next gain step above `current` (or the max if already at/above the top).
+fn next_gain_up(current: f64, steps: &[f64]) -> f64 {
+    const EPS: f64 = 0.05;
+    for &s in steps {
+        if s > current + EPS {
+            return s;
+        }
+    }
+    steps.last().copied().unwrap_or(current)
+}
+
+/// Find the next gain step below `current` (or the min if already at/below the bottom).
+fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
+    const EPS: f64 = 0.05;
+    for &s in steps.iter().rev() {
+        if s < current - EPS {
+            return s;
+        }
+    }
+    steps.first().copied().unwrap_or(current)
 }

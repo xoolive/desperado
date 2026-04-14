@@ -1111,6 +1111,9 @@ impl IqAsyncSource {
     }
 
     /// Adjust tuner gain on supported live SDR sources.
+    ///
+    /// Returns an error for source types that do not support runtime gain
+    /// adjustment (e.g., file sources, SoapySDR).
     pub fn set_gain(&self, _gain: Gain) -> error::Result<()> {
         match self {
             #[cfg(feature = "rtlsdr")]
@@ -1123,7 +1126,9 @@ impl IqAsyncSource {
             }
             #[cfg(feature = "hackrf")]
             IqAsyncSource::HackRf(source) => source.set_gain(_gain),
-            _ => Ok(()),
+            _ => Err(error::Error::other(
+                "Runtime gain adjustment is not supported for this source type",
+            )),
         }
     }
 
