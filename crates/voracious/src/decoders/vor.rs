@@ -30,7 +30,7 @@
 //!
 //! ## Filter Design
 //!
-//! All filter parameters (cutoff frequencies, orders) are defined in [`filter_config`](crate::filter_config).
+//! All filter parameters (cutoff frequencies, orders) are defined in the filter configuration.
 //! Key design choices:
 //! - Butterworth IIR filters chosen for phase linearity and stability
 //! - Higher filter orders (4–5) for sharp roll-off in congested VHF band

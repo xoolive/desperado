@@ -6,8 +6,8 @@
 //! The PRBS generator polynomial is: x^9 + x^5 + 1
 //! Initial register: all ones (0x1FF).
 //!
-//! The PRBS output at each step is: bit[8] XOR bit[4] of the shift register,
-//! then the register shifts left (toward MSB) with the output fed back to bit[0].
+//! The PRBS output at each step is: `bit[8]` XOR `bit[4]` of the shift register,
+//! then the register shifts left (toward MSB) with the output fed back to `bit[0]`.
 //!
 //! Reference: ETSI EN 300 401 §12, welle.io src/backend/fic-handler.cpp
 

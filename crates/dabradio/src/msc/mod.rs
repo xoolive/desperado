@@ -57,7 +57,7 @@ pub struct MscHandler {
     cif_in_frame: usize,
 
     /// Time de-interleaving buffer: circular buffer of subchannel extractions.
-    /// Matches welle.io's interleaveData[16][fragmentSize] ring buffer.
+    /// Matches welle.io's `interleaveData[16][fragmentSize]` ring buffer.
     deinterleave_buf: Vec<Vec<i8>>,
 
     /// Ring buffer write index (0..15), matching welle.io's interleaverIndex.
@@ -120,7 +120,7 @@ impl MscHandler {
     /// `blkno` is the 0-based index within the MSC symbols (0..71).
     /// The interleaved soft bit layout from DQPSK is: [I_0..I_{K-1}, Q_0..Q_{K-1}].
     /// For CIF assembly, we need them in the sequential order matching welle.io:
-    ///   for carrier i: soft_bits[i], soft_bits[K + i] (I then Q).
+    ///   for carrier `i`: `soft_bits[i]`, `soft_bits[K + i]` (I then Q).
     ///
     /// Returns decoded bytes whenever a complete CIF is processed and time
     /// de-interleaving produces valid output.

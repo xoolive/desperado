@@ -7,8 +7,8 @@ use tracing::{debug, trace};
 /// Build the frequency de-interleaving permutation table for Mode I.
 ///
 /// Uses the linear congruential generator from ETSI EN 300 401 §14.6:
-///   tmp[0] = 0
-///   tmp[i] = (13 * tmp[i-1] + V1) mod T_u
+///   `tmp[0] = 0`
+///   `tmp[i] = (13 * tmp[i-1] + V1) mod T_u`
 ///
 /// For Mode I: T_u=2048, V1=511, lwb=256, upb=1792.
 /// The result maps logical carrier index i (0..K-1) to a physical FFT bin

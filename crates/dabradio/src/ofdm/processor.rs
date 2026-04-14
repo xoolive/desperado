@@ -694,7 +694,7 @@ impl OfdmProcessor {
         frames
     }
 
-    /// Process a complete frame starting at buffer[0] = PRS useful start.
+    /// Process a complete frame starting at `buffer[0]` = PRS useful start.
     ///
     /// Steps:
     /// 1. Frequency-correct the entire frame (advancing running_phase)
@@ -903,8 +903,8 @@ impl OfdmProcessor {
 
     /// Find the exact start of the PRS useful part using IFFT-based correlation.
     ///
-    /// Expects buffer[0] to be approximately the PRS guard interval start.
-    /// Returns `(sample_offset, snr)` where sample_offset is from buffer[0] to the PRS
+    /// Expects `buffer[0]` to be approximately the PRS guard interval start.
+    /// Returns `(sample_offset, snr)` where sample_offset is from `buffer[0]` to the PRS
     /// useful-part start, or `(i32::MIN, 0.0)` if not enough data yet.
     /// May return negative values if the PRS start was already passed (caller should re-acquire).
     ///
@@ -996,7 +996,7 @@ impl OfdmProcessor {
     ///    below 50% of the long-term signal level
     /// 2. Then find the end of the null (power rises above 75% of s_level)
     ///
-    /// After detection, buffer[0] ≈ start of PRS guard interval.
+    /// After detection, `buffer[0]` ≈ start of PRS guard interval.
     /// Uses and updates `self.s_level` throughout for adaptive thresholding.
     fn find_null_symbol(&mut self) -> bool {
         // Need enough samples to search through (at least one frame)

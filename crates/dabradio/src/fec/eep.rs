@@ -145,15 +145,15 @@ pub const P_CODES: [[u8; 32]; 24] = [
     ],
 ];
 
-/// Puncturing vector PI_16 (index 15) from ETSI EN 300 401 Table 31.
-/// Kept for backwards compatibility with FIC code. Same as P_CODES[15].
+/// Puncturing vector PI_16 (index `15`) from ETSI EN 300 401 Table 31.
+/// Kept for backwards compatibility with FIC code. Same as `P_CODES[15]`.
 pub const PI_16: [u8; 32] = P_CODES[15];
 
-/// Puncturing vector PI_15 (index 14). Same as P_CODES[14].
+/// Puncturing vector PI_15 (index `14`). Same as `P_CODES[14]`.
 pub const PI_15: [u8; 32] = P_CODES[14];
 
 /// Tail puncturing pattern (for the 6 tail bits × 4 = 24 coded bits).
-/// 24 entries: 12 ones, 12 zeros. Pattern: [1,1,0,0] repeated 6 times.
+/// 24 entries: 12 ones, 12 zeros. Pattern: `[1,1,0,0]` repeated 6 times.
 pub const PI_TAIL: [u8; 24] = [
     1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
 ];
@@ -314,8 +314,8 @@ pub fn msc_depunctured_size(params: &EepParams) -> usize {
 /// Depuncture an MSC subchannel's soft bits using the given EEP parameters.
 ///
 /// The MSC uses:
-/// - L1 blocks with puncture pattern P_CODES[pi1_index]
-/// - L2 blocks with puncture pattern P_CODES[pi2_index]
+/// - L1 blocks with puncture pattern `P_CODES[pi1_index]`
+/// - L2 blocks with puncture pattern `P_CODES[pi2_index]`
 /// - 1 tail block of 24 coded positions with PI_TAIL
 ///
 /// Each block = 4 repetitions of the 32-entry puncture pattern = 128 coded positions.

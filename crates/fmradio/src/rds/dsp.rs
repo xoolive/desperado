@@ -834,7 +834,7 @@ impl RdsDecoder {
             .map(|&f| u32::from(f) * 10_000) // Convert to Hz
     }
 
-    /// Return all alternative frequencies as a Vec<u32> in Hz
+    /// Return all alternative frequencies as a `Vec<u32>` in Hz
     pub fn alt_frequencies(&self) -> Vec<u32> {
         self.rds_parser
             .station_info()

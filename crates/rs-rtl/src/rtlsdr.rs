@@ -473,7 +473,7 @@ impl RtlSdr {
     ///
     /// Valid ranges: 225,001–300,000 Hz and 900,001–3,200,000 Hz.
     /// The actual sample rate may differ slightly due to integer division;
-    /// use [`sample_rate()`] to read back the actual rate.
+    /// use [`Self::sample_rate`] to read back the actual rate.
     ///
     /// This also updates the tuner bandwidth and IF frequency, matching
     /// the behaviour of librtlsdr's `rtlsdr_set_sample_rate`.
@@ -556,7 +556,7 @@ impl RtlSdr {
 
     /// Set manual gain in tenths of dB (e.g., 496 = 49.6 dB).
     ///
-    /// Use [`gains()`] to get the list of supported values. The nearest
+    /// Use [`Self::gains`] to get the list of supported values. The nearest
     /// supported value will be used.
     pub fn set_gain_manual(&mut self, gain_tenth_db: i32) -> Result<()> {
         self.dev.set_i2c_repeater(true)?;

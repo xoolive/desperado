@@ -122,7 +122,7 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 // DAB+ superframe format
 // ---------------------------------------------------------------------------
 
-/// Parsed DAB+ superframe format flags from byte sf[2].
+/// Parsed DAB+ superframe format flags from byte `sf[2]`.
 #[derive(Debug, Clone, Copy)]
 pub struct SuperframeFormat {
     pub dac_rate: bool,

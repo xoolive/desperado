@@ -492,12 +492,12 @@ impl Airspy {
     /// Set sample rate for host-side IQ output, matching libairspy behavior.
     ///
     /// The Airspy firmware stores supported rates as IQ-mode output rates
-    /// (half the real ADC rate). Our [`IqConverter`] decimates N real samples
+    /// (half the real ADC rate). Our IQ converter decimates N real samples
     /// to N/2 complex IQ samples, so the host receives at the firmware rate.
     ///
     /// This method:
     /// 1. Looks up `iq_rate_hz` in the firmware's supported rates list
-    /// 2. If found, uses index-based [`set_sample_rate`] (firmware-safe)
+    /// 2. If found, uses index-based sample rate setting (firmware-safe)
     /// 3. If not found, falls back to sending `iq_rate_hz * 2 / 1000` kHz
     ///    directly — the doubling is required because the firmware expects the
     ///    real ADC rate in kHz for the fallback path (matching libairspy's
@@ -511,9 +511,7 @@ impl Airspy {
     /// `set_sample_rate_for_iq(4_096_000)`:
     /// - 4.096M not in firmware list [6M, 3M] → fallback
     /// - Sends `4_096_000 * 2 / 1000 = 8192` kHz to firmware
-    /// - ADC runs at 8.192 MHz real → IqConverter → 4.096M complex IQ
-    ///
-    /// [`IqConverter`]: rs_spy::IqConverter
+    /// - ADC runs at 8.192 MHz real → IQ converter → 4.096M complex IQ
     pub fn set_sample_rate_for_iq(&self, iq_rate_hz: u32) -> Result<()> {
         tracing::debug!(iq_rate_hz, "set_sample_rate_for_iq");
 

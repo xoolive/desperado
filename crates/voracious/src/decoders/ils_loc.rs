@@ -9,7 +9,7 @@
 //!
 //! ## Demodulation Process
 //!
-//! The [`IlsDemodulator`] processes raw I/Q samples or WAV audio through these steps:
+//! The `IlsDemodulator` processes raw I/Q samples or WAV audio through these steps:
 //!
 //! 1. **Frequency shifting** (I/Q path): Translates RF carrier to baseband
 //! 2. **Baseband filtering**: 500 Hz lowpass removes RF noise before decimation
@@ -40,7 +40,7 @@
 //! ## Filter Design
 //!
 //! All filter parameters (cutoff frequencies, orders, thresholds) are centralized in
-//! [`filter_config`](crate::filter_config). Key design choices:
+//! the filter configuration. Key design choices:
 //! - **Baseband LPF (500 Hz)**: Preserves both 90 Hz and 150 Hz tones while rejecting RF noise
 //! - **90/150 Hz BPF (order 4)**: Narrow passband (20 Hz wide) for tone isolation
 //! - **Morse envelope LPF (16 Hz stated, ~8 Hz effective)**: Suppresses ~36 Hz Hilbert ripple
@@ -49,9 +49,9 @@
 //!
 //! ## WAV File Processing
 //!
-//! For pre-recorded audio files, use [`IlsDemodulator::new_at_audio_rate`] to skip the I/Q
+//! For pre-recorded audio files, use `IlsDemodulator::new_at_audio_rate` to skip the I/Q
 //! decimation path. For Morse ident extraction over long files, use
-//! [`IlsDemodulator::precompute_morse_envelope`] to apply zero-phase filtering across the
+//! `IlsDemodulator::precompute_morse_envelope` to apply zero-phase filtering across the
 //! entire file at once, avoiding edge artifacts from rolling windowed filtering.
 //!
 //! Morse ident decoding is handled by the generic [`super::morse`] module.
