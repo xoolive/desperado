@@ -66,16 +66,27 @@ fn load_f32(path: &Path) -> Vec<f64> {
 /// Demodulate the raw IQ fixture in chunks, accumulate envelopes, and compute DDM.
 ///
 /// Uses the same chunk-based pipeline as `IlsSource` to avoid loading the 80 MB
-/// file into memory all at once.  Returns `(env_90, env_150, audio)`.
-fn demodulate_ils_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+/// file into memory all at once.  Returns `None` if the fixture file is not
+/// present (allows tests to skip gracefully in CI).  Returns
+/// `Some((env_90, env_150, audio))` on success.
+fn demodulate_ils_fixture() -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     use std::io::Read;
 
     let raw_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("samples_ils")
         .join("gqrx_20251107_215806_110700000_1800000_fc.raw");
 
-    let mut file = std::fs::File::open(&raw_path)
-        .unwrap_or_else(|e| panic!("cannot open {}: {e}", raw_path.display()));
+    let mut file = match std::fs::File::open(&raw_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "SKIPPED: fixture not found: {} — download it to run this test",
+                raw_path.display()
+            );
+            return None;
+        }
+        Err(e) => panic!("cannot open {}: {e}", raw_path.display()),
+    };
 
     let sample_rate: u32 = 1_800_000;
     // Carrier offset: tune to the actual localizer carrier.
@@ -113,7 +124,7 @@ fn demodulate_ils_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         audio_all.extend(audio);
     }
 
-    (env_90_all, env_150_all, audio_all)
+    Some((env_90_all, env_150_all, audio_all))
 }
 
 // ── Fixture-based tests (slow — require the raw IQ file) ─────────────────────
@@ -129,7 +140,9 @@ fn demodulate_ils_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 #[test]
 #[ignore]
 fn test_ils_ddm_nonzero_imbalance() {
-    let (env_90, env_150, audio) = demodulate_ils_fixture();
+    let Some((env_90, env_150, audio)) = demodulate_ils_fixture() else {
+        return;
+    };
 
     let result = compute_ddm(&env_90, &env_150, &audio).expect("compute_ddm should succeed");
 
@@ -157,7 +170,9 @@ fn test_ils_ddm_nonzero_imbalance() {
 #[test]
 #[ignore]
 fn test_ils_side_not_on_course() {
-    let (env_90, env_150, audio) = demodulate_ils_fixture();
+    let Some((env_90, env_150, audio)) = demodulate_ils_fixture() else {
+        return;
+    };
     let result = compute_ddm(&env_90, &env_150, &audio).expect("compute_ddm should succeed");
     let side = IlsSide::from_ddm(result.ddm);
     assert_ne!(
@@ -172,7 +187,9 @@ fn test_ils_side_not_on_course() {
 #[test]
 #[ignore]
 fn test_ils_signal_strength_nonzero() {
-    let (env_90, env_150, audio) = demodulate_ils_fixture();
+    let Some((env_90, env_150, audio)) = demodulate_ils_fixture() else {
+        return;
+    };
     let result = compute_ddm(&env_90, &env_150, &audio).expect("compute_ddm should succeed");
     assert!(
         result.carrier_strength > 0.0,
@@ -185,7 +202,9 @@ fn test_ils_signal_strength_nonzero() {
 #[test]
 #[ignore]
 fn test_ils_per_second_ddm_consistent() {
-    let (env_90, env_150, audio) = demodulate_ils_fixture();
+    let Some((env_90, env_150, audio)) = demodulate_ils_fixture() else {
+        return;
+    };
 
     let window = ILS_AUDIO_RATE as usize; // 9000 samples = 1 second
     let n_windows = audio.len() / window;
@@ -214,7 +233,15 @@ fn test_ils_per_second_ddm_consistent() {
 #[test]
 #[ignore]
 fn test_ils_fixture_envelope_ddm() {
-    let envelope = load_f32(&fixture_path(ILS_STEM, "envelope"));
+    let path = fixture_path(ILS_STEM, "envelope");
+    if !path.exists() {
+        eprintln!(
+            "SKIPPED: fixture not found: {} — extract it to run this test",
+            path.display()
+        );
+        return;
+    }
+    let envelope = load_f32(&path);
     assert!(!envelope.is_empty(), "envelope fixture is empty");
 
     // Recompute env_90 and env_150 from the envelope using the same filters IlsLocalizerDemodulator uses
