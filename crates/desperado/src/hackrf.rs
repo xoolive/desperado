@@ -257,17 +257,23 @@ impl Iterator for HackRfReader {
 
 /// Asynchronous HackRF I/Q Reader with dynamic control.
 ///
+/// Uses `rs_hack::HackRf::into_streaming_reader()` which keeps multiple USB bulk
+/// transfers in-flight simultaneously via nusb's endpoint queue, eliminating the
+/// inter-transfer gap that caused FIFO overflow and sample loss with single-transfer
+/// `read_sync()`.
+///
 /// Architecture:
 /// ```text
-///   USB reader thread  ──sync_channel(64)──▶  bridge thread  ──tokio::mpsc(32)──▶  decode loop
-///   (nusb bulk reads)                          (bytes→complex + control dispatch)     (IqAsyncSource)
+///   USB streaming thread  ──sync_channel──▶  bridge thread  ──tokio::mpsc(32)──▶  decode loop
+///   (nusb multi-transfer)                    (bytes→complex)                       (IqAsyncSource)
+///     └── control commands via mpsc channel   (tune / gain)
 /// ```
 ///
-/// Control messages (tune, gain) are sent to the USB thread via a dedicated
-/// channel and applied between bulk reads.
+/// Control messages (tune, gain) are sent to the streaming thread via
+/// `AsyncReadControlHandle`.
 pub struct AsyncHackRfReader {
-    /// Channel to send control messages to the USB reader thread.
-    control_tx: std::sync::mpsc::Sender<HackRfMessage>,
+    /// Control handle for tune/gain on the USB streaming thread.
+    control: rs_hack::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
 }
@@ -275,51 +281,37 @@ pub struct AsyncHackRfReader {
 impl AsyncHackRfReader {
     /// Create a new async HackRF reader.
     ///
-    /// Opens and configures the device, starts RX streaming, then spawns
-    /// a USB reader thread and a bridge thread for byte→complex conversion.
+    /// Opens and configures the device, then starts multi-transfer streaming.
+    /// A bridge thread converts raw Cs8 IQ bytes to `Complex<f32>` and
+    /// forwards them to the tokio channel.
     pub fn new(config: &HackRfConfig) -> error::Result<Self> {
-        let mut hackrf = open_and_configure(config)?;
+        let hackrf = open_and_configure(config)?;
 
-        hackrf
-            .start_rx()
-            .map_err(|e| error::Error::device(format!("Failed to start HackRF RX: {e}")))?;
+        let reader = hackrf
+            .into_streaming_reader(0, 0)
+            .map_err(|e| error::Error::device(format!("Failed to start HackRF streaming: {e}")))?;
+        let control = reader.control_handle();
 
-        let (control_tx, control_rx) = std::sync::mpsc::channel::<HackRfMessage>();
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
 
-        // Combined USB reader + bridge thread.
-        // Reads bulk data, checks for control messages between reads,
-        // converts bytes to complex, and sends to tokio channel.
+        // Bridge thread: receives raw bytes from the USB streaming thread,
+        // converts Cs8 to Complex<f32>, sends to tokio channel.
+        // Exits when the consumer drops `samples_rx`.
         std::thread::Builder::new()
-            .name("hackrf-async".into())
+            .name("hackrf-bridge".into())
             .spawn(move || {
-                let mut buf = vec![0u8; rs_hack::RECOMMENDED_BUFFER_SIZE];
-                loop {
-                    // Check for control messages (non-blocking)
-                    while let Ok(msg) = control_rx.try_recv() {
-                        match msg {
-                            HackRfMessage::Frequency(freq) => {
-                                if let Err(e) = hackrf.set_freq(freq) {
-                                    tracing::warn!("HackRF tune failed: {e}");
-                                }
+                while let Some(result) = reader.recv() {
+                    match result {
+                        Ok(bytes) => {
+                            if bytes.is_empty() {
+                                continue;
                             }
-                            HackRfMessage::Gain(gain) => {
-                                if let Err(e) = apply_gain(&hackrf, &gain) {
-                                    tracing::warn!("HackRF set gain failed: {e}");
-                                }
-                            }
-                        }
-                    }
-
-                    match hackrf.read_sync(&mut buf) {
-                        Ok(n) if n > 0 => {
                             let samples =
-                                Ok(crate::convert_bytes_to_complex(IqFormat::Cs8, &buf[..n]));
+                                Ok(crate::convert_bytes_to_complex(IqFormat::Cs8, &bytes));
                             if samples_tx.blocking_send(samples).is_err() {
                                 break; // consumer dropped
                             }
                         }
-                        Ok(_) => continue,
                         Err(e) => {
                             tracing::error!("HackRF read error: {e}");
                             let _ = samples_tx.blocking_send(Err(error::Error::device(format!(
@@ -329,27 +321,30 @@ impl AsyncHackRfReader {
                         }
                     }
                 }
-                // hackrf Drop will stop_rx and release USB
             })
             .map_err(|e| {
-                error::Error::device(format!("Failed to spawn HackRF async thread: {e}"))
+                error::Error::device(format!("Failed to spawn HackRF bridge thread: {e}"))
             })?;
 
         Ok(Self {
-            control_tx,
+            control,
             samples_rx,
         })
     }
 
-    /// Send a control message to the USB reader thread.
+    /// Send a control message to the USB streaming thread.
     pub fn adjust(&self, message: HackRfMessage) -> error::Result<()> {
         match &message {
             HackRfMessage::Frequency(freq) => tracing::debug!("HackRF tune -> {freq} Hz"),
             HackRfMessage::Gain(gain) => tracing::debug!("HackRF gain -> {gain:?}"),
         }
-        self.control_tx
-            .send(message)
-            .map_err(|_| error::Error::device("HackRF control channel closed"))
+        match message {
+            HackRfMessage::Frequency(freq) => self
+                .control
+                .tune(freq)
+                .map_err(|e| error::Error::device(format!("HackRF tune failed: {e}"))),
+            HackRfMessage::Gain(gain) => apply_gain_via_control(&self.control, &gain),
+        }
     }
 
     /// Retune to a specific center frequency.
@@ -361,6 +356,71 @@ impl AsyncHackRfReader {
     pub fn set_gain(&self, gain: Gain) -> error::Result<()> {
         self.adjust(HackRfMessage::Gain(gain))
     }
+}
+
+/// Apply gain settings via the async control handle.
+fn apply_gain_via_control(
+    control: &rs_hack::AsyncReadControlHandle,
+    gain: &Gain,
+) -> error::Result<()> {
+    match gain {
+        Gain::Auto => {
+            tracing::info!(
+                "HackRF has no AGC; using default LNA={DEFAULT_LNA_GAIN} VGA={DEFAULT_VGA_GAIN}"
+            );
+            control
+                .set_lna_gain(DEFAULT_LNA_GAIN)
+                .map_err(|e| error::Error::device(format!("HackRF set LNA gain failed: {e}")))?;
+            control
+                .set_vga_gain(DEFAULT_VGA_GAIN)
+                .map_err(|e| error::Error::device(format!("HackRF set VGA gain failed: {e}")))?;
+        }
+        Gain::Manual(db) => {
+            let total = *db as u32;
+            let lna = (total * 2 / 5).min(40);
+            let vga = total.saturating_sub(lna).min(62);
+            control
+                .set_lna_gain(lna)
+                .map_err(|e| error::Error::device(format!("HackRF set LNA gain failed: {e}")))?;
+            control
+                .set_vga_gain(vga)
+                .map_err(|e| error::Error::device(format!("HackRF set VGA gain failed: {e}")))?;
+        }
+        Gain::Elements(elements) => {
+            let mut lna_set = false;
+            let mut vga_set = false;
+            for GainElement { name, value_db } in elements {
+                match name {
+                    GainElementName::Lna => {
+                        control.set_lna_gain(*value_db as u32).map_err(|e| {
+                            error::Error::device(format!("HackRF set LNA gain failed: {e}"))
+                        })?;
+                        lna_set = true;
+                    }
+                    GainElementName::Vga => {
+                        control.set_vga_gain(*value_db as u32).map_err(|e| {
+                            error::Error::device(format!("HackRF set VGA gain failed: {e}"))
+                        })?;
+                        vga_set = true;
+                    }
+                    other => {
+                        tracing::warn!(?other, "HackRF does not support gain element; ignoring");
+                    }
+                }
+            }
+            if !lna_set {
+                control.set_lna_gain(DEFAULT_LNA_GAIN).map_err(|e| {
+                    error::Error::device(format!("HackRF set LNA gain failed: {e}"))
+                })?;
+            }
+            if !vga_set {
+                control.set_vga_gain(DEFAULT_VGA_GAIN).map_err(|e| {
+                    error::Error::device(format!("HackRF set VGA gain failed: {e}"))
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Stream for AsyncHackRfReader {

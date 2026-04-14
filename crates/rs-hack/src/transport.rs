@@ -7,6 +7,9 @@ use crate::error::{Error, Result};
 use crate::{HACKRF_JAWBREAKER_PID, HACKRF_ONE_PID, HACKRF_VID, RAD1O_PID};
 use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Recipient};
 use nusb::{Endpoint, MaybeFuture};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
 // ─── USB Constants ────────────────────────────────────────────────────────────
@@ -30,6 +33,125 @@ pub const RECOMMENDED_BUFFER_SIZE: usize = TRANSFER_BUFFER_SIZE;
 
 /// Bulk read timeout for streaming (1 second).
 const BULK_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Default number of in-flight transfers for multi-transfer streaming.
+pub const DEFAULT_NUM_TRANSFERS: usize = 4;
+
+// ─── Multi-Transfer Streaming Types ───────────────────────────────────────────
+
+/// Control commands for the multi-transfer streaming thread.
+pub enum StreamControl {
+    /// Retune to center frequency (Hz)
+    Tune(u64),
+    /// Set LNA gain (dB, 0-40 in 8 dB steps)
+    SetLnaGain(u32),
+    /// Set VGA gain (dB, 0-62 in 2 dB steps)
+    SetVgaGain(u32),
+    /// Enable/disable RF amplifier
+    SetAmpEnable(bool),
+}
+
+/// Handle for receiving streaming data from a HackRF device.
+///
+/// Obtained from [`HackRf::into_streaming_reader()`]. The streaming thread
+/// keeps multiple USB bulk transfers in-flight simultaneously, eliminating
+/// the inter-transfer gap that causes FIFO overflow and sample loss.
+pub struct AsyncReadHandle {
+    rx: mpsc::Receiver<Result<Vec<u8>>>,
+    ctrl_tx: mpsc::Sender<StreamControl>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// Clonable handle for sending control commands to an active streaming session.
+///
+/// Obtained from [`AsyncReadHandle::control_handle()`].
+#[derive(Clone)]
+pub struct AsyncReadControlHandle {
+    ctrl_tx: mpsc::Sender<StreamControl>,
+    stop: Arc<AtomicBool>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl AsyncReadHandle {
+    /// Receive the next chunk of raw IQ bytes (blocking).
+    ///
+    /// Returns `None` when the streaming thread has exited (device disconnected,
+    /// stop requested, or handle dropped).
+    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
+        self.rx.recv().ok()
+    }
+
+    /// Try to receive the next chunk without blocking.
+    pub fn try_recv(&self) -> Option<Result<Vec<u8>>> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Get a clonable control handle for sending commands to the streaming thread.
+    pub fn control_handle(&self) -> AsyncReadControlHandle {
+        AsyncReadControlHandle {
+            ctrl_tx: self.ctrl_tx.clone(),
+            stop: self.stop.clone(),
+            dropped: self.dropped.clone(),
+        }
+    }
+
+    /// Stop streaming.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AsyncReadHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl AsyncReadControlHandle {
+    /// Number of chunks dropped due to channel overflow (should always be 0
+    /// since we use blocking sends; provided for diagnostics).
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Request the streaming thread to stop.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Retune to a new center frequency (Hz).
+    pub fn tune(&self, freq_hz: u64) -> Result<()> {
+        self.ctrl_tx
+            .send(StreamControl::Tune(freq_hz))
+            .map_err(|_| Error::StreamingError("control channel closed".to_string()))
+    }
+
+    /// Set LNA gain (0-40 dB).
+    pub fn set_lna_gain(&self, gain_db: u32) -> Result<()> {
+        self.ctrl_tx
+            .send(StreamControl::SetLnaGain(gain_db))
+            .map_err(|_| Error::StreamingError("control channel closed".to_string()))
+    }
+
+    /// Set VGA gain (0-62 dB).
+    pub fn set_vga_gain(&self, gain_db: u32) -> Result<()> {
+        self.ctrl_tx
+            .send(StreamControl::SetVgaGain(gain_db))
+            .map_err(|_| Error::StreamingError("control channel closed".to_string()))
+    }
+
+    /// Enable or disable RF amplifier.
+    pub fn set_amp_enable(&self, enable: bool) -> Result<()> {
+        self.ctrl_tx
+            .send(StreamControl::SetAmpEnable(enable))
+            .map_err(|_| Error::StreamingError("control channel closed".to_string()))
+    }
+}
 
 // ─── Vendor Request IDs ───────────────────────────────────────────────────────
 // Reference: hackrf.c lines 59-118
@@ -568,6 +690,88 @@ impl HackRf {
         Ok(())
     }
 
+    /// Start multi-transfer RX streaming and return an async read handle.
+    ///
+    /// This consumes the `HackRf` device and moves it into a dedicated
+    /// streaming thread that keeps multiple USB bulk transfers in-flight
+    /// simultaneously. This eliminates the inter-transfer gap that causes
+    /// FIFO overflow and sample loss with single-transfer `read_sync()`.
+    ///
+    /// Architecture:
+    /// ```text
+    ///   streaming thread (nusb endpoint queue)  ──sync_channel──▶  consumer
+    ///     └── control commands via mpsc channel   (tune / gain)
+    /// ```
+    ///
+    /// Use [`AsyncReadHandle::recv()`] to read chunks and
+    /// [`AsyncReadHandle::control_handle()`] for runtime control.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_transfers` - Number of concurrent USB transfers (0 for default of 4)
+    /// * `transfer_size` - Size of each transfer buffer in bytes (0 for default of 256 KB)
+    pub fn into_streaming_reader(
+        self,
+        num_transfers: usize,
+        transfer_size: usize,
+    ) -> Result<AsyncReadHandle> {
+        let num_transfers = if num_transfers == 0 {
+            DEFAULT_NUM_TRANSFERS
+        } else {
+            num_transfers
+        };
+        let transfer_size = if transfer_size == 0 {
+            TRANSFER_BUFFER_SIZE
+        } else {
+            transfer_size
+        };
+
+        if !transfer_size.is_multiple_of(512) {
+            return Err(Error::StreamingError(format!(
+                "Invalid transfer size {} (must be multiple of 512)",
+                transfer_size
+            )));
+        }
+
+        // Set transceiver to receive mode (but don't open the endpoint here —
+        // the streaming thread will open it via the cloned iface)
+        self.set_transceiver_mode(TRANSCEIVER_MODE_RECEIVE)?;
+        tracing::info!("HackRF RX mode enabled for streaming");
+
+        // Bounded channel for sample delivery (backpressure-aware)
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(num_transfers * 4);
+        // Unbounded channel for control commands
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<StreamControl>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let iface = self.iface.clone();
+        let stop_thread = Arc::clone(&stop);
+
+        let thread = thread::Builder::new()
+            .name("hackrf-stream".into())
+            .spawn(move || {
+                streaming_thread(
+                    self,
+                    iface,
+                    tx,
+                    stop_thread,
+                    ctrl_rx,
+                    transfer_size,
+                    num_transfers,
+                );
+            })
+            .map_err(|e| Error::StreamingError(format!("failed to spawn streaming thread: {e}")))?;
+
+        Ok(AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop,
+            dropped,
+            thread: Some(thread),
+        })
+    }
+
     /// Read a chunk of RX data synchronously.
     ///
     /// Returns the number of bytes actually read. The data is interleaved
@@ -688,4 +892,158 @@ impl Drop for HackRf {
 /// Check if a USB product ID matches a known HackRF device.
 fn is_hackrf_pid(pid: u16) -> bool {
     pid == HACKRF_ONE_PID || pid == HACKRF_JAWBREAKER_PID || pid == RAD1O_PID
+}
+
+// ─── Multi-Transfer Streaming Thread ──────────────────────────────────────────
+
+/// The streaming thread function.
+///
+/// Uses nusb's Endpoint queue to keep multiple USB bulk transfers in-flight
+/// simultaneously. When one transfer completes, a new one is immediately
+/// re-submitted, so there is **never a gap** where the HackRF has no pending
+/// USB read — preventing internal FIFO overflow and sample loss.
+///
+/// The thread loops:
+/// 1. Process any pending control commands (tune, gain) — non-blocking
+/// 2. Wait for the next completed transfer
+/// 3. Send the data to the consumer via the bounded channel (blocking for backpressure)
+/// 4. Re-submit a new buffer to keep the queue full
+fn streaming_thread(
+    mut dev: HackRf,
+    iface: nusb::Interface,
+    tx: mpsc::SyncSender<Result<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    ctrl_rx: mpsc::Receiver<StreamControl>,
+    transfer_size: usize,
+    num_transfers: usize,
+) {
+    tracing::debug!(
+        "HackRF streaming thread started: transfer_size={}, num_transfers={}",
+        transfer_size,
+        num_transfers
+    );
+
+    // Open the bulk IN endpoint
+    let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(RX_ENDPOINT_ADDRESS) else {
+        tracing::warn!("failed to open bulk endpoint 0x{:02x}", RX_ENDPOINT_ADDRESS);
+        return;
+    };
+
+    // Pre-fill the queue with N transfers — all are in-flight simultaneously
+    for _ in 0..num_transfers {
+        ep_in.submit(Buffer::new(transfer_size));
+    }
+
+    tracing::debug!("submitted {} initial transfers", num_transfers);
+
+    // Consecutive transfer error counter for disconnect detection
+    const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+    let mut consecutive_errors: u32 = 0;
+
+    // Main streaming loop
+    while !stop.load(Ordering::Relaxed) {
+        // 1. Process any pending control commands (non-blocking)
+        while let Ok(cmd) = ctrl_rx.try_recv() {
+            match cmd {
+                StreamControl::Tune(freq) => {
+                    tracing::debug!("streaming thread: tuning to {} Hz", freq);
+                    if let Err(e) = dev.set_freq(freq) {
+                        tracing::warn!("HackRF retune to {} Hz failed: {}", freq, e);
+                    }
+                }
+                StreamControl::SetLnaGain(gain) => {
+                    if let Err(e) = dev.set_lna_gain(gain) {
+                        tracing::warn!("HackRF set LNA gain to {} dB failed: {}", gain, e);
+                    }
+                }
+                StreamControl::SetVgaGain(gain) => {
+                    if let Err(e) = dev.set_vga_gain(gain) {
+                        tracing::warn!("HackRF set VGA gain to {} dB failed: {}", gain, e);
+                    }
+                }
+                StreamControl::SetAmpEnable(enable) => {
+                    if let Err(e) = dev.set_amp_enable(enable) {
+                        tracing::warn!("HackRF set amp enable={} failed: {}", enable, e);
+                    }
+                }
+            }
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // 2. Wait for the next completed transfer
+        let completion = match ep_in.wait_next_complete(Duration::from_millis(500)) {
+            Some(c) => c,
+            None => {
+                // Timeout — check stop flag and retry
+                tracing::trace!("streaming: transfer timeout, retrying");
+                continue;
+            }
+        };
+
+        // 3. Check for transfer errors
+        if let Err(ref e) = completion.status {
+            consecutive_errors += 1;
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                tracing::warn!(
+                    "HackRF disconnected ({} consecutive transfer errors: {})",
+                    consecutive_errors,
+                    e
+                );
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            tracing::warn!(
+                "bulk transfer error ({}/{}): {}",
+                consecutive_errors,
+                MAX_CONSECUTIVE_ERRORS,
+                e
+            );
+            // Re-submit and continue (transient errors are common)
+            ep_in.submit(Buffer::new(transfer_size));
+            continue;
+        }
+
+        // Successful transfer — reset error counter
+        consecutive_errors = 0;
+
+        // Extract the data
+        let data = completion.buffer[..completion.actual_len].to_vec();
+
+        if data.is_empty() {
+            ep_in.submit(Buffer::new(transfer_size));
+            continue;
+        }
+
+        // 4. Send data to the consumer (blocking — provides backpressure).
+        // IMPORTANT: We use blocking send here to provide backpressure.
+        // Never use try_send in real-time signal processing pipelines —
+        // dropped samples corrupt protocol framing.
+        match tx.send(Ok(data)) {
+            Ok(()) => {}
+            Err(_) => {
+                // Channel closed — consumer is gone
+                tracing::debug!("streaming: consumer disconnected");
+                break;
+            }
+        }
+
+        // Re-submit a new transfer to keep the queue full
+        ep_in.submit(Buffer::new(transfer_size));
+    }
+
+    // Stop the receiver
+    let _ = dev.stop_rx();
+
+    // Cancel all pending transfers
+    ep_in.cancel_all();
+
+    // Drain remaining completions
+    while ep_in.pending() > 0 {
+        let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+    }
+
+    tracing::debug!("HackRF streaming thread exited");
 }
