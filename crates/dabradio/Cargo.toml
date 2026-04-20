@@ -15,7 +15,8 @@ name = "dabradio"
 path = "src/main.rs"
 
 [dependencies]
-desperado = { version = "0.3.0", path = "../desperado" }
+# Device support via desperado
+desperado = { version = "0.3.0", path = "../desperado", features = ["rtlsdr", "airspy", "hackrf", "resampler"] }
 num-complex = "0.4"
 rustfft = "6"
 clap = { version = "4.5", features = ["derive"] }
@@ -34,9 +35,4 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 [features]
-default = ["rtlsdr", "airspy", "hackrf"]
-rtlsdr = ["desperado/rtlsdr"]
-hackrf = ["desperado/hackrf"]
 soapy = ["desperado/soapy"]
-resampler = ["desperado/resampler"]
-airspy = ["desperado/airspy", "resampler"]

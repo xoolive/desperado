@@ -49,6 +49,8 @@ jobs:
           - "--all-features"
           - "--no-default-features"
           - "--features rtlsdr"
+          - "--features airspy"
+          - "--features hackrf"
           - "--features soapy"
           - "--features pluto"
     steps:
