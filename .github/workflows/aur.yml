@@ -1,0 +1,53 @@
+name: AUR Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  aur:
+    name: Update AUR packages
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - pkg: fmradio-bin
+            bin: fmradio
+          - pkg: dabradio-bin
+            bin: dabradio
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch release checksums
+        id: checksums
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+
+          X86_SHA=$(curl -sL "${BASE_URL}/${{ matrix.bin }}-x86_64-unknown-linux-gnu.tar.xz.sha256" | awk '{print $1}')
+          ARM_SHA=$(curl -sL "${BASE_URL}/${{ matrix.bin }}-aarch64-unknown-linux-gnu.tar.xz.sha256" | awk '{print $1}')
+
+          echo "x86_64=${X86_SHA}" >> "$GITHUB_OUTPUT"
+          echo "aarch64=${ARM_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate PKGBUILD
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" aur/${{ matrix.pkg }}/PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${{ steps.checksums.outputs.x86_64 }}')/" aur/${{ matrix.pkg }}/PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${{ steps.checksums.outputs.aarch64 }}')/" aur/${{ matrix.pkg }}/PKGBUILD
+          cat aur/${{ matrix.pkg }}/PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: ${{ matrix.pkg }}
+          pkgbuild: aur/${{ matrix.pkg }}/PKGBUILD
+          commit_username: "Xavier Olive"
+          commit_email: "git@xoolive.org"
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ steps.version.outputs.version }}"
