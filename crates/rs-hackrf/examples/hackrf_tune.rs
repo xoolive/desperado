@@ -26,8 +26,8 @@
 //! cargo run --example hackrf_tune -- --freq 1090000000 --bias-t
 //! ```
 
-use rs_hack::HackRf;
-use rs_hack::transport::board_id_name;
+use rs_hackrf::HackRf;
+use rs_hackrf::transport::board_id_name;
 use std::env;
 use std::process;
 

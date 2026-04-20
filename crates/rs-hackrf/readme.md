@@ -1,10 +1,10 @@
-# rs-hack
+# rs-hackrf
 
 A pure-Rust library for HackRF One Software Defined Radio devices. Zero C dependencies — built entirely on [`nusb`](https://docs.rs/nusb) for native USB communication.
 
 ## Overview
 
-`rs-hack` provides a complete HackRF One driver with device discovery, configuration, and high-throughput RX streaming. It includes:
+`rs-hackrf` provides a complete HackRF One driver with device discovery, configuration, and high-throughput RX streaming. It includes:
 
 - **Device Discovery:** Enumerate and open HackRF devices by index or serial number
 - **Full Configuration:** Center frequency, sample rate, LNA/VGA gain, RF amplifier, baseband filter bandwidth, bias tee
@@ -24,11 +24,11 @@ A pure-Rust library for HackRF One Software Defined Radio devices. Zero C depend
 ### Device Info
 
 ```rust
-use rs_hack::HackRf;
+use rs_hackrf::HackRf;
 
 let device = HackRf::open_first()?;
 println!("Firmware: {}", device.version()?);
-println!("Board: {}", rs_hack::board_id_name(device.board_id()?));
+println!("Board: {}", rs_hackrf::board_id_name(device.board_id()?));
 
 let (part0, part1, serial) = device.board_partid_serialno()?;
 println!("Serial: {}", serial);
@@ -37,7 +37,7 @@ println!("Serial: {}", serial);
 ### Configuration & Synchronous Read
 
 ```rust
-use rs_hack::HackRf;
+use rs_hackrf::HackRf;
 
 let mut device = HackRf::open_first()?;
 device.set_freq(100_000_000)?;       // 100 MHz
@@ -47,7 +47,7 @@ device.set_vga_gain(20)?;            // 20 dB (0-62, 2 dB steps)
 
 device.start_rx()?;
 
-let mut buf = vec![0u8; rs_hack::RECOMMENDED_BUFFER_SIZE];
+let mut buf = vec![0u8; rs_hackrf::RECOMMENDED_BUFFER_SIZE];
 let n = device.read_sync(&mut buf)?;
 // buf contains interleaved i8 I/Q: [I0, Q0, I1, Q1, ...]
 
@@ -57,7 +57,7 @@ device.stop_rx()?;
 ### Multi-Transfer Streaming
 
 ```rust
-use rs_hack::HackRf;
+use rs_hackrf::HackRf;
 
 let mut device = HackRf::open_first()?;
 device.set_freq(100_000_000)?;
@@ -116,5 +116,5 @@ Each I and Q value is an `i8` (-128 to 127). No additional DSP conversion is nee
 
 Run unit tests:
 ```bash
-cargo test -p rs-hack
+cargo test -p rs-hackrf
 ```

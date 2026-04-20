@@ -3,8 +3,8 @@
 //! This is a Phase 1 example showing device discovery and firmware version reporting.
 //! Output format matches the C `hackrf_info` tool as closely as possible.
 
-use rs_hack::transport::{BOARD_REV_GSG, board_id_name, board_rev_name};
-use rs_hack::{HackRf, HackRfErrorCode};
+use rs_hackrf::transport::{BOARD_REV_GSG, board_id_name, board_rev_name};
+use rs_hackrf::{HackRf, HackRfErrorCode};
 use std::process;
 
 fn main() {
@@ -101,14 +101,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             match hackrf.supported_platform() {
                 Ok(platform) => {
                     println!("Hardware supported by installed firmware:");
-                    if platform & rs_hack::transport::PLATFORM_JAWBREAKER != 0 {
+                    if platform & rs_hackrf::transport::PLATFORM_JAWBREAKER != 0 {
                         println!("    Jawbreaker");
                     }
-                    if platform & rs_hack::transport::PLATFORM_RAD1O != 0 {
+                    if platform & rs_hackrf::transport::PLATFORM_RAD1O != 0 {
                         println!("    rad1o");
                     }
-                    if platform & rs_hack::transport::PLATFORM_HACKRF1_OG != 0
-                        || platform & rs_hack::transport::PLATFORM_HACKRF1_R9 != 0
+                    if platform & rs_hackrf::transport::PLATFORM_HACKRF1_OG != 0
+                        || platform & rs_hackrf::transport::PLATFORM_HACKRF1_R9 != 0
                     {
                         println!("    HackRF One");
                     }

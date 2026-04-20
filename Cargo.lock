@@ -776,7 +776,7 @@ dependencies = [
  "num-complex",
  "plotters",
  "pluto-sdr",
- "rs-hack",
+ "rs-hackrf",
  "rs-rtl",
  "rs-spy",
  "rusb",
@@ -2274,7 +2274,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rs-hack"
+name = "rs-hackrf"
 version = "0.3.0"
 dependencies = [
  "nusb",

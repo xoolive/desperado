@@ -22,7 +22,7 @@ tracing-subscriber = "0.3"
 # Various SDR support
 industrial-io = { version = "0.5.2", optional = true } # together with pluto-sdr
 pluto-sdr = { version = "0.1.1", optional = true }
-rs-hack = { version = "0.3.0", path = "../rs-hack", optional = true }
+rs-hackrf = { version = "0.3.0", path = "../rs-hackrf", optional = true }
 rs-rtl = { version = "0.3.0", path = "../rs-rtl", optional = true }
 rs-spy = { version = "0.3.0", path = "../rs-spy", optional = true }
 rusb = { version = "0.9", optional = true }
@@ -40,7 +40,7 @@ tempfile = "3"
 [features]
 default = []
 airspy = ["dep:rs-spy"]
-hackrf = ["dep:rs-hack"]
+hackrf = ["dep:rs-hackrf"]
 pluto = ["dep:pluto-sdr", "dep:industrial-io"]
 rtlsdr = ["dep:rs-rtl"]
 soapy = ["dep:soapysdr"]

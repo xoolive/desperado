@@ -60,7 +60,7 @@ desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto device
 
 - **`rtlsdr`**: RTL-SDR device support (DVB-T dongles) via pure-Rust `rs_rtl` crate
 - **`airspy`**: Airspy device support (R2, Mini, HF+) via pure-Rust `rs_spy` crate
-- **`hackrf`**: HackRF device support via pure-Rust `rs_hack` crate (nusb backend)
+- **`hackrf`**: HackRF device support via pure-Rust `rs_hackrf` crate (nusb backend)
 - **`soapy`**: SoapySDR device support (LimeSDR, BladeRF, etc.)
 - **`pluto`**: Adalm-Pluto SDR support
 
@@ -156,7 +156,7 @@ All samples are returned as `Complex<f32>` values, regardless of the source.
 
 - The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementation of the RTL-SDR driver.
 - The `airspy` feature enables support for Airspy devices (R2, Mini, HF+). It is based on the `rs_spy` crate, a pure Rust implementation using `nusb` for USB access. Airspy hardware outputs real samples from a single ADC; the driver performs Fs/4 frequency translation and half-band filtering to produce proper I/Q output.
-- The `hackrf` feature enables support for HackRF One devices. It is based on the `rs_hack` crate, a pure Rust implementation using `nusb` for USB access. HackRF outputs interleaved 8-bit signed I/Q samples (Cs8) directly over USB. The driver supports per-element gain control (LNA, VGA, amp) and bias-tee power.
+- The `hackrf` feature enables support for HackRF One devices. It is based on the `rs_hackrf` crate, a pure Rust implementation using `nusb` for USB access. HackRF outputs interleaved 8-bit signed I/Q samples (Cs8) directly over USB. The driver supports per-element gain control (LNA, VGA, amp) and bias-tee power.
 - The `soapy` feature enables support for SoapySDR-compatible devices (LimeSDR, BladeRF, etc.). It is based on the [`soapysdr`](https://crates.io/crates/soapysdr) crate which provides Rust bindings to the SoapySDR C++ library. **The SoapySDR library must be installed separately**.
 - The `pluto` feature enables support for Adalm-Pluto devices. It is based on the [`pluto-sdr`](https://crates.io/crates/pluto-sdr) crate which provides Rust bindings to the libiio C library. **The libiio library must be installed separately**.
 
@@ -299,7 +299,7 @@ If you get an "I/O Error", the device may need time to reset after the previous 
 To list available HackRF devices and query firmware/board info:
 
 ```bash
-cargo run --example hackrf_info -p rs-hack
+cargo run --example hackrf_info -p rs-hackrf
 ```
 
 If the device appears hung, unplug and replug it. On Linux, ensure you have a udev rule granting access to the USB device (vendor `1d50`, product `6089`):

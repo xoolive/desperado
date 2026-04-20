@@ -23,8 +23,8 @@
 //! - Each I and Q sample is an `i8` value (-128 to 127)
 //! - Compatible with hackrf_transfer -r output
 
-use rs_hack::transport::board_id_name;
-use rs_hack::{HackRf, RECOMMENDED_BUFFER_SIZE};
+use rs_hackrf::transport::board_id_name;
+use rs_hackrf::{HackRf, RECOMMENDED_BUFFER_SIZE};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};

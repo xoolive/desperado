@@ -1,5 +1,5 @@
 [package]
-name = "rs-hack"
+name = "rs-hackrf"
 description = "A pure Rust library for HackRF One SDR devices"
 keywords = ["hackrf", "sdr", "radio"]
 readme = "readme.md"

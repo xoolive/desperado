@@ -2,7 +2,7 @@
 //! (requires the `hackrf` feature)
 //!
 //! Provides synchronous and asynchronous I/Q readers for HackRF devices,
-//! using the `rs_hack` crate (pure-Rust nusb backend) for hardware access.
+//! using the `rs_hackrf` crate (pure-Rust nusb backend) for hardware access.
 //!
 //! # Sample Format
 //!
@@ -69,8 +69,8 @@ pub enum HackRfMessage {
 }
 
 /// Open and configure a HackRF device from a `HackRfConfig`.
-fn open_and_configure(config: &HackRfConfig) -> error::Result<rs_hack::HackRf> {
-    let hackrf = rs_hack::HackRf::open_by_index(config.device_index)?;
+fn open_and_configure(config: &HackRfConfig) -> error::Result<rs_hackrf::HackRf> {
+    let hackrf = rs_hackrf::HackRf::open_by_index(config.device_index)?;
 
     hackrf.set_sample_rate(config.sample_rate)?;
     hackrf.set_freq(config.center_freq)?;
@@ -84,7 +84,7 @@ fn open_and_configure(config: &HackRfConfig) -> error::Result<rs_hack::HackRf> {
 }
 
 /// Apply gain settings to an open HackRF device.
-fn apply_gain(hackrf: &rs_hack::HackRf, gain: &Gain) -> error::Result<()> {
+fn apply_gain(hackrf: &rs_hackrf::HackRf, gain: &Gain) -> error::Result<()> {
     match gain {
         Gain::Auto => {
             // HackRF has no AGC — use sensible defaults
@@ -179,7 +179,7 @@ impl HackRfReader {
                 }
                 let _ = tx_init.send(Ok(()));
 
-                let mut buf = vec![0u8; rs_hack::RECOMMENDED_BUFFER_SIZE];
+                let mut buf = vec![0u8; rs_hackrf::RECOMMENDED_BUFFER_SIZE];
                 loop {
                     match hackrf.read_sync(&mut buf) {
                         Ok(n) if n > 0 => {
@@ -257,7 +257,7 @@ impl Iterator for HackRfReader {
 
 /// Asynchronous HackRF I/Q Reader with dynamic control.
 ///
-/// Uses `rs_hack::HackRf::into_streaming_reader()` which keeps multiple USB bulk
+/// Uses `rs_hackrf::HackRf::into_streaming_reader()` which keeps multiple USB bulk
 /// transfers in-flight simultaneously via nusb's endpoint queue, eliminating the
 /// inter-transfer gap that caused FIFO overflow and sample loss with single-transfer
 /// `read_sync()`.
@@ -273,7 +273,7 @@ impl Iterator for HackRfReader {
 /// `AsyncReadControlHandle`.
 pub struct AsyncHackRfReader {
     /// Control handle for tune/gain on the USB streaming thread.
-    control: rs_hack::AsyncReadControlHandle,
+    control: rs_hackrf::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
 }
@@ -360,7 +360,7 @@ impl AsyncHackRfReader {
 
 /// Apply gain settings via the async control handle.
 fn apply_gain_via_control(
-    control: &rs_hack::AsyncReadControlHandle,
+    control: &rs_hackrf::AsyncReadControlHandle,
     gain: &Gain,
 ) -> error::Result<()> {
     match gain {

@@ -35,7 +35,7 @@ pub enum Error {
 
     /// HackRF specific error (requires "hackrf" feature)
     #[cfg(feature = "hackrf")]
-    HackRf(rs_hack::Error),
+    HackRf(rs_hackrf::Error),
 
     /// Generic error with custom message
     Other(String),
@@ -110,8 +110,8 @@ impl From<soapysdr::Error> for Error {
 }
 
 #[cfg(feature = "hackrf")]
-impl From<rs_hack::Error> for Error {
-    fn from(err: rs_hack::Error) -> Self {
+impl From<rs_hackrf::Error> for Error {
+    fn from(err: rs_hackrf::Error) -> Self {
         Error::HackRf(err)
     }
 }

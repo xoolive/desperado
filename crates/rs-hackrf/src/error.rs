@@ -1,8 +1,8 @@
-//! Error types for rs-hack operations.
+//! Error types for rs-hackrf operations.
 
 use thiserror::Error;
 
-/// Result type for rs-hack operations.
+/// Result type for rs-hackrf operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error codes matching libhackrf enum values (for cross-compatibility).

@@ -2,7 +2,7 @@
 //!
 //! # Overview
 //!
-//! `rs-hack` provides a zero-C dependency Rust interface to HackRF SDR devices.
+//! `rs-hackrf` provides a zero-C dependency Rust interface to HackRF SDR devices.
 //! It supports device discovery, configuration, and high-throughput RX streaming.
 //!
 //! # Sample Format
@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rs_hack::HackRf;
+//! use rs_hackrf::HackRf;
 //!
 //! let device = HackRf::open_first()?;
 //! let version = device.version()?;
