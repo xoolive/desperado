@@ -2,6 +2,7 @@
 name = "rs-rtl"
 description = "A pure Rust library for RTL-SDR devices using nusb"
 keywords = ["rtlsdr", "sdr", "radio", "rtl2832u"]
+readme = "readme.md"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
