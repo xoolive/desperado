@@ -24,14 +24,14 @@
 //!
 //! | Module | Purpose |
 //! |---|---|
-//! | [`ofdm`] | Frame synchronisation, FFT, DQPSK differential decoding |
-//! | [`fic`] | Fast Information Channel — ensemble & service metadata |
-//! | [`msc`] | Main Service Channel — subchannel extraction |
-//! | [`fec`] | Forward Error Correction (EEP depuncturing, Viterbi, energy dispersal) |
-//! | [`audio`] | DAB+ super-frame assembly, Reed-Solomon, AAC decoding |
-//! | [`pad`] | Programme Associated Data (Dynamic Label Segment, MOT slide-show) |
-//! | [`constants`] | DAB Mode I parameters and Band III channel table |
-//! | [`charsets`] | EBU Latin → UTF-8 conversion for service labels |
+//! | `ofdm` | Frame synchronisation, FFT, DQPSK differential decoding |
+//! | `fic` | Fast Information Channel — ensemble & service metadata |
+//! | `msc` | Main Service Channel — subchannel extraction |
+//! | `fec` | Forward Error Correction (EEP depuncturing, Viterbi, energy dispersal) |
+//! | `audio` | DAB+ super-frame assembly, Reed-Solomon, AAC decoding |
+//! | `pad` | Programme Associated Data (Dynamic Label Segment, MOT slide-show) |
+//! | `constants` | DAB Mode I parameters and Band III channel table |
+//! | `charsets` | EBU Latin → UTF-8 conversion for service labels |
 //!
 
 mod audio;
