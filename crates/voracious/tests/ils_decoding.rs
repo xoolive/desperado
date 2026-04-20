@@ -4,10 +4,8 @@
 //! several seconds even in release mode.  Run them with:
 //!
 //! ```sh
-//! cargo test --release -p voracious -- --include-ignored
+//! cargo test --release -p voracious --features test-fixtures -- --include-ignored
 //! ```
-//!
-//! # Test Fixture
 //!
 //! The test uses a pre-captured gqrx recording stored under `tests/data/`:
 //!
@@ -39,17 +37,22 @@
 
 use std::path::Path;
 use voracious::decoders::ils_loc::{IlsLocalizerDemodulator, IlsSide, compute_ddm};
+#[cfg(feature = "test-fixtures")]
 use voracious::dsp_utils::hilbert_transform;
 
 const ILS_AUDIO_RATE: f64 = 9_000.0;
+
+#[cfg(feature = "test-fixtures")]
 const ILS_STEM: &str = "gqrx_20251107_215806_110700000_1800000_fc_ils";
 
+#[cfg(feature = "test-fixtures")]
 fn fixture_path(stem: &str, suffix: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(format!("{stem}_{suffix}.f32"))
 }
 
+#[cfg(feature = "test-fixtures")]
 fn load_f32(path: &Path) -> Vec<f64> {
     let bytes =
         std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -232,6 +235,7 @@ fn test_ils_per_second_ddm_consistent() {
 /// with the full IQ pipeline result.  This is faster than re-running the full DSP chain.
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_ils_fixture_envelope_ddm() {
     let path = fixture_path(ILS_STEM, "envelope");
     if !path.exists() {

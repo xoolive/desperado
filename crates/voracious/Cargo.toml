@@ -9,6 +9,7 @@ homepage.workspace = true
 repository.workspace = true
 readme = "readme.md"
 keywords = ["vor", "aviation", "radio", "decoder", "navigation"]
+exclude = ["tests/data/"]
 
 [dependencies]
 num-complex = "0.4"
@@ -29,6 +30,7 @@ hound = "3.5"
 
 [features]
 soapy = ["desperado/soapy"]
+test-fixtures = []
 
 [[bin]]
 name = "voracious"

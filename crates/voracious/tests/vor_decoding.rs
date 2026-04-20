@@ -4,7 +4,7 @@
 //! in a debug build.  Run them with:
 //!
 //! ```sh
-//! cargo test --release -p voracious -- --include-ignored
+//! cargo test --release -p voracious --features test-fixtures -- --include-ignored
 //! ```
 //!
 //! # Test Fixtures
@@ -40,7 +40,6 @@
 //! | `gqrx_20250925_144051_114647000_1800000_fc`     | KLO     | 114.85     | ~18 s    |
 //! | `gqrx_20251107_182558_116000000_1800000_fc`     | ARL     | 116.00     | ~26 s    |
 
-use std::path::Path;
 use voracious::decoders::{calculate_radial, calculate_radial_vortrack, decode_morse_ident};
 
 // Audio rate matches VorDemodulator: round(1_800_000 / 48_000) = 38, rate = 1_800_000 / 38
@@ -49,55 +48,67 @@ const AUDIO_RATE: f64 = 1_800_000.0 / 38.0; // ≈ 47368 Hz
 // Morse window: 15 seconds of audio, matching production default (source.rs)
 const MORSE_WINDOW_SAMPLES: usize = (AUDIO_RATE as usize) * 15;
 
-fn load_f32(path: &Path) -> Vec<f64> {
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    assert!(
-        bytes.len().is_multiple_of(4),
-        "file length not a multiple of 4"
-    );
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
-        .collect()
-}
+#[cfg(feature = "test-fixtures")]
+mod fixture_helpers {
+    use super::*;
+    use std::path::Path;
 
-fn fixture_path(stem: &str, suffix: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data")
-        .join(format!("{stem}_{suffix}.f32"))
-}
-
-/// Try Morse decoding over sliding windows of `MORSE_WINDOW_SAMPLES`, stepping by half a window.
-/// Returns the first decoded ident and all accumulated tokens.
-/// Mirrors the sliding-window strategy used by `IqSource` in `source.rs`.
-fn decode_morse_sliding(audio: &[f64]) -> (Option<String>, Vec<String>) {
-    let step = MORSE_WINDOW_SAMPLES / 2;
-    let mut all_tokens: Vec<String> = Vec::new();
-    let mut best_ident: Option<String> = None;
-
-    let mut start = 0;
-    while start + MORSE_WINDOW_SAMPLES <= audio.len() {
-        let window = &audio[start..start + MORSE_WINDOW_SAMPLES];
-        let (ident, tokens, _) = decode_morse_ident(window, AUDIO_RATE);
-        all_tokens.extend(tokens);
-        if best_ident.is_none() {
-            best_ident = ident;
-        }
-        start += step;
+    pub fn load_f32(path: &Path) -> Vec<f64> {
+        let bytes =
+            std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        assert!(
+            bytes.len().is_multiple_of(4),
+            "file length not a multiple of 4"
+        );
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+            .collect()
     }
 
-    (best_ident, all_tokens)
+    pub fn fixture_path(stem: &str, suffix: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(format!("{stem}_{suffix}.f32"))
+    }
+
+    /// Try Morse decoding over sliding windows of `MORSE_WINDOW_SAMPLES`, stepping by half a window.
+    /// Returns the first decoded ident and all accumulated tokens.
+    /// Mirrors the sliding-window strategy used by `IqSource` in `source.rs`.
+    pub fn decode_morse_sliding(audio: &[f64]) -> (Option<String>, Vec<String>) {
+        let step = MORSE_WINDOW_SAMPLES / 2;
+        let mut all_tokens: Vec<String> = Vec::new();
+        let mut best_ident: Option<String> = None;
+
+        let mut start = 0;
+        while start + MORSE_WINDOW_SAMPLES <= audio.len() {
+            let window = &audio[start..start + MORSE_WINDOW_SAMPLES];
+            let (ident, tokens, _) = decode_morse_ident(window, AUDIO_RATE);
+            all_tokens.extend(tokens);
+            if best_ident.is_none() {
+                best_ident = ident;
+            }
+            start += step;
+        }
+
+        (best_ident, all_tokens)
+    }
 }
+
+#[cfg(feature = "test-fixtures")]
+use fixture_helpers::*;
 
 // ── KLO (114.85 MHz) ─────────────────────────────────────────────────────────
 
+#[cfg(feature = "test-fixtures")]
 const KLO_STEM: &str = "gqrx_20250925_144051_114647000_1800000_fc";
+#[cfg(feature = "test-fixtures")]
 const ARL_STEM: &str = "gqrx_20251107_182558_116000000_1800000_fc";
 
 /// VORtrack radial should be in the expected range for KLO (~119°).
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_klo_vortrack_radial_in_range() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -114,6 +125,7 @@ fn test_klo_vortrack_radial_in_range() {
 /// This mirrors production behaviour where radial is computed per 3-second window.
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_klo_vortrack_windowed_consistent() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -147,6 +159,7 @@ fn test_klo_vortrack_windowed_consistent() {
 /// regression target but the assertion is relaxed until the decoder is fixed.
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_klo_morse_ident() {
     let audio = load_f32(&fixture_path(KLO_STEM, "audio"));
 
@@ -168,6 +181,7 @@ fn test_klo_morse_ident() {
 /// VORtrack radial should be in the expected range for ARL (~115°).
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_arl_vortrack_radial_in_range() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 
@@ -183,6 +197,7 @@ fn test_arl_vortrack_radial_in_range() {
 /// VORtrack radial on 3-second windows should be consistent with the full-signal result.
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_arl_vortrack_windowed_consistent() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 
@@ -213,6 +228,7 @@ fn test_arl_vortrack_windowed_consistent() {
 /// ARL has strong signal with ident bursts at t≈0–3 s, 8–11 s, and 23–26 s.
 #[test]
 #[ignore]
+#[cfg(feature = "test-fixtures")]
 fn test_arl_morse_ident() {
     let audio = load_f32(&fixture_path(ARL_STEM, "audio"));
 

@@ -15,8 +15,10 @@
 //! an unoptimised debug build.  Run them in release mode:
 //!
 //! ```sh
-//! cargo test --release -p fmradio -- --include-ignored
+//! cargo test --release -p fmradio --features test-fixtures -- --include-ignored
 //! ```
+
+#![cfg(feature = "test-fixtures")]
 
 use desperado::dsp::{DspBlock, decimator::Decimator, filters::LowPassFir, rotate::Rotate};
 use fmradio::fm::PhaseExtractor;

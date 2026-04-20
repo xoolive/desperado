@@ -9,6 +9,7 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+exclude = ["tests/data/"]
 
 [[bin]]
 name = "fmradio"
@@ -41,3 +42,4 @@ crossterm = "0.28"
 
 [features]
 soapy = ["desperado/soapy"]
+test-fixtures = []
