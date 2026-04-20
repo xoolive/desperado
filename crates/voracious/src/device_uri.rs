@@ -3,7 +3,6 @@
 //! This module handles CLI-level concerns of parsing device URIs
 //! (rtlsdr://, airspy://, soapy://) and building IQ sources from them.
 
-#[cfg(feature = "airspy")]
 use desperado::Gain;
 use desperado::{DeviceConfig, IqSource as BaseIqSource};
 use std::io;
@@ -58,7 +57,6 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> Stri
 }
 
 /// Build Airspy device source from URI.
-#[cfg(feature = "airspy")]
 fn build_airspy_source(
     uri: &str,
     center_freq_hz: u32,
@@ -108,15 +106,4 @@ fn build_airspy_source(
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(BaseIqSource::Airspy(source))
-}
-
-#[cfg(not(feature = "airspy"))]
-fn build_airspy_source(
-    _uri: &str,
-    _center_freq_hz: u32,
-    _sample_rate: u32,
-) -> Result<BaseIqSource, io::Error> {
-    Err(io::Error::other(
-        "airspy:// is not enabled. Rebuild with --features airspy",
-    ))
 }
