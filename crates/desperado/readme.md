@@ -58,7 +58,7 @@ desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto device
 
 ### Available features
 
-- **`rtlsdr`**: RTL-SDR device support (DVB-T dongles)
+- **`rtlsdr`**: RTL-SDR device support (DVB-T dongles) via pure-Rust `rs_rtl` crate
 - **`airspy`**: Airspy device support (R2, Mini, HF+) via pure-Rust `rs_spy` crate
 - **`hackrf`**: HackRF device support via pure-Rust `rs_hack` crate (nusb backend)
 - **`soapy`**: SoapySDR device support (LimeSDR, BladeRF, etc.)
