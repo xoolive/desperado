@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod decoders;
 pub mod device_uri;
+pub mod dsp_utils;
 pub mod sources;
 pub mod timestamp_helpers;
 

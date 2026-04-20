@@ -47,6 +47,10 @@ To use hardware SDR devices, enable the appropriate feature flags:
 [dependencies]
 desperado = { version = "0.1", features = ["rtlsdr"] }  # For RTL-SDR devices
 # or
+desperado = { version = "0.1", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
+# or
+desperado = { version = "0.1", features = ["hackrf"] }  # For HackRF devices
+# or
 desperado = { version = "0.1", features = ["soapy"] }   # For SoapySDR-compatible devices
 # or
 desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto devices
@@ -55,7 +59,9 @@ desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto device
 ### Available features
 
 - **`rtlsdr`**: RTL-SDR device support (DVB-T dongles)
-- **`soapy`**: SoapySDR device support (HackRF, LimeSDR, etc.)
+- **`airspy`**: Airspy device support (R2, Mini, HF+) via pure-Rust `rs_spy` crate
+- **`hackrf`**: HackRF device support via pure-Rust `rs_hack` crate (nusb backend)
+- **`soapy`**: SoapySDR device support (LimeSDR, BladeRF, etc.)
 - **`pluto`**: Adalm-Pluto SDR support
 
 The following features are only needed for examples:
@@ -141,16 +147,20 @@ Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncI
 | Standard Input | `[Async]IqSource::from_stdin`  |                  |
 | TCP socket     | `[Async]IqSource::from_tcp`    |                  | address and port |
 | RTL-SDR        | `[Async]IqSource::from_rtlsdr` | `rtlsdr`         | device index     |
+| Airspy         | `[Async]IqSource::from_airspy` | `airspy`         | device index     |
+| HackRF         | `[Async]IqSource::from_hackrf` | `hackrf`         | device index     |
 | Soapy          | `[Async]IqSource::from_soapy`  | `soapy`          | device arguments |
 | Adalm-Pluto    | `[Async]IqSource::from_pluto`  | `pluto`          | URI              |
 
 All samples are returned as `Complex<f32>` values, regardless of the source.
 
-- The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementaiton of the RTL-SDR driver.
-- The `soapy` feature enables support for SoapySDR-compatible devices (HackRF, LimeSDR, BladeRF, etc.). It is based on the [`soapysdr`](https://crates.io/crates/soapysdr) crate which provides Rust bindings to the SoapySDR C++ library. **The SoapySDR library must be installed separately**.
+- The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementation of the RTL-SDR driver.
+- The `airspy` feature enables support for Airspy devices (R2, Mini, HF+). It is based on the `rs_spy` crate, a pure Rust implementation using `nusb` for USB access. Airspy hardware outputs real samples from a single ADC; the driver performs Fs/4 frequency translation and half-band filtering to produce proper I/Q output.
+- The `hackrf` feature enables support for HackRF One devices. It is based on the `rs_hack` crate, a pure Rust implementation using `nusb` for USB access. HackRF outputs interleaved 8-bit signed I/Q samples (Cs8) directly over USB. The driver supports per-element gain control (LNA, VGA, amp) and bias-tee power.
+- The `soapy` feature enables support for SoapySDR-compatible devices (LimeSDR, BladeRF, etc.). It is based on the [`soapysdr`](https://crates.io/crates/soapysdr) crate which provides Rust bindings to the SoapySDR C++ library. **The SoapySDR library must be installed separately**.
 - The `pluto` feature enables support for Adalm-Pluto devices. It is based on the [`pluto-sdr`](https://crates.io/crates/pluto-sdr) crate which provides Rust bindings to the libiio C library. **The libiio library must be installed separately**.
 
-Contributions to include more SDR frontends (LimeSDR, HackRF, etc.) **or to port existing ones to pure Rust implementations** are welcome.
+Contributions to include more SDR frontends (LimeSDR, BladeRF, etc.) **or to port existing ones to pure Rust implementations** are welcome.
 
 ## Sync vs Async: Which should I use?
 
@@ -217,6 +227,19 @@ let source = IqSource::from_file(path, freq, rate, 65536, format)?;
 - Network latency affects performance for IP-connected devices
 - Use USB 3.0 connections when possible
 
+**Airspy tips**:
+
+- The R2 supports sample rates of 2.5 and 10 MSPS; the Mini supports 3 and 6 MSPS
+- Uses pure-Rust USB access (nusb) — no system driver needed
+- Gain modes: manual (LNA/Mixer/IF), linearity, or sensitivity
+
+**HackRF tips**:
+
+- Supports up to 20 MSPS with 8-bit I/Q samples
+- Uses pure-Rust USB access (nusb) — no system driver needed
+- Control LNA (0–40 dB), VGA (0–62 dB), and 14 dB RF amplifier independently
+- Bias-tee output available for powering external LNAs
+
 ### Format Considerations
 
 Different I/Q formats have different performance characteristics:
@@ -225,7 +248,7 @@ Different I/Q formats have different performance characteristics:
 | ------ | --------- | --------- | -------------------------------------- |
 | Cu8    | Lowest    | 8-bit     | RTL-SDR, bandwidth-limited scenarios   |
 | Cs8    | Low       | 8-bit     | Signed 8-bit devices                   |
-| Cs16   | Medium    | 16-bit    | Higher dynamic range, HackRF           |
+| Cs16   | Medium    | 16-bit    | Higher dynamic range, Airspy, PlutoSDR |
 | Cf32   | Highest   | 32-bit    | Pre-processed files, maximum precision |
 
 **Recommendation**: Use the native format of your source when possible to avoid unnecessary conversions.
@@ -255,6 +278,35 @@ To list available RTL-SDR devices:
 
 ```bash
 rtl_test
+# or using the workspace example:
+cargo run --example rtl_sdr -p desperado --features rtlsdr
+```
+
+### Airspy Device Detection
+
+To list available Airspy devices and query firmware versions:
+
+```bash
+cargo run --example airspy_info -p rs-spy
+# or stream a few samples with the integration test:
+cargo run --example airspy_test -p desperado --features airspy
+```
+
+If you get an "I/O Error", the device may need time to reset after the previous run. Unplug and replug the device, or wait ~30 seconds.
+
+### HackRF Device Detection
+
+To list available HackRF devices and query firmware/board info:
+
+```bash
+cargo run --example hackrf_info -p rs-hack
+```
+
+If the device appears hung, unplug and replug it. On Linux, ensure you have a udev rule granting access to the USB device (vendor `1d50`, product `6089`):
+
+```bash
+# /etc/udev/rules.d/52-hackrf.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", MODE="0666"
 ```
 
 ### SoapySDR Device Detection
@@ -311,7 +363,7 @@ Desperado supports raw I/Q files in various formats:
 
 Contributions are welcome! Here are some ways you can help:
 
-- **Add SDR device support**: HackRF, LimeSDR, BladeRF, etc.  
+- **Add SDR device support**: LimeSDR, BladeRF, etc.  
   Consider pure Rust implementations where possible!
 - **Improve documentation**: Fix typos, add examples, clarify explanations
 - **Report bugs**: Open an issue with details and reproduction steps

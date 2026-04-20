@@ -7,6 +7,13 @@ use num_complex::Complex;
 
 use crate::dsp::DspBlock;
 
+/// Adaptive frequency correction block using squared-signal FFT peak detection.
+///
+/// Corrects residual carrier frequency offsets in OFDM-like signals by squaring
+/// the input (to double the carrier offset), performing an FFT, locating the
+/// peak pair, and applying a compensating complex rotation.
+///
+/// Used in FM radio for fine frequency offset correction after initial tuning.
 pub struct SquareFreqOffsetCorrection {
     /// Buffer for squared input samples for FFT
     fft_data: Vec<Complex<f32>>,
@@ -29,6 +36,12 @@ pub struct SquareFreqOffsetCorrection {
 }
 
 impl SquareFreqOffsetCorrection {
+    /// Create a new frequency correction block.
+    ///
+    /// # Arguments
+    /// * `n` - FFT size (number of samples per correction window, must be a power of 2)
+    /// * `window` - Search window size for peak detection (bins to exclude at edges)
+    /// * `wide` - Enable wide search mode for larger frequency offsets
     pub fn with_params(n: usize, window: usize, wide: bool) -> Self {
         let log_n = (n as f32).log2() as usize;
         Self {
@@ -51,7 +64,7 @@ impl SquareFreqOffsetCorrection {
         fft_in_place(&mut self.fft_data);
 
         let delta = (9600.0 / 48000.0 * n as f32) as usize;
-        let mut wi = 0;
+        let mut wi: isize = 0;
 
         if self.wide {
             if self.cumsum.len() < n {
@@ -68,6 +81,7 @@ impl SquareFreqOffsetCorrection {
                 self.cumsum[i] = self.cumsum[i - 1] + p;
             }
 
+            let mut best_i: usize = 0;
             for i in 0..(n - m) {
                 let v = self.cumsum[i + m] - self.cumsum[i]
                     + 0.6
@@ -75,16 +89,19 @@ impl SquareFreqOffsetCorrection {
                             + self.fft_data[(i + ofs + delta + n / 2) % n].norm());
                 if v > wm {
                     wm = v;
-                    wi = i;
+                    best_i = i;
                 }
             }
-            wi = wi + m / 2 - n / 2;
+            wi = best_i as isize + (m / 2) as isize - (n / 2) as isize;
         }
 
         let mut max_val = 0.0f32;
         let mut fz = -1.0f32;
 
-        for i in (wi + self.window)..(wi + n - self.window - delta) {
+        // Search range uses signed arithmetic; clamp to valid [0, n) range.
+        let lo = (wi + self.window as isize).max(0) as usize;
+        let hi = (wi + n as isize - self.window as isize - delta as isize).max(0) as usize;
+        for i in lo..hi.min(n) {
             let h = self.fft_data[(i + n / 2) % n].norm()
                 + self.fft_data[(i + delta + n / 2) % n].norm();
 
@@ -187,5 +204,82 @@ fn fft_in_place(data: &mut [Complex<f32>]) {
 
         m2 = m;
         m <<= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_afc_creation() {
+        let afc = SquareFreqOffsetCorrection::with_params(1024, 10, false);
+        assert_eq!(afc.n, 1024);
+        assert_eq!(afc.window, 10);
+        assert!(!afc.wide);
+        assert_eq!(afc.count, 0);
+    }
+
+    #[test]
+    fn test_afc_process_empty() {
+        let mut afc = SquareFreqOffsetCorrection::with_params(1024, 10, false);
+        let result = afc.process(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_afc_process_partial_window() {
+        let mut afc = SquareFreqOffsetCorrection::with_params(1024, 10, false);
+        // Feed fewer samples than the FFT window — no output expected
+        let input: Vec<Complex<f32>> = (0..512)
+            .map(|i| Complex::new((i as f32 * 0.1).cos(), (i as f32 * 0.1).sin()))
+            .collect();
+        let result = afc.process(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_afc_process_full_window() {
+        let mut afc = SquareFreqOffsetCorrection::with_params(1024, 10, false);
+        // Feed exactly one FFT window — should produce output
+        let input: Vec<Complex<f32>> = (0..1024)
+            .map(|i| Complex::new((i as f32 * 0.1).cos(), (i as f32 * 0.1).sin()))
+            .collect();
+        let result = afc.process(&input);
+        assert_eq!(result.len(), 1024);
+        // Output should contain finite values
+        assert!(result.iter().all(|c| c.re.is_finite() && c.im.is_finite()));
+    }
+
+    #[test]
+    fn test_afc_wide_mode() {
+        let mut afc = SquareFreqOffsetCorrection::with_params(1024, 10, true);
+        let input: Vec<Complex<f32>> = (0..1024)
+            .map(|i| Complex::new((i as f32 * 0.1).cos(), (i as f32 * 0.1).sin()))
+            .collect();
+        let result = afc.process(&input);
+        assert_eq!(result.len(), 1024);
+        assert!(result.iter().all(|c| c.re.is_finite() && c.im.is_finite()));
+    }
+
+    #[test]
+    fn test_fft_in_place_dc() {
+        // DC signal — all energy in bin 0
+        let n = 8;
+        let mut data = vec![Complex::new(1.0, 0.0); n];
+        fft_in_place(&mut data);
+        // Bin 0 should have magnitude n, rest should be ~0
+        assert!((data[0].norm() - n as f32).abs() < 1e-4);
+        for bin in &data[1..] {
+            assert!(bin.norm() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_reverse_bits() {
+        assert_eq!(reverse_bits(0b000, 3), 0b000);
+        assert_eq!(reverse_bits(0b001, 3), 0b100);
+        assert_eq!(reverse_bits(0b010, 3), 0b010);
+        assert_eq!(reverse_bits(0b110, 3), 0b011);
     }
 }

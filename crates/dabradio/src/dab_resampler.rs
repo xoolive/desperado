@@ -1,12 +1,17 @@
 //! DAB-specific resampling paths tuned for Airspy and RTL front-ends.
+//!
+//! This module contains the exact rate-matching logic for converting
+//! various SDR front-end sample rates to the DAB native rate (2.048 MHz).
+//! The paths are carefully chosen to preserve OFDM timing integrity.
 
-use super::resampler::ComplexResampler;
+use desperado::dsp::resampler::ComplexResampler;
 use num_complex::Complex;
 
-const DAB_SAMPLE_RATE: u32 = 2_048_000;
+use crate::constants;
+
 const WELLE_INTERMEDIATE_RATE: u32 = 4_096_000;
 
-pub struct DabResampler {
+pub(crate) struct DabResampler {
     path: Path,
 }
 
@@ -26,12 +31,20 @@ enum Path {
 }
 
 impl DabResampler {
-    pub fn new(input_rate_hz: u32) -> Result<Self, String> {
+    /// Create a DAB resampler for the given SDR input sample rate.
+    ///
+    /// Uses hardcoded rate ranges tuned for known SDR front-ends:
+    /// - 2.048 MHz: passthrough (RTL-SDR native DAB rate)
+    /// - ~4.096 MHz: 2:1 averaging (Airspy)
+    /// - ~2.4 MHz: direct polyphase resample (RTL-SDR)
+    /// - ~3 MHz: resample to 4.096 MHz then halve
+    /// - ~6 MHz: halve, resample to 4.096 MHz, halve (Airspy HF+)
+    pub(crate) fn new(input_rate_hz: u32) -> Result<Self, String> {
         if input_rate_hz == 0 {
             return Err("Input sample rate must be non-zero".to_string());
         }
 
-        let path = if input_rate_hz == DAB_SAMPLE_RATE {
+        let path = if input_rate_hz == constants::SAMPLE_RATE {
             Path::Passthrough
         } else if (4_000_000..=4_200_000).contains(&input_rate_hz) {
             Path::Half(AveragingDecimator2::new())
@@ -48,7 +61,10 @@ impl DabResampler {
                 decimator: AveragingDecimator2::new(),
             }
         } else if (2_300_000..=2_500_000).contains(&input_rate_hz) {
-            Path::Direct(ComplexResampler::new(input_rate_hz, DAB_SAMPLE_RATE)?)
+            Path::Direct(ComplexResampler::new(
+                input_rate_hz,
+                constants::SAMPLE_RATE,
+            )?)
         } else {
             return Err(format!(
                 "Unsupported input sample rate: {}. Supported: ~2.4M, ~3M, ~4.096M, ~6M",
@@ -59,7 +75,7 @@ impl DabResampler {
         Ok(Self { path })
     }
 
-    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+    pub(crate) fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
         if input.is_empty() {
             return Vec::new();
         }
@@ -72,8 +88,8 @@ impl DabResampler {
                 resampler,
                 decimator,
             } => {
-                let up = resampler.process(input);
-                decimator.process(&up)
+                let resampled = resampler.process(input);
+                decimator.process(&resampled)
             }
             Path::HalfThenResampleThenHalf {
                 pre_decimator,
@@ -88,6 +104,7 @@ impl DabResampler {
     }
 }
 
+/// Stateful 2:1 averaging decimator for complex samples.
 struct AveragingDecimator2 {
     pending: Option<Complex<f32>>,
 }

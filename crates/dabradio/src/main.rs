@@ -1,10 +1,44 @@
 //! dabradio — DAB/DAB+ digital radio decoder.
 //!
-//! Reads IQ samples and decodes DAB ensemble information (services, labels, subchannels).
+//! This crate receives raw I/Q samples (via [`desperado`]) from an SDR device or
+//! file and decodes a DAB Mode I ensemble, extracting services, labels,
+//! programme-associated data (Dynamic Label, MOT slide-show images), and
+//! DAB+ HE-AAC audio.
+//!
+//! # Architecture
+//!
+//! The processing pipeline is split into the following stages:
+//!
+//! ```text
+//! IQ stream ─► OFDM sync & FFT ─► DQPSK decode ─┬─► FIC ─► ensemble metadata
+//!                                               └─► MSC ─► subchannel frames
+//!                                                              │
+//!                                                     FEC (Viterbi + RS)
+//!                                                              │
+//!                                                     AAC decode ─► audio
+//!                                                              │
+//!                                                     PAD ─► DLS / MOT
+//! ```
+//!
+//! # Modules
+//!
+//! | Module | Purpose |
+//! |---|---|
+//! | [`ofdm`] | Frame synchronisation, FFT, DQPSK differential decoding |
+//! | [`fic`] | Fast Information Channel — ensemble & service metadata |
+//! | [`msc`] | Main Service Channel — subchannel extraction |
+//! | [`fec`] | Forward Error Correction (EEP depuncturing, Viterbi, energy dispersal) |
+//! | [`audio`] | DAB+ super-frame assembly, Reed-Solomon, AAC decoding |
+//! | [`pad`] | Programme Associated Data (Dynamic Label Segment, MOT slide-show) |
+//! | [`constants`] | DAB Mode I parameters and Band III channel table |
+//! | [`charsets`] | EBU Latin → UTF-8 conversion for service labels |
+//!
 
 mod audio;
 mod charsets;
 mod constants;
+#[cfg(feature = "resampler")]
+mod dab_resampler;
 mod fec;
 mod fic;
 mod msc;
@@ -15,6 +49,8 @@ use clap::Parser;
 use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+#[cfg(feature = "resampler")]
+use dab_resampler::DabResampler;
 #[cfg(any(
     feature = "rtlsdr",
     feature = "soapy",
@@ -37,8 +73,6 @@ use desperado::Gain;
 ))]
 use desperado::IqAsyncSource;
 use desperado::dsp::DspBlock;
-#[cfg(feature = "resampler")]
-use desperado::dsp::dab_resampler::DabResampler;
 use desperado::dsp::rotate::Rotate;
 use desperado::{IqFormat, IqSource};
 #[cfg(any(
@@ -913,8 +947,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sig_running = app_running.clone();
     tokio::spawn(async move {
+        // First Ctrl-C: graceful shutdown
         if tokio::signal::ctrl_c().await.is_ok() {
             sig_running.store(false, Ordering::Relaxed);
+        }
+        // Second Ctrl-C: force exit (audio device drop can hang on stuck ALSA)
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nForce exit (second Ctrl-C)");
+            restart_audio_server();
+            std::process::exit(1);
         }
     });
 
@@ -958,11 +999,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_rate: AUDIO_RATE,
             channel_sample_count: 1024,
         };
-        let audio_underruns_cb = Arc::clone(&audio_underruns);
-        let audio_primed_cb = Arc::clone(&audio_primed);
-        let audio_measure_active_cb = Arc::clone(&audio_measure_active);
-        Some(
-            run_output_device(config, move |data| {
+        let make_callback = |rx: channel::Receiver<f32>,
+                             audio_underruns_cb: Arc<AtomicU64>,
+                             audio_primed_cb: Arc<AtomicBool>,
+                             audio_measure_active_cb: Arc<AtomicBool>| {
+            move |data: &mut [f32]| {
                 if !audio_measure_active_cb.load(Ordering::Relaxed) {
                     data.fill(0.0);
                     return;
@@ -995,9 +1036,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if all_empty {
                     audio_primed_cb.store(false, Ordering::Relaxed);
                 }
-            })
-            .expect("Failed to open audio output device"),
-        )
+            }
+        };
+        match run_output_device(
+            config,
+            make_callback(
+                rx.clone(),
+                Arc::clone(&audio_underruns),
+                Arc::clone(&audio_primed),
+                Arc::clone(&audio_measure_active),
+            ),
+        ) {
+            Ok(device) => Some(device),
+            Err(e) => {
+                error!("Failed to open audio output device: {}.", e);
+                warn!("Attempting to restart audio server to recover sound card...");
+                restart_audio_server();
+                // Give the audio server time to reinitialize.
+                thread::sleep(Duration::from_millis(500));
+                // Retry once after recovery.
+                match run_output_device(
+                    config,
+                    make_callback(
+                        rx.clone(),
+                        Arc::clone(&audio_underruns),
+                        Arc::clone(&audio_primed),
+                        Arc::clone(&audio_measure_active),
+                    ),
+                ) {
+                    Ok(device) => {
+                        info!("Audio device opened after server restart");
+                        Some(device)
+                    }
+                    Err(e2) => {
+                        error!(
+                            "Still cannot open audio device after restart: {}. Continuing without audio.",
+                            e2
+                        );
+                        None
+                    }
+                }
+            }
+        }
     } else {
         None
     };
@@ -1014,7 +1094,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut main_loop_iter = 0usize;
     while app_running.load(Ordering::Relaxed) {
-        let Some(chunk) = source.next_chunk().await else {
+        // Use a timeout so we periodically re-check app_running even if the
+        // SDR source blocks (device error, USB stall, etc.).
+        let chunk_result = loop {
+            match tokio::time::timeout(Duration::from_millis(500), source.next_chunk()).await {
+                Ok(result) => break result,
+                Err(_timeout) => {
+                    if !app_running.load(Ordering::Relaxed) {
+                        break None;
+                    }
+                    // Timeout — retry
+                    continue;
+                }
+            }
+        };
+        let Some(chunk) = chunk_result else {
             info!("stream ended");
             break;
         };
@@ -1404,14 +1498,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
 
-                                // Blocking send for both live and file sources: no samples are
-                                // ever silently dropped. The IQ bridge chain (~1.2 s deep) absorbs
-                                // any stall while the audio callback drains the queue.
+                                // Send with timeout so we can check app_running and avoid
+                                // blocking forever if the audio callback stops consuming
+                                // (device error, etc.). The IQ bridge chain (~1.2 s deep)
+                                // absorbs any stall while the audio callback drains the queue.
                                 // block_in_place lets tokio know this thread will block briefly.
                                 tokio::task::block_in_place(|| {
                                     for sample in &decoded_out.pcm {
-                                        if tx.send(*sample).is_err() {
-                                            break;
+                                        loop {
+                                            match tx
+                                                .send_timeout(*sample, Duration::from_millis(100))
+                                            {
+                                                Ok(()) => break,
+                                                Err(channel::SendTimeoutError::Timeout(_)) => {
+                                                    if !app_running.load(Ordering::Relaxed) {
+                                                        return;
+                                                    }
+                                                    // Queue full, retry after timeout
+                                                }
+                                                Err(channel::SendTimeoutError::Disconnected(_)) => {
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
                                 });
@@ -1501,6 +1609,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     audio_measure_active.store(false, Ordering::Relaxed);
+
+    // Drop the audio device with a timeout. tinyaudio's ALSA backend calls
+    // thread::join() inside Drop, which hangs if snd_pcm_writei is blocked.
+    // If the drop doesn't complete in 2 seconds, force-exit to avoid
+    // leaving a zombie process that locks the sound card.
+    if _device.is_some() {
+        let drop_done = Arc::new(AtomicBool::new(false));
+        let drop_done2 = drop_done.clone();
+        let drop_handle = thread::spawn(move || {
+            drop(_device);
+            drop_done2.store(true, Ordering::Relaxed);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !drop_done.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if drop_done.load(Ordering::Relaxed) {
+            let _ = drop_handle.join();
+        } else {
+            warn!("Audio device drop timed out (ALSA likely stuck) — forcing exit");
+            // Try to restart PipeWire so the sound card isn't left locked.
+            // This is best-effort; process::exit below will run regardless.
+            restart_audio_server();
+            std::process::exit(1);
+        }
+    }
 
     // Print ensemble info
     ensemble.resolve_services();
@@ -2033,4 +2167,42 @@ fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
         }
     }
     steps.first().copied().unwrap_or(current)
+}
+
+/// Restart the PipeWire/PulseAudio audio server to release a stuck sound card.
+///
+/// tinyaudio opens ALSA directly, which can grab the hardware device exclusively.
+/// When the process is force-killed (or Drop hangs and we call process::exit),
+/// the ALSA handle is never closed and the sound card stays locked until the
+/// audio server reclaims it. This function does that automatically.
+fn restart_audio_server() {
+    // Try PipeWire first (modern distros), then PulseAudio as fallback.
+    let commands: &[&[&str]] = &[
+        &[
+            "systemctl",
+            "--user",
+            "restart",
+            "pipewire",
+            "wireplumber",
+            "pipewire-pulse",
+        ],
+        &["systemctl", "--user", "restart", "pulseaudio"],
+    ];
+    for cmd in commands {
+        match std::process::Command::new(cmd[0])
+            .args(&cmd[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                eprintln!("Audio server restarted ({})", cmd.join(" "));
+                return;
+            }
+            _ => continue,
+        }
+    }
+    eprintln!(
+        "Could not restart audio server automatically. Try: systemctl --user restart pipewire wireplumber pipewire-pulse"
+    );
 }

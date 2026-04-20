@@ -1,6 +1,7 @@
 //! Complex (I/Q) sample-rate resampling utilities.
 
 use crate::dsp::buffer::StreamBuffer;
+use crate::dsp::window::{WindowType, compute_window_f64, sinc};
 use num_complex::Complex;
 
 const DEFAULT_TAPS: usize = 128;
@@ -21,6 +22,17 @@ pub struct ComplexResampler {
 }
 
 impl ComplexResampler {
+    /// Create a new complex I/Q resampler.
+    ///
+    /// For ratios > 2×, automatically uses a two-stage approach (integer
+    /// decimation followed by polyphase sinc) for better quality.
+    ///
+    /// # Arguments
+    /// * `input_rate_hz` - Input sample rate in Hz
+    /// * `output_rate_hz` - Desired output sample rate in Hz
+    ///
+    /// # Errors
+    /// Returns an error if either rate is zero.
     pub fn new(input_rate_hz: u32, output_rate_hz: u32) -> Result<Self, String> {
         if input_rate_hz == 0 || output_rate_hz == 0 {
             return Err("Sample rates must be non-zero".to_string());
@@ -200,6 +212,9 @@ impl SingleStageResampler {
     }
 }
 
+/// Build an anti-aliasing low-pass FIR filter using a Blackman-windowed sinc.
+///
+/// Uses f64 precision for coefficient computation, then casts to f32.
 fn build_lowpass_filter(taps: usize, cutoff: f64) -> Vec<f32> {
     let center = (taps - 1) as f64 / 2.0;
     let mut filter = vec![0.0f32; taps];
@@ -207,7 +222,10 @@ fn build_lowpass_filter(taps: usize, cutoff: f64) -> Vec<f32> {
 
     for (n, f) in filter.iter_mut().enumerate() {
         let x = n as f64 - center;
-        let h = 2.0 * cutoff * sinc(2.0 * cutoff * x) * blackman(n, taps);
+        let h = 2.0
+            * cutoff
+            * sinc(2.0 * cutoff * x)
+            * compute_window_f64(n, taps, WindowType::Blackman);
         *f = h as f32;
         sum += h;
     }
@@ -223,23 +241,10 @@ fn build_lowpass_filter(taps: usize, cutoff: f64) -> Vec<f32> {
     filter
 }
 
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-12 {
-        1.0
-    } else {
-        let px = std::f64::consts::PI * x;
-        px.sin() / px
-    }
-}
-
-fn blackman(n: usize, len: usize) -> f64 {
-    let a0 = 0.42;
-    let a1 = 0.5;
-    let a2 = 0.08;
-    let x = 2.0 * std::f64::consts::PI * n as f64 / (len as f64 - 1.0);
-    a0 - a1 * x.cos() + a2 * (2.0 * x).cos()
-}
-
+/// Build a polyphase sinc kernel for fractional-delay interpolation.
+///
+/// Generates `phases × taps` coefficients. Each phase is a Blackman-windowed
+/// sinc filter shifted by `phase / phases` of a sample, normalised to unity gain.
 fn build_polyphase_kernel(taps: usize, phases: usize, cutoff: f64) -> Vec<f32> {
     let center = taps as f64 / 2.0 - 1.0;
     let mut table = vec![0.0f32; taps * phases];
@@ -249,7 +254,10 @@ fn build_polyphase_kernel(taps: usize, phases: usize, cutoff: f64) -> Vec<f32> {
         let mut sum = 0.0f64;
         for n in 0..taps {
             let x = n as f64 - center - frac;
-            let h = 2.0 * cutoff * sinc(2.0 * cutoff * x) * blackman(n, taps);
+            let h = 2.0
+                * cutoff
+                * sinc(2.0 * cutoff * x)
+                * compute_window_f64(n, taps, WindowType::Blackman);
             table[p * taps + n] = h as f32;
             sum += h;
         }
@@ -263,4 +271,286 @@ fn build_polyphase_kernel(taps: usize, phases: usize, cutoff: f64) -> Vec<f32> {
     }
 
     table
+}
+
+/// Stateful 2:1 averaging decimator for complex samples.
+///
+/// Produces one output sample for every two input samples by averaging
+/// adjacent pairs. Maintains state across `process()` calls so that an
+/// odd trailing sample is paired with the first sample of the next block.
+///
+/// This is a cheap alternative to a full FIR decimator when the input is
+/// already bandwidth-limited (e.g. hardware anti-alias filter in the ADC).
+struct AveragingDecimator2 {
+    pending: Option<Complex<f32>>,
+}
+
+impl AveragingDecimator2 {
+    fn new() -> Self {
+        Self { pending: None }
+    }
+
+    fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        let mut output = Vec::with_capacity(input.len().div_ceil(2));
+        let mut idx = 0usize;
+
+        if let Some(prev) = self.pending.take() {
+            let pair_avg = (prev + input[0]) * 0.5;
+            output.push(pair_avg);
+            idx = 1;
+        }
+
+        while idx + 1 < input.len() {
+            let pair_avg = (input[idx] + input[idx + 1]) * 0.5;
+            output.push(pair_avg);
+            idx += 2;
+        }
+
+        if idx < input.len() {
+            self.pending = Some(input[idx]);
+        }
+
+        output
+    }
+}
+
+/// Multi-stage complex resampler that picks an optimal processing path
+/// based on the input and output sample rates.
+///
+/// For common SDR front-end rates, this selects efficient combinations of
+/// 2:1 averaging decimation and polyphase sinc resampling to minimise
+/// computation while maintaining signal quality.
+///
+/// # Supported paths
+///
+/// | Input rate          | Strategy                                         |
+/// |---------------------|--------------------------------------------------|
+/// | Equal to output     | Passthrough (zero-copy)                          |
+/// | ~2× output          | Single 2:1 averaging decimation                  |
+/// | ~3× output          | Polyphase resample → 2:1 decimation              |
+/// | ~1.2× output        | Direct polyphase resample                        |
+/// | ≥2.8× output        | 2:1 decimate → polyphase resample → 2:1 decimate |
+/// | Other               | Direct polyphase resample (fallback)             |
+///
+/// # Example
+///
+/// ```ignore
+/// use desperado::dsp::resampler::MultiStageResampler;
+/// use num_complex::Complex;
+///
+/// // Airspy 4.096 MHz → DAB native 2.048 MHz
+/// let mut r = MultiStageResampler::new(4_096_000, 2_048_000).unwrap();
+/// let input = vec![Complex::new(1.0, 0.0); 4096];
+/// let output = r.process(&input);
+/// ```
+pub struct MultiStageResampler {
+    path: MultiStagePath,
+}
+
+enum MultiStagePath {
+    Passthrough,
+    Half(AveragingDecimator2),
+    Direct(ComplexResampler),
+    ResampleThenHalf {
+        resampler: ComplexResampler,
+        decimator: AveragingDecimator2,
+    },
+    HalfThenResampleThenHalf {
+        pre_decimator: AveragingDecimator2,
+        resampler: ComplexResampler,
+        post_decimator: AveragingDecimator2,
+    },
+}
+
+impl MultiStageResampler {
+    /// Create a multi-stage resampler for the given input and output rates.
+    ///
+    /// # Arguments
+    /// * `input_rate_hz`  – Source sample rate in Hz
+    /// * `output_rate_hz` – Desired output sample rate in Hz
+    ///
+    /// # Errors
+    /// Returns an error if either rate is zero or the rate combination is
+    /// unsupported.
+    pub fn new(input_rate_hz: u32, output_rate_hz: u32) -> Result<Self, String> {
+        if input_rate_hz == 0 || output_rate_hz == 0 {
+            return Err("Sample rates must be non-zero".to_string());
+        }
+
+        let intermediate_2x = output_rate_hz.saturating_mul(2);
+
+        let path = if input_rate_hz == output_rate_hz {
+            MultiStagePath::Passthrough
+        } else if is_near(input_rate_hz, intermediate_2x, 0.05) {
+            // ~2× output → simple 2:1 averaging
+            MultiStagePath::Half(AveragingDecimator2::new())
+        } else if is_near(input_rate_hz, output_rate_hz.saturating_mul(3), 0.05) {
+            // ~3× output → resample to 2× then halve
+            MultiStagePath::ResampleThenHalf {
+                resampler: ComplexResampler::new(input_rate_hz, intermediate_2x)?,
+                decimator: AveragingDecimator2::new(),
+            }
+        } else if input_rate_hz as f64 / output_rate_hz as f64 >= 2.8 {
+            // High ratio → halve, resample to 2×, halve
+            let half_rate = input_rate_hz / 2;
+            MultiStagePath::HalfThenResampleThenHalf {
+                pre_decimator: AveragingDecimator2::new(),
+                resampler: ComplexResampler::new(half_rate, intermediate_2x)?,
+                post_decimator: AveragingDecimator2::new(),
+            }
+        } else {
+            // Moderate ratio → direct polyphase resample
+            MultiStagePath::Direct(ComplexResampler::new(input_rate_hz, output_rate_hz)?)
+        };
+
+        Ok(Self { path })
+    }
+
+    /// Resample a chunk of complex I/Q samples.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Complex<f32>> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        match &mut self.path {
+            MultiStagePath::Passthrough => input.to_vec(),
+            MultiStagePath::Half(decimator) => decimator.process(input),
+            MultiStagePath::Direct(resampler) => resampler.process(input),
+            MultiStagePath::ResampleThenHalf {
+                resampler,
+                decimator,
+            } => {
+                let resampled = resampler.process(input);
+                decimator.process(&resampled)
+            }
+            MultiStagePath::HalfThenResampleThenHalf {
+                pre_decimator,
+                resampler,
+                post_decimator,
+            } => {
+                let half = pre_decimator.process(input);
+                let intermediate = resampler.process(&half);
+                post_decimator.process(&intermediate)
+            }
+        }
+    }
+}
+
+/// Check whether `rate` is within `tolerance` (fraction) of `target`.
+fn is_near(rate: u32, target: u32, tolerance: f64) -> bool {
+    let ratio = rate as f64 / target as f64;
+    (ratio - 1.0).abs() < tolerance
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- ComplexResampler -------------------------------------------------
+
+    #[test]
+    fn test_complex_resampler_zero_rate() {
+        assert!(ComplexResampler::new(0, 48000).is_err());
+        assert!(ComplexResampler::new(48000, 0).is_err());
+    }
+
+    #[test]
+    fn test_complex_resampler_identity() {
+        let mut r = ComplexResampler::new(48000, 48000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 480];
+        let output = r.process(&input);
+        // Same rate: output length should be close to input length
+        // (first call loses samples to filter warmup)
+        assert!(
+            output.len().abs_diff(480) < 150,
+            "Expected ~480, got {}",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_complex_resampler_downsample() {
+        // 2.4 MHz → 2.048 MHz (~0.85× ratio)
+        let mut r = ComplexResampler::new(2_400_000, 2_048_000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 2400];
+        let output = r.process(&input);
+        let expected = (2400.0 * 2_048_000.0 / 2_400_000.0) as usize;
+        assert!(
+            output.len().abs_diff(expected) < 200,
+            "Expected ~{}, got {}",
+            expected,
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_complex_resampler_empty() {
+        let mut r = ComplexResampler::new(48000, 44100).unwrap();
+        assert!(r.process(&[]).is_empty());
+    }
+
+    // -- MultiStageResampler ----------------------------------------------
+
+    #[test]
+    fn test_multistage_passthrough() {
+        let mut r = MultiStageResampler::new(2_048_000, 2_048_000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 1024];
+        let output = r.process(&input);
+        assert_eq!(output.len(), 1024);
+    }
+
+    #[test]
+    fn test_multistage_half() {
+        // 4.096 MHz → 2.048 MHz (2:1 averaging)
+        let mut r = MultiStageResampler::new(4_096_000, 2_048_000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 1024];
+        let output = r.process(&input);
+        assert_eq!(output.len(), 512);
+    }
+
+    #[test]
+    fn test_multistage_direct() {
+        // 2.4 MHz → 2.048 MHz (polyphase resample)
+        let mut r = MultiStageResampler::new(2_400_000, 2_048_000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 2400];
+        let output = r.process(&input);
+        let expected = (2400.0 * 2_048_000.0 / 2_400_000.0) as usize;
+        assert!(
+            output.len().abs_diff(expected) < 200,
+            "Expected ~{}, got {}",
+            expected,
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_multistage_high_ratio() {
+        // 6.144 MHz → 2.048 MHz (3:1 via multi-stage)
+        let mut r = MultiStageResampler::new(6_144_000, 2_048_000).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 6144];
+        let output = r.process(&input);
+        let expected = (6144.0 * 2_048_000.0 / 6_144_000.0) as usize;
+        assert!(
+            output.len().abs_diff(expected) < 300,
+            "Expected ~{}, got {}",
+            expected,
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_multistage_zero_rate() {
+        assert!(MultiStageResampler::new(0, 48000).is_err());
+        assert!(MultiStageResampler::new(48000, 0).is_err());
+    }
+
+    #[test]
+    fn test_multistage_empty_input() {
+        let mut r = MultiStageResampler::new(4_096_000, 2_048_000).unwrap();
+        assert!(r.process(&[]).is_empty());
+    }
 }

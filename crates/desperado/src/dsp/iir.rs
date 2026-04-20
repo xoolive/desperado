@@ -23,6 +23,37 @@
 
 use biquad::*;
 
+/// Apply zero-phase (forward + backward) filtering with the given biquad coefficients.
+///
+/// The filter is applied `passes` times forward, then the signal is reversed
+/// and filtered `passes` times backward, then reversed again. This eliminates
+/// phase distortion and doubles the effective filter order.
+fn filtfilt_core(x: &[f64], coeffs: Coefficients<f64>, passes: usize) -> Vec<f64> {
+    // Forward pass
+    let mut y = x.to_vec();
+    for _ in 0..passes {
+        let mut df1 = DirectForm1::<f64>::new(coeffs);
+        for sample in y.iter_mut() {
+            *sample = df1.run(*sample);
+        }
+    }
+
+    // Reverse
+    y.reverse();
+
+    // Backward pass
+    for _ in 0..passes {
+        let mut df1 = DirectForm1::<f64>::new(coeffs);
+        for sample in y.iter_mut() {
+            *sample = df1.run(*sample);
+        }
+    }
+
+    // Reverse back
+    y.reverse();
+    y
+}
+
 /// Apply zero-phase filtering (forward + backward pass) using Butterworth low-pass IIR filter.
 ///
 /// Zero-phase filtering applies the filter twice (forward and backward) to eliminate
@@ -49,44 +80,14 @@ use biquad::*;
 /// assert_eq!(filtered.len(), signal.len());
 /// ```
 pub fn filtfilt_lowpass(x: &[f64], cutoff: f64, fs: f64, order: usize) -> Vec<f64> {
-    // For order N Butterworth, we need N/2 cascaded biquads (for even order)
-    // The biquad crate provides Q values for proper Butterworth response
-
     let hz = cutoff.hz();
     let sample_rate = fs.hz();
 
-    // For zero-phase filtering, we apply the filter twice (forward + backward)
-    // This doubles the filter order, so we use order/2 for each pass
     let coeffs =
         Coefficients::<f64>::from_params(Type::LowPass, sample_rate, hz, Q_BUTTERWORTH_F64)
             .unwrap();
 
-    // Forward pass
-    let mut directform1 = DirectForm1::<f64>::new(coeffs);
-    let mut y: Vec<f64> = x.iter().map(|&sample| directform1.run(sample)).collect();
-
-    // Apply order/2 times for proper order
-    for _ in 1..order.div_ceil(2) {
-        let mut directform1 = DirectForm1::<f64>::new(coeffs);
-        y = y.iter().map(|&sample| directform1.run(sample)).collect();
-    }
-
-    // Reverse
-    y.reverse();
-
-    // Backward pass (same number of biquads)
-    let mut directform1 = DirectForm1::<f64>::new(coeffs);
-    y = y.iter().map(|&sample| directform1.run(sample)).collect();
-
-    for _ in 1..order.div_ceil(2) {
-        let mut directform1 = DirectForm1::<f64>::new(coeffs);
-        y = y.iter().map(|&sample| directform1.run(sample)).collect();
-    }
-
-    // Reverse back
-    y.reverse();
-
-    y
+    filtfilt_core(x, coeffs, order.div_ceil(2))
 }
 
 /// Apply zero-phase filtering for bandpass IIR filter.
@@ -125,30 +126,67 @@ pub fn filtfilt_bandpass(x: &[f64], lowcut: f64, highcut: f64, fs: f64, order: u
 
     let coeffs = Coefficients::<f64>::from_params(Type::BandPass, sample_rate, hz, q).unwrap();
 
-    // Forward pass
-    let mut directform1 = DirectForm1::<f64>::new(coeffs);
-    let mut y: Vec<f64> = x.iter().map(|&sample| directform1.run(sample)).collect();
+    filtfilt_core(x, coeffs, order.div_ceil(2))
+}
 
-    // Apply order/2 times
-    for _ in 1..order.div_ceil(2) {
-        let mut directform1 = DirectForm1::<f64>::new(coeffs);
-        y = y.iter().map(|&sample| directform1.run(sample)).collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filtfilt_lowpass_length() {
+        let signal = vec![1.0; 100];
+        let filtered = filtfilt_lowpass(&signal, 100.0, 1000.0, 2);
+        assert_eq!(filtered.len(), 100);
     }
 
-    // Reverse
-    y.reverse();
-
-    // Backward pass
-    let mut directform1 = DirectForm1::<f64>::new(coeffs);
-    y = y.iter().map(|&sample| directform1.run(sample)).collect();
-
-    for _ in 1..order.div_ceil(2) {
-        let mut directform1 = DirectForm1::<f64>::new(coeffs);
-        y = y.iter().map(|&sample| directform1.run(sample)).collect();
+    #[test]
+    fn test_filtfilt_lowpass_dc_passthrough() {
+        // DC signal should pass through a low-pass filter unchanged
+        let signal = vec![1.0; 1000];
+        let filtered = filtfilt_lowpass(&signal, 100.0, 1000.0, 4);
+        // Check interior samples (away from edges)
+        for &v in &filtered[100..900] {
+            assert!((v - 1.0).abs() < 0.05, "DC passthrough failed: {}", v);
+        }
     }
 
-    // Reverse back
-    y.reverse();
+    #[test]
+    fn test_filtfilt_bandpass_length() {
+        let signal = vec![0.5; 100];
+        let filtered = filtfilt_bandpass(&signal, 100.0, 200.0, 1000.0, 2);
+        assert_eq!(filtered.len(), 100);
+    }
 
-    y
+    #[test]
+    fn test_filtfilt_bandpass_rejects_dc() {
+        // DC signal should be rejected by a bandpass filter
+        let signal = vec![1.0; 1000];
+        let filtered = filtfilt_bandpass(&signal, 100.0, 200.0, 1000.0, 4);
+        // Interior samples should be near zero
+        for &v in &filtered[200..800] {
+            assert!(v.abs() < 0.1, "DC should be rejected: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_filtfilt_zero_phase() {
+        // Zero-phase filtering should produce no group delay.
+        // Create an impulse and verify the peak stays at the same position.
+        let mut signal = vec![0.0; 500];
+        signal[250] = 1.0;
+        let filtered = filtfilt_lowpass(&signal, 100.0, 1000.0, 2);
+        // Peak should be at or very near index 250
+        let peak_idx = filtered
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            (peak_idx as i64 - 250).abs() <= 1,
+            "Peak shifted to {}, expected ~250",
+            peak_idx
+        );
+    }
 }

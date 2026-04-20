@@ -1,14 +1,14 @@
 //! Streaming buffer abstraction for DSP processing.
 //!
-//! This module provides a [`StreamBuffer<T>`] that efficiently manages
+//! This module provides a `StreamBuffer<T>` that efficiently manages
 //! sample accumulation and consumption patterns common in DSP pipelines.
 //!
 //! # Pattern
 //!
 //! The streaming buffer follows a simple lifecycle:
-//! 1. **Accumulate**: Push samples via [`push_slice()`](StreamBuffer::push_slice)
+//! 1. **Accumulate**: Push samples via `push_slice()`
 //! 2. **Process**: Access accumulated samples via indexing
-//! 3. **Consume**: Remove processed samples via [`consume()`](StreamBuffer::consume)
+//! 3. **Consume**: Remove processed samples via `consume()`
 //!
 //! This pattern avoids frequent allocations by reusing buffer capacity.
 //!

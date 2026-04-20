@@ -1,8 +1,8 @@
 //! Digital filter implementations.
 //!
 //! This module provides various digital filter implementations for signal processing:
-//! - [`LowPassFir`]: Finite Impulse Response (FIR) low-pass filter
-//! - [`ButterworthFilter`]: Butterworth IIR filter (low-pass and bandpass)
+//! - `LowPassFir`: Finite Impulse Response (FIR) low-pass filter
+//! - `ButterworthFilter`: Butterworth IIR filter (low-pass and bandpass)
 //!
 //! # Example
 //!
@@ -407,13 +407,14 @@ impl StatefulLowPassFir {
     }
 }
 
-/// Butterworth filter for low-pass and bandpass filtering.
+/// FIR-based filter with low-pass and bandpass modes.
 ///
-/// Implements a Butterworth filter using FIR coefficients derived from a low-pass
-/// prototype. Supports both real and complex signal filtering.
+/// Despite the name, this filter uses windowed-sinc FIR coefficients (from [`LowPassFir`])
+/// with a circular buffer state for stateful streaming. It does **not** implement a true
+/// IIR Butterworth transfer function. The `order` parameter controls the filter length
+/// (more taps = sharper transition) rather than IIR pole count.
 ///
-/// The filter operates as a simple FIR filter with a circular buffer state,
-/// suitable for real-time processing of scalar and complex samples.
+/// For true IIR Butterworth zero-phase filtering, see [`super::iir::filtfilt_lowpass`].
 ///
 /// # Example
 ///

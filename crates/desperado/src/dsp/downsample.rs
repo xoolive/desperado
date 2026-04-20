@@ -8,6 +8,7 @@ pub struct EveryN {
 }
 
 impl EveryN {
+    /// Create a new downsampler that keeps every `factor`-th sample.
     pub fn new(factor: u32) -> Self {
         assert!(factor > 0, "downsample factor must be > 0");
         Self { factor, counter: 0 }
@@ -24,6 +25,7 @@ impl EveryN {
         true
     }
 
+    /// Reset the internal counter so the next sample is kept.
     pub fn reset(&mut self) {
         self.counter = 0;
     }
@@ -41,5 +43,28 @@ mod tests {
             keeps,
             vec![false, false, true, false, false, true, false, false, true]
         );
+    }
+
+    #[test]
+    fn factor_one_keeps_all() {
+        let mut d = EveryN::new(1);
+        assert!((0..5).all(|_| d.keep()));
+    }
+
+    #[test]
+    fn reset_restarts_counter() {
+        let mut d = EveryN::new(3);
+        d.keep(); // 1
+        d.keep(); // 2
+        d.reset();
+        // After reset, counter is 0, so next keep() sequence restarts
+        let keeps: Vec<bool> = (0..3).map(|_| d.keep()).collect();
+        assert_eq!(keeps, vec![false, false, true]);
+    }
+
+    #[test]
+    #[should_panic(expected = "downsample factor must be > 0")]
+    fn factor_zero_panics() {
+        let _ = EveryN::new(0);
     }
 }

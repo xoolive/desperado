@@ -48,6 +48,41 @@ pub fn compute_window(n: usize, taps: usize, window_type: WindowType) -> f32 {
     }
 }
 
+/// Compute a window value for the given tap index (f64 precision).
+///
+/// Identical to [`compute_window`] but returns `f64` for applications that
+/// require higher precision (e.g., polyphase kernel construction).
+///
+/// # Arguments
+/// * `n` - Tap index (0 to taps-1)
+/// * `taps` - Total number of taps
+/// * `window_type` - Type of window to compute
+pub fn compute_window_f64(n: usize, taps: usize, window_type: WindowType) -> f64 {
+    let normalized_n = n as f64 / (taps as f64 - 1.0);
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    match window_type {
+        WindowType::Hamming => 0.54 - 0.46 * (two_pi * normalized_n).cos(),
+        WindowType::Blackman => {
+            0.42 - 0.5 * (two_pi * normalized_n).cos() + 0.08 * (2.0 * two_pi * normalized_n).cos()
+        }
+        WindowType::Hann => 0.5 - 0.5 * (two_pi * normalized_n).cos(),
+    }
+}
+
+/// Normalized sinc function: sinc(x) = sin(πx) / (πx), with sinc(0) = 1.
+///
+/// This is the standard normalized sinc used in windowed-sinc filter design
+/// and polyphase resampler kernel construction.
+pub fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
 /// Normalize filter coefficients to unity gain (sum of coefficients = 1.0).
 ///
 /// This is typically applied after windowing and sinc computation to ensure
@@ -101,17 +136,11 @@ pub fn design_fir_filter(cutoff: f32, taps: usize, window_type: WindowType) -> V
     // Design windowed-sinc filter
     for n in 0..taps {
         let x = n as isize - mid;
-
-        // Sinc function: sinc(x) = sin(πx) / (πx), with sinc(0) = 1
-        let sinc = if x == 0 {
-            2.0 * cutoff
-        } else {
-            (2.0 * cutoff * PI * x as f32).sin() / (PI * x as f32)
-        };
+        let h = 2.0 * cutoff as f64 * sinc(2.0 * cutoff as f64 * x as f64);
 
         // Apply window
         let window = compute_window(n, taps, window_type);
-        fir.push(sinc * window);
+        fir.push(h as f32 * window);
     }
 
     // Normalize to unity gain
@@ -223,5 +252,39 @@ mod tests {
     #[should_panic(expected = "Number of taps must be greater than 0")]
     fn test_design_fir_zero_taps() {
         design_fir_filter(0.125, 0, WindowType::Hamming);
+    }
+
+    #[test]
+    fn test_compute_window_f64_matches_f32() {
+        // f64 version should match f32 version within f32 precision
+        for &wtype in &[WindowType::Hamming, WindowType::Blackman, WindowType::Hann] {
+            for n in 0..31 {
+                let f32_val = compute_window(n, 31, wtype);
+                let f64_val = compute_window_f64(n, 31, wtype);
+                assert_relative_eq!(f32_val as f64, f64_val, epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sinc_at_zero() {
+        assert_relative_eq!(sinc(0.0), 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_sinc_at_integers() {
+        // sinc(n) = 0 for non-zero integers
+        for n in 1..10 {
+            assert_relative_eq!(sinc(n as f64), 0.0, epsilon = 1e-12);
+            assert_relative_eq!(sinc(-(n as f64)), 0.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_sinc_symmetry() {
+        // sinc is an even function
+        for &x in &[0.1, 0.5, 1.5, 3.7] {
+            assert_relative_eq!(sinc(x), sinc(-x), epsilon = 1e-12);
+        }
     }
 }

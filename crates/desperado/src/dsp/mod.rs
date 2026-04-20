@@ -1,97 +1,98 @@
-/// Digital Signal Processing (DSP) module.
-///
-/// This module provides core DSP building blocks and traits for processing
-/// streams of complex-valued and real-valued samples, commonly used in
-/// software-defined radio (SDR) and digital signal analysis applications.
-///
-/// # Overview
-///
-/// The DSP module is organized into specialized submodules, each providing
-/// specific signal processing functionality. These modules can be combined
-/// to create complete signal processing pipelines for applications like
-/// FM demodulation, frequency analysis, and real-time audio streaming.
-///
-/// ## DSP Pipeline Example
-///
-/// A typical FM radio demodulation pipeline might look like:
-///
-/// ```text
-/// I/Q Samples → Rotate → Decimator → AFC → Phase Extractor → LowPass Filter → Deemphasis → Audio
-///                  ↓         ↓          ↓          ↓               ↓              ↓
-///              Freq Shift  Downsample  Freq Corr  FM Demod      Audio Filter   De-emphasis
-/// ```
-///
-/// # Modules
-///
-/// ## Signal Manipulation
-/// - [`rotate`]: Complex rotation for frequency shifting and offset correction
-/// - [`decimator`]: Sample rate reduction with anti-aliasing filtering
-/// - [`filters`]: Digital filter implementations (FIR low-pass, Butterworth, etc.)
-/// - [`iir`]: IIR Butterworth filters with zero-phase filtering (filtfilt)
-/// - [`window`]: Window functions for filter design (Hamming, Blackman, Hann)
-/// - [`buffer`]: Streaming buffer for sample accumulation and consumption
-///
-/// ## Carrier and Timing Recovery
-/// - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
-/// - [`symsync`]: Polyphase Symbol Synchronizer for timing recovery
-/// - [`pll_filter`]: Reusable second-order PLL loop filter (used by nco and symsync)
-/// - [`agc`]: Automatic Gain Control for amplitude normalization
-///
-/// ## Advanced Features
-/// - [`afc`]: Automatic Frequency Control for frequency offset correction
-///
-/// Note: FM demodulation (phase extraction, de-emphasis), RDS decoding,
-/// and adaptive resampling have been moved to the `fmradio` crate for better modularity.
-///
-/// # Traits
-///
-/// - [`DspBlock`]: A trait representing a generic DSP processing block that
-///   operates on slices of complex samples and produces complex output.
-///
-/// # Feature Flags
-///
-/// None currently. Adaptive resampling has been moved to the `fmradio` crate.
-///
-/// # Examples
-///
-/// ## Basic Frequency Shifting
-///
-/// ```
-/// use desperado::dsp::{DspBlock, rotate::Rotate};
-/// use num_complex::Complex;
-/// use std::f32::consts::PI;
-///
-/// // Shift frequency by 200 kHz at 2 MHz sample rate
-/// let sample_rate = 2_000_000.0;
-/// let freq_offset = 200_000.0;
-/// let angle = -2.0 * PI * freq_offset / sample_rate;
-///
-/// let mut rotator = Rotate::new(angle);
-/// let samples = vec![Complex::new(1.0, 0.0); 100];
-/// let shifted = rotator.process(&samples);
-/// ```
-///
-/// # Performance Considerations
-///
-/// - **Decimation**: Use decimation early in the pipeline to reduce computational load
-/// - **Filter Length**: Longer FIR filters provide better frequency response but cost more CPU
-/// - **Batch Processing**: Process larger chunks of samples for better throughput
-/// - **Feature Flags**: Only enable features you need to minimize dependencies
-///
-/// # Thread Safety
-///
-/// DSP blocks maintain internal state and are **not** thread-safe. Each thread should
-/// have its own instance of DSP blocks. For parallel processing, create separate instances
-/// per thread or use synchronization primitives.
+//! Digital Signal Processing (DSP) module.
+//!
+//! This module provides core DSP building blocks and traits for processing
+//! streams of complex-valued and real-valued samples, commonly used in
+//! software-defined radio (SDR) and digital signal analysis applications.
+//!
+//! # Overview
+//!
+//! The DSP module is organized into specialized submodules, each providing
+//! specific signal processing functionality. These modules can be combined
+//! to create complete signal processing pipelines for applications like
+//! FM demodulation, frequency analysis, and real-time audio streaming.
+//!
+//! ## DSP Pipeline Example
+//!
+//! A typical FM radio demodulation pipeline might look like:
+//!
+//! ```text
+//! I/Q Samples → Rotate → Decimator → AFC → Phase Extractor → LowPass Filter → Deemphasis → Audio
+//!                  ↓         ↓          ↓          ↓               ↓              ↓
+//!              Freq Shift  Downsample  Freq Corr  FM Demod      Audio Filter   De-emphasis
+//! ```
+//!
+//! # Modules
+//!
+//! ## Signal Manipulation
+//! - [`rotate`]: Complex rotation for frequency shifting and offset correction
+//! - [`decimator`]: Sample rate reduction with anti-aliasing filtering
+//! - [`filters`]: Digital filter implementations (FIR low-pass, Butterworth, etc.)
+//! - [`iir`]: IIR Butterworth filters with zero-phase filtering (filtfilt)
+//! - [`window`]: Window functions for filter design (Hamming, Blackman, Hann)
+//! - [`buffer`]: Streaming buffer for sample accumulation and consumption
+//!
+//! ## Carrier and Timing Recovery
+//! - [`nco`]: Numerically Controlled Oscillator with Phase-Locked Loop (PLL)
+//! - [`symsync`]: Polyphase Symbol Synchronizer for timing recovery
+//! - [`pll_filter`]: Reusable second-order PLL loop filter (used by nco and symsync)
+//! - [`agc`]: Automatic Gain Control for amplitude normalization
+//!
+//! ## Advanced Features
+//! - [`afc`]: Automatic Frequency Control for frequency offset correction
+//!
+//! Note: FM demodulation (phase extraction, de-emphasis), RDS decoding,
+//! and adaptive resampling have been moved to the `fmradio` crate for better modularity.
+//!
+//! # Traits
+//!
+//! - [`DspBlock`]: A trait representing a generic DSP processing block that
+//!   operates on slices of complex samples and produces complex output.
+//!
+//! # Feature Flags
+//!
+//! None currently. Adaptive resampling has been moved to the `fmradio` crate.
+//!
+//! # Examples
+//!
+//! ## Basic Frequency Shifting
+//!
+//! ```
+//! use desperado::dsp::{DspBlock, rotate::Rotate};
+//! use num_complex::Complex;
+//! use std::f32::consts::PI;
+//!
+//! // Shift frequency by 200 kHz at 2 MHz sample rate
+//! let sample_rate = 2_000_000.0;
+//! let freq_offset = 200_000.0;
+//! let angle = -2.0 * PI * freq_offset / sample_rate;
+//!
+//! let mut rotator = Rotate::new(angle);
+//! let samples = vec![Complex::new(1.0, 0.0); 100];
+//! let shifted = rotator.process(&samples);
+//! ```
+//!
+//! # Performance Considerations
+//!
+//! - **Decimation**: Use decimation early in the pipeline to reduce computational load
+//! - **Filter Length**: Longer FIR filters provide better frequency response but cost more CPU
+//! - **Batch Processing**: Process larger chunks of samples for better throughput
+//! - **Feature Flags**: Only enable features you need to minimize dependencies
+//!
+//! # Thread Safety
+//!
+//! DSP blocks maintain internal state and are **not** thread-safe. Each thread should
+//! have its own instance of DSP blocks. For parallel processing, create separate instances
+//! per thread or use synchronization primitives.
 use num_complex::Complex;
 
 pub mod afc;
 pub mod agc;
 pub mod buffer;
+/// 2-pole Chebyshev Type-I low-pass IIR filter.
 pub mod chebyshev;
-#[cfg(feature = "resampler")]
-pub mod dab_resampler;
+/// Integer decimator with anti-aliasing FIR filter.
 pub mod decimator;
+/// Stateless integer downsampler (every-Nth sample).
 pub mod downsample;
 pub mod filters;
 pub mod iir;
@@ -99,9 +100,9 @@ pub mod nco;
 pub mod pll_filter;
 #[cfg(feature = "resampler")]
 pub mod resampler;
+/// Complex rotation (frequency shifting) DSP block.
 pub mod rotate;
 pub mod symsync;
-pub mod voracious;
 pub mod window;
 
 /// Trait for DSP blocks that process complex-valued signals.

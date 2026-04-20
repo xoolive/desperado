@@ -46,6 +46,7 @@ The binary will be at `target/release/dabradio`.
 ```
 
 Output:
+
 ```
 Ensemble: Métropolitain 2 (EId: 0xF044)
 
@@ -112,6 +113,7 @@ If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from
 ```
 
 **Output example:**
+
 ```
 $ ls -lah /tmp/fip_slides/
 -rw-r--r-- 1 user user 14279 slide_001.jpg  (JPEG 320×240)
@@ -241,7 +243,9 @@ All 45 unit tests pass (2 require external test fixtures and are ignored). 0 cli
 ## IQ Format Support
 
 ### cu8 (Unsigned 8-bit I/Q) — Default
+
 Used by RTL-SDR and most software radios.
+
 ```
 Bytes per sample: 2 (I byte, Q byte)
 Value range: 0-255 → normalized to [-1, +1]
@@ -249,7 +253,9 @@ Conversion: (byte - 127.5) / 128.0
 ```
 
 ### cf32 (Complex 32-bit float)
+
 Used by gqrx, USRP, and advanced SDRs.
+
 ```
 Bytes per sample: 8 (I float, Q float)
 Value range: as-is (typically [-1, +1])
@@ -257,6 +263,7 @@ Conversion: direct from IEEE 754 f32 bytes
 ```
 
 ### cs8, cs16
+
 Signed 8-bit and 16-bit I/Q formats. Specify with `--format cs8` or `--format cs16`.
 
 ## Supported DAB Channels
@@ -296,6 +303,7 @@ RUST_LOG=trace ./target/release/dabradio recording.cu8 --channel 12A --max-frame
 ```
 
 Key debug output:
+
 - `PRS correlation failed, re-acquiring sync` — frame alignment recovery in progress
 - `DAB+ audio configured` — audio pipeline ready
 - `Fire code sync acquired` — superframe boundary found
@@ -303,20 +311,18 @@ Key debug output:
 ## Dependencies
 
 Core:
+
 - **rustfft** — FFT for OFDM processing
 - **fdk-aac** — AAC audio decoding
 - **reed-solomon** — Forward error correction
 - **tinyaudio** — Cross-platform audio output
 
 Utilities:
+
 - **clap** — command-line parsing
 - **serde/serde_json** — JSON output
 - **tracing** — structured logging
 - **crossbeam-channel** — lock-free audio buffering
-
-## License
-
-See `LICENSE` in the workspace root.
 
 ## References
 
@@ -329,13 +335,8 @@ See `LICENSE` in the workspace root.
 Contributions welcome! Areas for enhancement:
 
 - [ ] Multiplex multiple services in a single run
-- [ ] Real-time recording from SDRs (SoapySDR/Airspy)
+- [ ] Real-time recording from SDRs
 - [ ] TII (Transmitter Identification Information) decoder for SFN detection
 - [ ] WebAssembly/browser decoder
 - [ ] Ensemble metadata export (RSID/PI-code)
 - [ ] JSON output for metadata and MOT images
-
----
-
-**Last updated:** March 2026  
-**Status:** Production-ready, actively maintained

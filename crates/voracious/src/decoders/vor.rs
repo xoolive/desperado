@@ -195,9 +195,9 @@ pub const MODULATION_DEPTH_MIN: f64 = 1e-9;
 
 use super::metrics;
 use super::morse;
+use crate::dsp_utils::{envelope, hilbert_transform};
 use desperado::dsp::filters::ButterworthFilter;
 use desperado::dsp::iir::filtfilt_lowpass;
-use desperado::dsp::voracious::{envelope, hilbert_transform};
 
 /// Sample rate constants for VOR decoding
 pub const VOR_SAMPLE_RATE_1_8M: u32 = 1_800_000;

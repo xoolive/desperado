@@ -1,7 +1,7 @@
-//! Shared DSP utilities for radio navigation decoders (voracious).
+//! Shared DSP utilities for radio navigation decoders.
 //!
-//! This module provides common signal processing functions used across
-//! VOR, ILS, and other radio beacon decoders to avoid code duplication.
+//! Provides common signal processing functions (Hilbert transform, envelope
+//! extraction, decimation) used across VOR, ILS, and other beacon decoders.
 
 use num_complex::Complex;
 use rustfft::FftPlanner;

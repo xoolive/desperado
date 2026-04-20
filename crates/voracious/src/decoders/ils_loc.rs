@@ -184,9 +184,9 @@ use std::f64::consts::PI;
 
 use super::error::{Error, IlsDdmResult, Result};
 use super::morse;
+use crate::dsp_utils::{envelope, hilbert_transform};
 use desperado::dsp::filters::ButterworthFilter;
 use desperado::dsp::iir::{filtfilt_bandpass, filtfilt_lowpass};
-use desperado::dsp::voracious::{envelope, hilbert_transform};
 
 /// Sample rate constants for ILS decoding
 pub const ILS_SAMPLE_RATE_1_8M: u32 = 1_800_000;

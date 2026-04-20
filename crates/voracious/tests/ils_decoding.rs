@@ -37,9 +37,9 @@
 //! | Audio rate          | 9000 Hz (decimate 200×)            |
 //! | Recording duration  | ≈ 5.8 s                            |
 
-use desperado::dsp::voracious::hilbert_transform;
 use std::path::Path;
 use voracious::decoders::ils_loc::{IlsLocalizerDemodulator, IlsSide, compute_ddm};
+use voracious::dsp_utils::hilbert_transform;
 
 const ILS_AUDIO_RATE: f64 = 9_000.0;
 const ILS_STEM: &str = "gqrx_20251107_215806_110700000_1800000_fc_ils";

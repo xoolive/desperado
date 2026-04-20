@@ -1,3 +1,14 @@
+//! RF signal quality metrics computed from IQ samples.
+//!
+//! This module provides tools for monitoring and evaluating the quality of
+//! received RF signals in real time. It computes metrics such as signal level
+//! (dBFS), clipping ratio, DC offset, and I/Q imbalance from raw IQ sample
+//! streams.
+//!
+//! The main entry point is [`RfMetricsCalculator`], which accepts successive
+//! chunks of IQ samples and emits [`RfMetrics`] snapshots at a configurable
+//! rate, using a sliding window for smoothing.
+
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
