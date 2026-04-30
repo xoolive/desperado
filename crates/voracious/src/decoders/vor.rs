@@ -386,7 +386,7 @@ impl VorDemodulator {
 
         let mut prev_ref_phase = self.last_ref_phase.unwrap_or_else(|| {
             if !ref_analytic.is_empty() {
-                ref_analytic[0].arg() as f64
+                ref_analytic[0].arg()
             } else {
                 0.0
             }

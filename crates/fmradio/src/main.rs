@@ -707,6 +707,7 @@ fn ensure_tuning_query(
     let has_freq = uri.contains("freq=") || uri.contains("frequency=");
     let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
     let has_gain = uri.contains("gain=");
+    let has_amp = uri.contains("amp=") || uri.contains("amp_enable=");
 
     let mut out = uri.to_string();
     if !has_query {
@@ -759,6 +760,13 @@ fn ensure_tuning_query(
             out.push_str("gain=72");
             effective_gain = Some(72.0);
         }
+    }
+
+    if uri.starts_with("hackrf://") && !has_amp {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str("amp=true");
     }
 
     (out, effective_gain)
@@ -1461,4 +1469,32 @@ fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
         }
     }
     steps.first().copied().unwrap_or(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hackrf_default_uri_enables_rf_amp() {
+        let (uri, effective_gain) = ensure_tuning_query("hackrf://", 101_000_000, 2_000_000, None);
+
+        assert_eq!(
+            uri,
+            "hackrf://?freq=101000000&rate=2000000&gain=72&amp=true"
+        );
+        assert_eq!(effective_gain, Some(72.0));
+    }
+
+    #[test]
+    fn hackrf_explicit_amp_is_preserved() {
+        let (uri, effective_gain) =
+            ensure_tuning_query("hackrf://?amp=false", 101_000_000, 2_000_000, None);
+
+        assert_eq!(
+            uri,
+            "hackrf://?amp=false&freq=101000000&rate=2000000&gain=72"
+        );
+        assert_eq!(effective_gain, Some(72.0));
+    }
 }

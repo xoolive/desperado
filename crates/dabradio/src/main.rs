@@ -1474,11 +1474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let sf_decoded = dab_dec.superframe.superframes_decoded;
                                     let sf_fc_fail = dab_dec.superframe.fire_code_failures;
                                     let sf_rs_err = dab_dec.superframe.rs_errors;
-                                    let sf_ok_pct = if sf_attempted > 0 {
-                                        sf_decoded * 100 / sf_attempted
-                                    } else {
-                                        0
-                                    };
+                                    let sf_ok_pct = sf_decoded
+                                        .saturating_mul(100)
+                                        .checked_div(sf_attempted)
+                                        .unwrap_or(0);
                                     debug!(target: "dabradio::audio_pipeline",
                                         queue_fill = tx.len(),
                                         queue_capacity = tx.capacity().unwrap_or(0),
@@ -1747,6 +1746,7 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> (Str
     let has_rate = uri.contains("rate=") || uri.contains("sample_rate=");
     let has_gain = uri.contains("gain=");
     let has_gain_mode = uri.contains("gain_mode=") || uri.contains("gain-mode=");
+    let has_amp = uri.contains("amp=") || uri.contains("amp_enable=");
 
     let mut out = uri.to_string();
     if !has_query {
@@ -1792,12 +1792,20 @@ fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> (Str
         out.push_str("gain=29.7");
     }
 
-    // For HackRF devices, default to gain=72 for balanced reception
-    if uri.starts_with("hackrf://") && !has_gain {
-        if !out.ends_with('?') && !out.ends_with('&') {
-            out.push('&');
+    // For HackRF devices, default to gain=72 and enable the RF amp for reception.
+    if uri.starts_with("hackrf://") {
+        if !has_gain {
+            if !out.ends_with('?') && !out.ends_with('&') {
+                out.push('&');
+            }
+            out.push_str("gain=72");
         }
-        out.push_str("gain=72");
+        if !has_amp {
+            if !out.ends_with('?') && !out.ends_with('&') {
+                out.push('&');
+            }
+            out.push_str("amp=true");
+        }
     }
 
     // Extract effective gain from the final URI
@@ -2077,4 +2085,32 @@ fn restart_audio_server() {
     eprintln!(
         "Could not restart audio server automatically. Try: systemctl --user restart pipewire wireplumber pipewire-pulse"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hackrf_default_uri_enables_rf_amp() {
+        let (uri, effective_gain) = ensure_tuning_query("hackrf://", 223_936_000, 2_048_000);
+
+        assert_eq!(
+            uri,
+            "hackrf://?freq=223936000&rate=2048000&gain=72&amp=true"
+        );
+        assert_eq!(effective_gain, Some(72.0));
+    }
+
+    #[test]
+    fn hackrf_explicit_amp_is_preserved() {
+        let (uri, effective_gain) =
+            ensure_tuning_query("hackrf://?amp=false", 223_936_000, 2_048_000);
+
+        assert_eq!(
+            uri,
+            "hackrf://?amp=false&freq=223936000&rate=2048000&gain=72"
+        );
+        assert_eq!(effective_gain, Some(72.0));
+    }
 }

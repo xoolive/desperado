@@ -189,10 +189,8 @@ impl SingleStageResampler {
 
             let coeffs = &self.kernel[phase * self.taps..(phase + 1) * self.taps];
             let mut acc = Complex::new(0.0f32, 0.0f32);
-            let mut idx = start as usize;
-            for c in coeffs {
+            for (idx, c) in (start as usize..).zip(coeffs.iter()) {
                 acc += self.buffer[idx] * *c;
-                idx += 1;
             }
 
             output.push(acc);

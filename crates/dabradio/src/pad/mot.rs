@@ -222,20 +222,15 @@ impl MotObject {
 
             // Process parameter
             match param_id {
-                0x05 => {
+                0x05 if data_len >= 4 => {
                     // TriggerTime
-                    if data_len >= 4 {
-                        self.result_file.trigger_time_now = data[offset] & 0x80 == 0;
-                    }
+                    self.result_file.trigger_time_now = data[offset] & 0x80 == 0;
                 }
-                0x0C => {
+                0x0C if data_len > 0 => {
                     // ContentName
-                    if data_len > 0 {
-                        let charset = data[offset] >> 4;
-                        let name_bytes = &data[offset + 1..offset + data_len];
-                        self.result_file.content_name =
-                            Some(decode_mot_string(name_bytes, charset));
-                    }
+                    let charset = data[offset] >> 4;
+                    let name_bytes = &data[offset + 1..offset + data_len];
+                    self.result_file.content_name = Some(decode_mot_string(name_bytes, charset));
                 }
                 0x26 => {
                     // CategoryTitle (already UTF-8)

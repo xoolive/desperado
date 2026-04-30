@@ -252,16 +252,19 @@ static MAX2837_BANDWIDTHS: &[u32] = &[
 
 /// Compute the best baseband filter bandwidth for a given target bandwidth.
 ///
-/// Returns the smallest valid MAX2837 bandwidth that is >= the target.
-/// Reference: hackrf.c `hackrf_compute_baseband_filter_bw()`
+/// Returns the largest valid MAX2837 bandwidth that is <= the target, except
+/// below the minimum supported bandwidth where the minimum is returned. This
+/// matches libhackrf's `hackrf_compute_baseband_filter_bw()` behavior.
 pub fn compute_baseband_filter_bw(bandwidth_hz: u32) -> u32 {
+    let mut previous = MAX2837_BANDWIDTHS[0];
     for &bw in MAX2837_BANDWIDTHS {
         if bw >= bandwidth_hz {
-            return bw;
+            return if bw == bandwidth_hz { bw } else { previous };
         }
+        previous = bw;
     }
-    // If requested bandwidth exceeds all valid values, return the largest
-    MAX2837_BANDWIDTHS[MAX2837_BANDWIDTHS.len() - 1]
+    // If requested bandwidth exceeds all valid values, return the largest.
+    previous
 }
 
 // ─── Platform Flags ───────────────────────────────────────────────────────────
@@ -733,10 +736,9 @@ impl HackRf {
             )));
         }
 
-        // Set transceiver to receive mode (but don't open the endpoint here —
-        // the streaming thread will open it via the cloned iface)
-        self.set_transceiver_mode(TRANSCEIVER_MODE_RECEIVE)?;
-        tracing::info!("HackRF RX mode enabled for streaming");
+        // The streaming thread opens the endpoint and queues transfers before
+        // enabling RX. Starting RX before any USB reads are pending can overflow
+        // the HackRF FIFO and drop initial samples.
 
         // Bounded channel for sample delivery (backpressure-aware)
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(num_transfers * 4);
@@ -929,12 +931,23 @@ fn streaming_thread(
         return;
     };
 
-    // Pre-fill the queue with N transfers — all are in-flight simultaneously
+    // Pre-fill the queue with N transfers before enabling RX so the device has
+    // host-side reads ready as soon as samples start flowing.
     for _ in 0..num_transfers {
         ep_in.submit(Buffer::new(transfer_size));
     }
 
     tracing::debug!("submitted {} initial transfers", num_transfers);
+
+    if let Err(e) = dev.set_transceiver_mode(TRANSCEIVER_MODE_RECEIVE) {
+        tracing::warn!("failed to enable HackRF RX mode: {}", e);
+        ep_in.cancel_all();
+        while ep_in.pending() > 0 {
+            let _ = ep_in.wait_next_complete(Duration::from_millis(100));
+        }
+        return;
+    }
+    tracing::info!("HackRF RX mode enabled for streaming");
 
     // Consecutive transfer error counter for disconnect detection
     const MAX_CONSECUTIVE_ERRORS: u32 = 5;
@@ -1017,10 +1030,16 @@ fn streaming_thread(
             continue;
         }
 
+        // Re-submit a new transfer before handing the completed buffer to the
+        // consumer. This keeps the USB queue full even if downstream DSP blocks
+        // briefly while receiving this chunk.
+        ep_in.submit(Buffer::new(transfer_size));
+
         // 4. Send data to the consumer (blocking — provides backpressure).
-        // IMPORTANT: We use blocking send here to provide backpressure.
-        // Never use try_send in real-time signal processing pipelines —
-        // dropped samples corrupt protocol framing.
+        // IMPORTANT: We use blocking send here to avoid silently dropping chunks;
+        // dropped samples corrupt protocol framing. The transfer has already been
+        // re-submitted above, so short consumer stalls do not immediately drain
+        // the HackRF USB queue.
         match tx.send(Ok(data)) {
             Ok(()) => {}
             Err(_) => {
@@ -1029,9 +1048,6 @@ fn streaming_thread(
                 break;
             }
         }
-
-        // Re-submit a new transfer to keep the queue full
-        ep_in.submit(Buffer::new(transfer_size));
     }
 
     // Stop the receiver
@@ -1046,4 +1062,33 @@ fn streaming_thread(
     }
 
     tracing::debug!("HackRF streaming thread exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_baseband_filter_bw;
+
+    #[test]
+    fn baseband_filter_bandwidth_matches_libhackrf_round_down() {
+        // Below the minimum table entry, libhackrf returns the minimum.
+        assert_eq!(compute_baseband_filter_bw(1_536_000), 1_750_000);
+
+        // Otherwise libhackrf rounds down to avoid exceeding 75% of Fs.
+        assert_eq!(compute_baseband_filter_bw(3_000_000), 2_500_000);
+        assert_eq!(compute_baseband_filter_bw(3_072_000), 2_500_000);
+        assert_eq!(compute_baseband_filter_bw(7_500_000), 7_000_000);
+        assert_eq!(compute_baseband_filter_bw(7_680_000), 7_000_000);
+    }
+
+    #[test]
+    fn baseband_filter_bandwidth_keeps_exact_matches() {
+        assert_eq!(compute_baseband_filter_bw(1_750_000), 1_750_000);
+        assert_eq!(compute_baseband_filter_bw(8_000_000), 8_000_000);
+        assert_eq!(compute_baseband_filter_bw(28_000_000), 28_000_000);
+    }
+
+    #[test]
+    fn baseband_filter_bandwidth_caps_above_maximum() {
+        assert_eq!(compute_baseband_filter_bw(99_000_000), 28_000_000);
+    }
 }

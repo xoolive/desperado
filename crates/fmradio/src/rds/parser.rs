@@ -1445,42 +1445,36 @@ impl RdsParser {
 
                 // Handle specific ODA applications
                 match oda_app_id {
-                    0x4BD7 => {
+                    0x4BD7 if self.verbose => {
                         // RadioText+ (RT+)
                         // Verbose debug output (converted to tracing)
-                        if self.verbose {
-                            let cb = (oda_message >> 12) & 0x01 != 0;
-                            let scb = (oda_message >> 8) & 0x0F;
-                            let template_num = (oda_message & 0xFF) as u8;
-                            debug!(
-                                "    [RT+] CB={}, SCB=0x{:X}, Template={}",
-                                cb, scb, template_num
-                            );
-                        }
+                        let cb = (oda_message >> 12) & 0x01 != 0;
+                        let scb = (oda_message >> 8) & 0x0F;
+                        let template_num = (oda_message & 0xFF) as u8;
+                        debug!(
+                            "    [RT+] CB={}, SCB=0x{:X}, Template={}",
+                            cb, scb, template_num
+                        );
                     }
-                    0x6552 => {
+                    0x6552 if self.verbose => {
                         // Enhanced RadioText (eRT)
                         // Verbose debug output (converted to tracing)
-                        if self.verbose {
-                            let encoding = if (oda_message & 0x01) != 0 {
-                                "UTF-8"
-                            } else {
-                                "UCS2"
-                            };
-                            let direction = if (oda_message & 0x02) != 0 {
-                                "RTL"
-                            } else {
-                                "LTR"
-                            };
-                            debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
-                        }
+                        let encoding = if (oda_message & 0x01) != 0 {
+                            "UTF-8"
+                        } else {
+                            "UCS2"
+                        };
+                        let direction = if (oda_message & 0x02) != 0 {
+                            "RTL"
+                        } else {
+                            "LTR"
+                        };
+                        debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
                     }
-                    0xCD46 | 0xCD47 => {
+                    0xCD46 | 0xCD47 if self.verbose => {
                         // RDS-TMC (Traffic Message Channel)
                         // Verbose debug output (converted to tracing)
-                        if self.verbose {
-                            debug!("    [TMC] ALERT-C message: 0x{:04X}", oda_message);
-                        }
+                        debug!("    [TMC] ALERT-C message: 0x{:04X}", oda_message);
                     }
                     _ => {}
                 }
