@@ -275,8 +275,8 @@ impl DlsReassembler {
 /// Decode EBU Latin character set to UTF-8 (ETSI TS 101 756).
 fn decode_charset(data: &[u8], charset: u8) -> String {
     match charset {
-        0 | 15 => crate::charsets::ebu_latin_to_utf8(data), // EBU Latin
-        6 => String::from_utf8_lossy(data).into_owned(),    // UTF-8
+        0 | 15 => decode_ebu_or_misflagged_utf8(data),
+        6 => String::from_utf8_lossy(data).into_owned(), // UTF-8
         _ => {
             // For other charsets, try UTF-8 then fall back to Latin-1
             if let Ok(s) = std::str::from_utf8(data) {
@@ -286,6 +286,15 @@ fn decode_charset(data: &[u8], charset: u8) -> String {
             }
         }
     }
+}
+
+fn decode_ebu_or_misflagged_utf8(data: &[u8]) -> String {
+    if data.iter().any(|&b| b >= 0x80)
+        && let Ok(s) = std::str::from_utf8(data)
+    {
+        return s.to_string();
+    }
+    crate::charsets::ebu_latin_to_utf8(data)
 }
 
 /// F-PAD length in bytes.
@@ -952,6 +961,15 @@ mod tests {
         let data2 = [b'C', b'a', b'f', 0x82]; // "Café" — 0x82 = é in EBU Latin
         let result2 = decode_charset(&data2, 0);
         assert_eq!(result2, "Café");
+    }
+
+    #[test]
+    fn test_decode_charset_handles_misflagged_utf8_dls() {
+        // Some real DLS messages advertise EBU Latin but carry UTF-8 bytes.
+        // Decoding these as EBU turns UTF-8 "é" (C3 A9) into "È€".
+        let data = b"Crooner Radio - La voix de l'\xC3\xA9l\xC3\xA9gance intemporelle";
+        let result = decode_charset(data, 0);
+        assert_eq!(result, "Crooner Radio - La voix de l'élégance intemporelle");
     }
 
     #[test]

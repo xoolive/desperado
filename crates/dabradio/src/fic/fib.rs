@@ -356,6 +356,7 @@ impl EnsembleInfo {
 
 /// Decode a 16-byte label field to a UTF-8 string.
 fn decode_label(bytes: &[u8], charset: u8) -> String {
+    let bytes = trim_label_padding(bytes);
     match charset {
         0 => charsets::ebu_latin_to_utf8(bytes).trim_end().to_string(),
         // charset 6 = UTF-8
@@ -363,6 +364,14 @@ fn decode_label(bytes: &[u8], charset: u8) -> String {
         // Others: fallback to lossy UTF-8
         _ => String::from_utf8_lossy(bytes).trim_end().to_string(),
     }
+}
+
+fn trim_label_padding(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], 0x00 | 0x20 | 0xFF) {
+        end -= 1;
+    }
+    &bytes[..end]
 }
 
 /// UEP (Unequal Error Protection) table lookup.
@@ -458,4 +467,27 @@ fn eep_bitrate(sub_size: u16, option: u8, protection_level: u8) -> u16 {
         _ => 0,
     };
     bitrate as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_label;
+
+    #[test]
+    fn decode_label_trims_nul_padding_before_ebu_conversion() {
+        let label = decode_label(b"BORDEAUX 8C\0\0\0\0\0", 0);
+        assert_eq!(label, "BORDEAUX 8C");
+    }
+
+    #[test]
+    fn decode_label_trims_ff_padding_before_ebu_conversion() {
+        let label = decode_label(b"NOVA\xFF\xFF\xFF\xFF", 0);
+        assert_eq!(label, "NOVA");
+    }
+
+    #[test]
+    fn decode_label_keeps_internal_reserved_bytes_visible() {
+        let label = decode_label(b"A\0B\0\0", 0);
+        assert_eq!(label, "A�B");
+    }
 }
