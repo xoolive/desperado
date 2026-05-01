@@ -185,11 +185,17 @@ impl RtlSdr {
             .nth(index)
             .ok_or(Error::DeviceNotFound)?;
 
+        let usb_manufacturer = dev_info.manufacturer_string();
+        let usb_product = dev_info.product_string();
+        let is_blog_v4 = Self::is_blog_v4_strings(usb_manufacturer, usb_product);
+
         info!(
-            "found RTL-SDR: bus={}, addr={}, product={:?}",
+            "found RTL-SDR: bus={}, addr={}, manufacturer={:?}, product={:?}, blog_v4={}",
             dev_info.bus_id(),
             dev_info.device_address(),
-            dev_info.product_string(),
+            usb_manufacturer,
+            usb_product,
+            is_blog_v4,
         );
 
         // Open the USB device
@@ -223,7 +229,7 @@ impl RtlSdr {
             tuner_xtal_freq: DEF_RTL_XTAL_FREQ,
             force_bias_t: false,
             force_direct_sampling: false,
-            is_blog_v4: false,
+            is_blog_v4,
         };
 
         sdr.init()?;
@@ -247,9 +253,6 @@ impl RtlSdr {
 
         // Enable I2C repeater for tuner communication
         self.dev.set_i2c_repeater(true)?;
-
-        // Check if this is an RTL-SDR Blog V4
-        self.is_blog_v4 = self.detect_blog_v4();
 
         // Detect and initialize tuner
         let (tuner_type, i2c_addr) = self.search_tuner()?;
@@ -400,15 +403,12 @@ impl RtlSdr {
         Ok(())
     }
 
-    /// Detect whether this is an RTL-SDR Blog V4 device.
-    ///
-    /// Checks USB manufacturer/product strings for "RTLSDRBlog" and "Blog V4".
-    fn detect_blog_v4(&self) -> bool {
-        // We check via nusb device info - this data is from USB descriptors
-        // Note: nusb doesn't expose string descriptors easily after open,
-        // so we read from the device info during enumeration.
-        // For now, this is a simplified check.
-        false // TODO: implement Blog V4 detection via USB string descriptors
+    fn is_blog_v4_strings(manufacturer: Option<&str>, product: Option<&str>) -> bool {
+        matches!((manufacturer, product),
+            (Some(manufacturer), Some(product))
+                if manufacturer.eq_ignore_ascii_case("RTLSDRBlog")
+                    && product.eq_ignore_ascii_case("Blog V4")
+        )
     }
 
     /// Search for a supported tuner on the I2C bus.
