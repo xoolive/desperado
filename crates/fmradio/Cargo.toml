@@ -33,7 +33,7 @@ serde_json = "1.0"
 desperado = { version = "0.4.1", path = "../desperado", features = ["rtlsdr", "airspy", "hackrf"] }
 clap = { version = "4.5", features = ["derive"] }
 tracing-subscriber = "0.3"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
 crossbeam = "0.8"
 rayon = "1.10"
