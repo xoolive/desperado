@@ -1,7 +1,7 @@
 /// Quick streaming test — read a few chunks of IQ data and print stats.
 use std::time::Instant;
 
-use rs_rtl::RtlSdr;
+use rs_rtl::{DeviceId, RtlSdr};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -10,8 +10,7 @@ fn main() {
         )
         .init();
 
-    let mut sdr = RtlSdr::open(0).expect("failed to open RTL-SDR");
-
+    let mut sdr = RtlSdr::open(DeviceId::Index(0)).expect("failed to open RTL-SDR");
     sdr.set_center_freq(100_000_000).expect("set freq");
     sdr.set_sample_rate(2_048_000).expect("set rate");
     sdr.set_gain_manual(400).expect("set gain");

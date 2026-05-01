@@ -39,12 +39,6 @@ pub const DEF_RTL_XTAL_FREQ: u32 = 28_800_000;
 /// USB Vendor ID for RTL-SDR devices (Realtek).
 pub const RTL_USB_VID: u16 = 0x0bda;
 
-/// Known USB Product IDs for RTL-SDR devices.
-pub const KNOWN_PIDS: &[u16] = &[
-    0x2832, // Generic RTL2832U
-    0x2838, // RTL2832U (alternate)
-];
-
 /// Bulk IN endpoint for IQ sample data.
 const BULK_ENDPOINT: u8 = 0x81;
 
@@ -67,9 +61,11 @@ pub const RECOMMENDED_QUEUE_DEPTH: usize = 32;
 
 // ── Device info ─────────────────────────────────────────────────────────────
 
-/// Information about a detected RTL-SDR device.
+/// Metadata captured for a detected RTL-SDR device.
 #[derive(Debug, Clone)]
-pub struct DeviceInfo {
+pub struct DeviceDescriptor {
+    /// Filtered RTL-SDR device index used by selector-based open paths.
+    pub index: usize,
     /// USB bus identifier.
     pub bus: String,
     /// USB device address on the bus.
@@ -84,31 +80,120 @@ pub struct DeviceInfo {
     pub product: Option<String>,
     /// Serial number string (if available).
     pub serial: Option<String>,
+    /// Board identity derived during enumeration.
+    pub board_variant: BoardVariant,
 }
 
-/// List all connected RTL-SDR devices.
-///
-/// Enumerates USB devices and returns info for each one matching a known
-/// RTL-SDR vendor/product ID combination.
-pub fn list_devices() -> Result<Vec<DeviceInfo>> {
-    let devices = nusb::list_devices().wait().map_err(Error::OpenFailed)?;
-    let mut result = Vec::new();
+/// Board identity derived from USB enumeration metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardVariant {
+    Generic,
+    RtlSdrBlogV4,
+}
 
-    for dev in devices {
-        if dev.vendor_id() == RTL_USB_VID && KNOWN_PIDS.contains(&dev.product_id()) {
-            result.push(DeviceInfo {
-                bus: dev.bus_id().to_string(),
-                address: dev.device_address(),
-                vendor_id: dev.vendor_id(),
-                product_id: dev.product_id(),
-                manufacturer: dev.manufacturer_string().map(|s| s.to_string()),
-                product: dev.product_string().map(|s| s.to_string()),
-                serial: dev.serial_number().map(|s| s.to_string()),
-            });
+struct EnumeratedDevice {
+    usb: nusb::DeviceInfo,
+    descriptor: DeviceDescriptor,
+}
+
+impl EnumeratedDevice {
+    fn from_usb(index: usize, usb: nusb::DeviceInfo) -> Self {
+        let board_variant = classify_board_variant(usb.manufacturer_string(), usb.product_string());
+        let descriptor = DeviceDescriptor {
+            index,
+            bus: usb.bus_id().to_string(),
+            address: usb.device_address(),
+            vendor_id: usb.vendor_id(),
+            product_id: usb.product_id(),
+            manufacturer: usb.manufacturer_string().map(str::to_owned),
+            product: usb.product_string().map(str::to_owned),
+            serial: usb.serial_number().map(str::to_owned),
+            board_variant,
+        };
+
+        Self { usb, descriptor }
+    }
+}
+
+fn is_known_rtl_device(vendor_id: u16, product_id: u16) -> bool {
+    matches!((vendor_id, product_id), (RTL_USB_VID, 0x2832 | 0x2838))
+}
+
+fn classify_board_variant(manufacturer: Option<&str>, product: Option<&str>) -> BoardVariant {
+    match (manufacturer, product) {
+        (Some(manufacturer), Some(product))
+            if manufacturer.eq_ignore_ascii_case("RTLSDRBlog")
+                && product.eq_ignore_ascii_case("Blog V4") =>
+        {
+            BoardVariant::RtlSdrBlogV4
         }
+        _ => BoardVariant::Generic,
+    }
+}
+
+/// Selector used to open a specific RTL-SDR device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceId<'a> {
+    /// Open by filtered RTL-SDR index.
+    Index(usize),
+    /// Open by exact serial number match.
+    Serial(&'a str),
+}
+
+/// Collection of enumerated RTL-SDR devices.
+pub struct DeviceDescriptors {
+    devices: Vec<EnumeratedDevice>,
+}
+
+impl DeviceDescriptors {
+    /// Enumerate all connected RTL-SDR devices.
+    pub fn new() -> Result<Self> {
+        let devices = nusb::list_devices()
+            .wait()
+            .map_err(Error::OpenFailed)?
+            .filter(|device| is_known_rtl_device(device.vendor_id(), device.product_id()))
+            .enumerate()
+            .map(|(index, device)| EnumeratedDevice::from_usb(index, device))
+            .collect();
+
+        Ok(Self { devices })
     }
 
-    Ok(result)
+    /// Returns `true` when no supported RTL-SDR devices were found.
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    /// Number of supported RTL-SDR devices discovered during enumeration.
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Iterate over the captured device descriptors.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &DeviceDescriptor> + '_ {
+        self.devices.iter().map(|device| &device.descriptor)
+    }
+
+    /// Access a single captured device descriptor by selector.
+    pub fn get(&self, device_id: DeviceId<'_>) -> Option<&DeviceDescriptor> {
+        self.find(device_id).map(|device| &device.descriptor)
+    }
+
+    /// Open an enumerated device without re-running enumeration.
+    pub fn open(&self, device_id: DeviceId<'_>) -> Result<RtlSdr> {
+        let enumerated = self.find(device_id).ok_or(Error::DeviceNotFound)?;
+        RtlSdr::open_enumerated(enumerated)
+    }
+
+    fn find(&self, device_id: DeviceId<'_>) -> Option<&EnumeratedDevice> {
+        match device_id {
+            DeviceId::Index(index) => self.devices.get(index),
+            DeviceId::Serial(serial) => self
+                .devices
+                .iter()
+                .find(|device| device.descriptor.serial.as_deref() == Some(serial)),
+        }
+    }
 }
 
 // ── Main RtlSdr struct ──────────────────────────────────────────────────────
@@ -124,9 +209,9 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 /// # Example
 ///
 /// ```no_run
-/// use rs_rtl::RtlSdr;
+/// use rs_rtl::{DeviceId, RtlSdr};
 ///
-/// let mut sdr = RtlSdr::open(0)?;
+/// let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 /// sdr.set_center_freq(100_000_000)?;  // 100 MHz
 /// sdr.set_sample_rate(2_048_000)?;    // 2.048 MS/s
 /// sdr.set_gain_manual(496)?;          // 49.6 dB
@@ -157,8 +242,8 @@ pub struct RtlSdr {
     force_bias_t: bool,
     /// Whether direct sampling is forced by EEPROM.
     force_direct_sampling: bool,
-    /// Whether this is an RTL-SDR Blog V4 device.
-    is_blog_v4: bool,
+    /// Board identity derived during device enumeration.
+    board_variant: BoardVariant,
 }
 
 impl RtlSdr {
@@ -170,36 +255,25 @@ impl RtlSdr {
     /// 3. Detects tuner type (R820T or R828D) via I2C probing
     /// 4. Initializes tuner (register defaults, filter calibration)
     /// 5. Reads EEPROM for device-specific flags
-    pub fn open(index: usize) -> Result<Self> {
-        info!("opening RTL-SDR device index {}", index);
+    pub fn open(device_id: DeviceId<'_>) -> Result<Self> {
+        info!("opening RTL-SDR device {device_id:?}");
+        DeviceDescriptors::new()?.open(device_id)
+    }
 
-        // Enumerate and find the device
-        let devices: Vec<_> = nusb::list_devices()
-            .wait()
-            .map_err(Error::OpenFailed)?
-            .filter(|d| d.vendor_id() == RTL_USB_VID && KNOWN_PIDS.contains(&d.product_id()))
-            .collect();
-
-        let dev_info = devices
-            .into_iter()
-            .nth(index)
-            .ok_or(Error::DeviceNotFound)?;
-
-        let usb_manufacturer = dev_info.manufacturer_string();
-        let usb_product = dev_info.product_string();
-        let is_blog_v4 = Self::is_blog_v4_strings(usb_manufacturer, usb_product);
+    fn open_enumerated(enumerated: &EnumeratedDevice) -> Result<Self> {
+        let device_info = &enumerated.descriptor;
 
         info!(
-            "found RTL-SDR: bus={}, addr={}, manufacturer={:?}, product={:?}, blog_v4={}",
-            dev_info.bus_id(),
-            dev_info.device_address(),
-            usb_manufacturer,
-            usb_product,
-            is_blog_v4,
+            "found RTL-SDR: bus={}, addr={}, manufacturer={:?}, product={:?}, variant={:?}",
+            device_info.bus,
+            device_info.address,
+            device_info.manufacturer,
+            device_info.product,
+            device_info.board_variant,
         );
 
         // Open the USB device
-        let usb_device = dev_info.open().wait().map_err(Error::OpenFailed)?;
+        let usb_device = enumerated.usb.open().wait().map_err(Error::OpenFailed)?;
 
         // Detach kernel driver on Linux if needed
         #[cfg(target_os = "linux")]
@@ -229,7 +303,7 @@ impl RtlSdr {
             tuner_xtal_freq: DEF_RTL_XTAL_FREQ,
             force_bias_t: false,
             force_direct_sampling: false,
-            is_blog_v4,
+            board_variant: device_info.board_variant,
         };
 
         sdr.init()?;
@@ -239,7 +313,7 @@ impl RtlSdr {
 
     /// Open the first available RTL-SDR device.
     pub fn open_first() -> Result<Self> {
-        Self::open(0)
+        Self::open(DeviceId::Index(0))
     }
 
     /// Full hardware initialization sequence.
@@ -257,8 +331,9 @@ impl RtlSdr {
         // Detect and initialize tuner
         let (tuner_type, i2c_addr) = self.search_tuner()?;
 
+        let is_blog_v4 = matches!(self.board_variant, BoardVariant::RtlSdrBlogV4);
         // Determine tuner crystal frequency
-        let tuner_xtal = if tuner_type == TunerType::R828D && !self.is_blog_v4 {
+        let tuner_xtal = if tuner_type == TunerType::R828D && !is_blog_v4 {
             tuner::XTAL_FREQ_16
         } else {
             DEF_RTL_XTAL_FREQ
@@ -266,7 +341,12 @@ impl RtlSdr {
         self.tuner_xtal_freq = tuner_xtal;
 
         // Create and initialize the tuner driver
-        self.tuner = R82xx::new(tuner_type, i2c_addr, tuner_xtal, self.is_blog_v4);
+        self.tuner = R82xx::new(
+            tuner_type,
+            i2c_addr,
+            tuner_xtal,
+            is_blog_v4,
+        );
         self.tuner.init(&self.dev)?;
 
         // Disable I2C repeater
@@ -303,8 +383,8 @@ impl RtlSdr {
         }
 
         info!(
-            "RTL-SDR initialized: tuner={:?}, blog_v4={}, xtal={}Hz",
-            tuner_type, self.is_blog_v4, tuner_xtal,
+            "RTL-SDR initialized: tuner={:?}, variant={:?}, xtal={}Hz",
+            tuner_type, self.board_variant, tuner_xtal,
         );
 
         Ok(())
@@ -403,12 +483,8 @@ impl RtlSdr {
         Ok(())
     }
 
-    fn is_blog_v4_strings(manufacturer: Option<&str>, product: Option<&str>) -> bool {
-        matches!((manufacturer, product),
-            (Some(manufacturer), Some(product))
-                if manufacturer.eq_ignore_ascii_case("RTLSDRBlog")
-                    && product.eq_ignore_ascii_case("Blog V4")
-        )
+    pub fn board_variant(&self) -> BoardVariant {
+        self.board_variant
     }
 
     /// Search for a supported tuner on the I2C bus.

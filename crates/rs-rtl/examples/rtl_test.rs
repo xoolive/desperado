@@ -1,5 +1,5 @@
 /// Equivalent to rtl_test — detect and probe RTL-SDR devices.
-use rs_rtl::{RtlSdr, list_devices};
+use rs_rtl::{DeviceDescriptors, DeviceId, RtlSdr};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -11,7 +11,7 @@ fn main() {
     println!("rs-rtl device test\n");
 
     // List devices
-    match list_devices() {
+    match DeviceDescriptors::new() {
         Ok(devices) => {
             println!("Found {} RTL-SDR device(s):\n", devices.len());
             for (i, dev) in devices.iter().enumerate() {
@@ -42,7 +42,7 @@ fn main() {
 
     // Try to open device 0
     println!("Opening device #0...");
-    match RtlSdr::open(0) {
+    match RtlSdr::open(DeviceId::Index(0)) {
         Ok(sdr) => {
             println!("  Tuner:       {:?}", sdr.tuner_type());
             println!(

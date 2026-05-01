@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let mut sdr = rs_rtl::RtlSdr::open(args.device)?;
+    let mut sdr = rs_rtl::RtlSdr::open(rs_rtl::DeviceId::Index(args.device))?;
     sdr.set_sample_rate(args.sample_rate)?;
     let _ = sdr.set_bandwidth(args.sample_rate);
     sdr.set_center_freq(args.frequency)?;

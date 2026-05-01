@@ -27,9 +27,9 @@ A pure-Rust library for RTL-SDR devices (RTL2832U + R820T/R828D) using [`nusb`](
 ### Quick Start
 
 ```rust
-use rs_rtl::RtlSdr;
+use rs_rtl::{DeviceId, RtlSdr};
 
-let mut sdr = RtlSdr::open(0)?;
+let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 sdr.set_center_freq(100_000_000)?;  // 100 MHz
 sdr.set_sample_rate(2_048_000)?;    // 2.048 MS/s
 sdr.set_gain_manual(496)?;          // 49.6 dB
@@ -44,11 +44,11 @@ while let Some(data) = reader.recv() {
 ### Device Discovery
 
 ```rust
-use rs_rtl::list_devices;
+use rs_rtl::DeviceDescriptors;
 
-for (i, dev) in list_devices()?.iter().enumerate() {
-    println!("#{}: {} {} (serial: {:?})",
-        i,
+for dev in DeviceDescriptors::new()?.iter() {
+  println!("#{}: {} {} (serial: {:?})",
+    dev.index,
         dev.manufacturer.as_deref().unwrap_or("?"),
         dev.product.as_deref().unwrap_or("?"),
         dev.serial,
@@ -59,9 +59,9 @@ for (i, dev) in list_devices()?.iter().enumerate() {
 ### Configuration
 
 ```rust
-use rs_rtl::RtlSdr;
+use rs_rtl::{DeviceId, RtlSdr};
 
-let mut sdr = RtlSdr::open(0)?;
+let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 
 // Frequency: 24 MHz – 1766 MHz (R820T), HF with Blog V4
 sdr.set_center_freq(433_920_000)?;
@@ -86,9 +86,9 @@ println!("gains: {:?}", sdr.gains());
 ### Runtime Control During Streaming
 
 ```rust
-use rs_rtl::RtlSdr;
+use rs_rtl::{DeviceId, RtlSdr};
 
-let mut sdr = RtlSdr::open(0)?;
+let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 sdr.set_center_freq(100_000_000)?;
 sdr.set_sample_rate(2_048_000)?;
 sdr.set_gain_manual(296)?;

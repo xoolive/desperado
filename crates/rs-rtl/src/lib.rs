@@ -17,9 +17,9 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use rs_rtl::RtlSdr;
+//! use rs_rtl::{DeviceId, RtlSdr};
 //!
-//! let mut sdr = RtlSdr::open(0)?;
+//! let mut sdr = RtlSdr::open(DeviceId::Index(0))?;
 //! sdr.set_center_freq(100_000_000)?;  // 100 MHz
 //! sdr.set_sample_rate(2_048_000)?;    // 2.048 MS/s
 //! sdr.set_gain_manual(496)?;          // 49.6 dB
@@ -38,8 +38,8 @@ pub mod tuner;
 
 pub use error::{Error, Result};
 pub use rtlsdr::{
-    AsyncReadControlHandle, AsyncReadHandle, DEF_RTL_XTAL_FREQ, DeviceInfo, NUM_TRANSFERS,
-    RECOMMENDED_QUEUE_DEPTH, RtlSdr, TRANSFER_BUF_SIZE, list_devices,
+    AsyncReadControlHandle, AsyncReadHandle, BoardVariant, DEF_RTL_XTAL_FREQ, DeviceDescriptor,
+    DeviceDescriptors, DeviceId, NUM_TRANSFERS, RECOMMENDED_QUEUE_DEPTH, RtlSdr, TRANSFER_BUF_SIZE,
 };
 pub use tuner::{GAIN_VALUES, R82XX_IF_FREQ, TunerType};
 
