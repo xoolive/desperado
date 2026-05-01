@@ -21,7 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 num-complex = "0.4"
-rubato = "0.16.2"
+rubato = "2.0.0"
 crossbeam-channel = "0.5"
 tinyaudio = "0.1"
 tracing = "0.1"
