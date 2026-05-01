@@ -453,9 +453,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -476,9 +476,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -723,7 +723,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 name = "dabradio"
 version = "0.4.1"
 dependencies = [
- "clap 4.6.0",
+ "clap 4.6.1",
  "crossbeam-channel",
  "crossterm 0.28.1",
  "desperado",
@@ -782,7 +782,7 @@ version = "0.4.1"
 dependencies = [
  "approx",
  "biquad",
- "clap 4.6.0",
+ "clap 4.6.1",
  "dirs",
  "futures",
  "industrial-io",
@@ -995,7 +995,7 @@ name = "fmradio"
 version = "0.4.1"
 dependencies = [
  "approx",
- "clap 4.6.0",
+ "clap 4.6.1",
  "crossbeam",
  "crossbeam-channel",
  "crossterm 0.28.1",
@@ -2982,7 +2982,7 @@ version = "0.4.1"
 dependencies = [
  "biquad",
  "chrono",
- "clap 4.6.0",
+ "clap 4.6.1",
  "crossbeam-channel",
  "desperado",
  "futures",
