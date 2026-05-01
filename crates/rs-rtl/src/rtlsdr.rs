@@ -341,12 +341,7 @@ impl RtlSdr {
         self.tuner_xtal_freq = tuner_xtal;
 
         // Create and initialize the tuner driver
-        self.tuner = R82xx::new(
-            tuner_type,
-            i2c_addr,
-            tuner_xtal,
-            is_blog_v4,
-        );
+        self.tuner = R82xx::new(tuner_type, i2c_addr, tuner_xtal, is_blog_v4);
         self.tuner.init(&self.dev)?;
 
         // Disable I2C repeater
