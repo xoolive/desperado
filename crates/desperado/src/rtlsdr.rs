@@ -132,7 +132,7 @@ pub struct RtlSdrDeviceInfo {
 
 /// List all available RTL-SDR devices.
 pub fn list_devices() -> error::Result<Vec<RtlSdrDeviceInfo>> {
-    let devices = rs_rtl::list_devices()
+    let devices = rs_rtl::DeviceDescriptors::new()
         .map_err(|e| error::Error::device(format!("Failed to enumerate devices: {e}")))?;
     Ok(devices
         .iter()
@@ -155,7 +155,7 @@ fn resolve_device_index(selector: &DeviceSelector) -> error::Result<usize> {
             product,
             serial,
         } => {
-            let devices = rs_rtl::list_devices()
+            let devices = rs_rtl::DeviceDescriptors::new()
                 .map_err(|e| error::Error::device(format!("Failed to enumerate devices: {e}")))?;
 
             let matching = devices.iter().enumerate().find(|(_, d)| {
@@ -184,7 +184,7 @@ fn resolve_device_index(selector: &DeviceSelector) -> error::Result<usize> {
 /// Open and configure an RTL-SDR device from a `RtlSdrConfig`.
 fn open_and_configure(config: &RtlSdrConfig) -> error::Result<rs_rtl::RtlSdr> {
     let idx = resolve_device_index(&config.device)?;
-    let mut sdr = rs_rtl::RtlSdr::open(idx)?;
+    let mut sdr = rs_rtl::RtlSdr::open(rs_rtl::DeviceId::Index(idx))?;
 
     sdr.set_sample_rate(config.sample_rate)?;
     let _ = sdr.set_bandwidth(config.sample_rate);
