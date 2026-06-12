@@ -15,7 +15,7 @@ exclude = ["tests/data/"]
 num-complex = "0.4"
 rustfft = "6.4"
 # Device support via desperado
-desperado = { version = "0.4.1", path = "../desperado", features = ["rtlsdr", "airspy", "hackrf"] }
+desperado = { version = "0.4.2", path = "../desperado", features = ["rtlsdr", "airspy", "hackrf"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
