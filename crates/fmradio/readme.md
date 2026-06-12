@@ -2,6 +2,8 @@
 
 A high-performance FM radio demodulator and RDS (Radio Data System) decoder in pure Rust. Supports multiple SDR backends (RTL-SDR, Airspy, SoapySDR) and real-time audio output with integrated RDS data extraction.
 
+![fmradio screenshot](fmradio.png)
+
 ## Overview
 
 `fmradio` is a complete FM broadcasting receiver with:
@@ -25,6 +27,7 @@ A high-performance FM radio demodulator and RDS (Radio Data System) decoder in p
 ## Installation
 
 ### Requirements
+
 - libusb (for RTL-SDR/Airspy backends)
 - Audio output library (ALSA on Linux, CoreAudio on macOS, WinMM on Windows)
 
@@ -80,6 +83,7 @@ cargo run --release -p fmradio --example fm_scan -- --source rtlsdr://
 ```
 
 This default uses:
+
 - 87.5-108.0 MHz band
 - 100 kHz step
 - 90 ms dwell per step
@@ -115,6 +119,7 @@ Channel power scoring evaluates multiple PPM-offset hypotheses in parallel for e
 #### Scanner Performance
 
 Full FM band scan (87.5-108 MHz, 100 kHz steps, RDS enabled):
+
 - **Time:** ~4.5 minutes (266 seconds)
 - **Coverage:** 205 frequency steps
 - **RDS attempts:** Only on high-confidence candidates (typically 15-25 stations)
@@ -124,6 +129,7 @@ Full FM band scan (87.5-108 MHz, 100 kHz steps, RDS enabled):
 Use `--debug-rds-selection` to see detailed frequency selection and fallback logic during RDS verification.
 
 Example output:
+
 ```json
 {"group":"0A","ps":"KISS FM","af":[98.1,99.0,101.5]}
 {"group":"2A","rt":"Now Playing: Artist - Song Title"}
@@ -144,7 +150,7 @@ cargo run --release -p fmradio -- rtlsdr:// -c 103.5M --raw-out --resample-out 2
 ### Signal Processing Pipeline
 
 ```
-Input (6 MSps) 
+Input (6 MSps)
   ↓
 [AGC] → Automatic gain control
   ↓
@@ -236,16 +242,19 @@ fmradio rtlsdr:// -c 103.5M | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.mp3
 ## Troubleshooting
 
 ### No Audio Output
+
 - Check source URI/path is correct and device is connected
 - Try `--mono` if stereo causes issues
 - Verify gain with `-g auto` or manual value
 
 ### RDS Data Not Appearing
+
 - Weak signal? Try increasing gain: `-g 50` (RTL-SDR)
 - Some stations broadcast incomplete RDS groups
 - RDS output is emitted as JSON lines by default
 
 ### USB Device Not Found
+
 - **Linux:** Install udev rules for your device
 - **Windows:** Use Zadig to install WinUSB drivers
 - **macOS:** libusb usually works out of the box
@@ -253,6 +262,7 @@ fmradio rtlsdr:// -c 103.5M | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.mp3
 ## Performance
 
 On a modern CPU:
+
 - **CPU:** ~15–25% single-core (RTL-SDR @ 2.4 MSps)
 - **Memory:** ~50 MB (includes audio buffers)
 - **Latency:** ~100 ms (tuning to audio output)

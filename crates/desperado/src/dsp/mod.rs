@@ -88,6 +88,8 @@ use num_complex::Complex;
 pub mod afc;
 pub mod agc;
 pub mod buffer;
+#[cfg(feature = "resampler")]
+pub mod channelizer;
 /// 2-pole Chebyshev Type-I low-pass IIR filter.
 pub mod chebyshev;
 /// Integer decimator with anti-aliasing FIR filter.

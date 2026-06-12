@@ -162,6 +162,12 @@ All samples are returned as `Complex<f32>` values, regardless of the source.
 
 Contributions to include more SDR frontends (LimeSDR, BladeRF, etc.) **or to port existing ones to pure Rust implementations** are welcome.
 
+## Shared SDR settings
+
+Applications can use `desperado::sdr::SdrSettings` and the shared device path structs to parse common SDR options consistently. A missing value (`None`) means the user did not specify it and the application should apply its own protocol/device default. This is distinct from `gain = "auto"`, which becomes `Gain::Auto` and explicitly requests device automatic gain control.
+
+Common settings include `center_freq`, `sample_rate`, `gain`, `bias_tee`, `freq_correction_ppm`, `iq_format`, and HackRF `amp_enable`. Per-stage gain should use `Gain::Elements`, for example `{ LNA = 32, VGA = 20 }`; HackRF RF amplifier control is boolean (`amp_enable`), not a numeric gain.
+
 ## Sync vs Async: Which should I use?
 
 Desperado provides both synchronous (`IqSource`) and asynchronous (`AsyncIqSource`) interfaces. Here's how to choose:

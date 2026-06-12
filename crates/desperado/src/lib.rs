@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod pluto;
 #[cfg(feature = "rtlsdr")]
 pub mod rtlsdr;
+pub mod sdr;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 
@@ -335,7 +336,7 @@ impl Gain {
 ///
 /// Represents the different formats for I/Q sample data. Each variant corresponds
 /// to a specific data type and encoding used for representing complex samples.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
 pub enum IqFormat {
     /// Complex unsigned 8-bit (Cu8)
     ///
@@ -832,6 +833,18 @@ impl std::str::FromStr for IqFormat {
             "cf32" => Ok(IqFormat::Cf32),
             _ => Err(Error::format(format!("Invalid IQ format: '{}'", s))),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for IqFormat {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value
+            .parse()
+            .map_err(|err: Error| serde::de::Error::custom(err.to_string()))
     }
 }
 

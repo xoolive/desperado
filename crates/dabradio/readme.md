@@ -2,6 +2,8 @@
 
 A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting) and DAB+ signals. Reads IQ samples from files or SDRs and decodes ensemble information, service listings, and audio streams in real-time.
 
+![dabradio screenshot](dabradio.png)
+
 ## Features
 
 - **Full DAB/DAB+ decoding pipeline** — OFDM sync, FIC/MSC extraction, Viterbi FEC, AAC audio
@@ -22,10 +24,9 @@ A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting
 # From the desperado workspace root:
 cargo build --release -p dabradio
 
-# Enable live SDR backends as needed:
-cargo build --release -p dabradio --features rtlsdr
+# RTL-SDR, Airspy, and HackRF are enabled by default.
+# Add SoapySDR explicitly when needed:
 cargo build --release -p dabradio --features soapy
-cargo build --release -p dabradio --features airspy
 ```
 
 The binary will be at `target/release/dabradio`.
@@ -85,7 +86,7 @@ SId      Label                SubCh  Bitrate    Protection
 ./target/release/dabradio airspy://0 --channel 12A --service "FIP"
 ```
 
-If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from `--channel`/`--freq` and the DAB sample rate (2.048 MHz).
+If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from `--channel`/`--freq` and the DAB sample rate (2.048 MHz, or 4.096 MHz for Airspy before 2:1 resampling). Gain follows desperado's shared SDR settings: omitted gain means the DAB default is injected (`rtlsdr`: 29.7 dB, `airspy`: 40 with `gain_mode=linearity`, `hackrf`: 72 plus `amp=true`), while `gain=auto` explicitly requests device automatic gain control where supported.
 
 ### Output formats
 
@@ -100,16 +101,16 @@ If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from
 ### Extract DLS Metadata and MOT Slideshow Images
 
 ```bash
-# Display DLS text metadata while decoding audio
-./target/release/dabradio recording.cu8 --channel 12A --service "FIP" --metadata
+# DLS text metadata is printed while decoding a service
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP"
 
 # Extract MOT slideshow images to directory (album art, cover art, etc.)
 ./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
-  --metadata --slideshow /tmp/fip_slides
+  --slideshow /tmp/fip_slides
 
 # Extract images without audio playback
 ./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
-  --metadata --slideshow /tmp/fip_slides --no-audio
+  --slideshow /tmp/fip_slides --no-audio
 ```
 
 **Output example:**
@@ -155,9 +156,6 @@ OPTIONS:
 
     --no-audio
             Disable audio output to soundcard
-
-    --metadata
-            Display DLS text metadata (song titles, artist names)
 
     --slideshow <DIR>
             Extract MOT slideshow images to directory

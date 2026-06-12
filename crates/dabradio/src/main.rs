@@ -54,6 +54,7 @@ use desperado::Gain;
 use desperado::IqAsyncSource;
 use desperado::dsp::DspBlock;
 use desperado::dsp::rotate::Rotate;
+use desperado::sdr::{gain_steps_for_source, is_device_uri};
 use desperado::{IqFormat, IqSource};
 use futures::StreamExt;
 use num_complex::Complex;
@@ -1733,13 +1734,6 @@ fn detect_device_sample_rate(configured_uri: &str) -> Result<u32, Box<dyn std::e
     .into())
 }
 
-fn is_device_uri(input: &str) -> bool {
-    input.starts_with("rtlsdr://")
-        || input.starts_with("soapy://")
-        || input.starts_with("airspy://")
-        || input.starts_with("hackrf://")
-}
-
 fn ensure_tuning_query(uri: &str, center_freq_hz: u32, sample_rate: u32) -> (String, Option<f64>) {
     let has_query = uri.contains('?');
     let has_freq = uri.contains("freq=") || uri.contains("frequency=");
@@ -2002,28 +1996,6 @@ fn print_services(ensemble: &fic::fib::EnsembleInfo, json: bool) {
                 .unwrap_or_default(),
             svc.protection.as_deref().unwrap_or(""),
         );
-    }
-}
-
-/// Return the discrete gain steps (in dB) supported by the hardware behind `uri`.
-fn gain_steps_for_source(uri: &str) -> Vec<f64> {
-    if uri.starts_with("rtlsdr://") {
-        // R820T tuner gain table (tenths-of-dB → dB)
-        vec![
-            0.0, 0.9, 1.4, 2.7, 3.7, 7.7, 8.7, 12.5, 14.4, 15.7, 16.6, 19.7, 20.7, 22.9, 25.4,
-            28.0, 29.7, 32.8, 33.8, 36.4, 37.2, 38.6, 40.2, 42.1, 43.4, 43.9, 44.5, 48.0, 49.6,
-        ]
-    } else if uri.starts_with("airspy://") {
-        // 22 preset levels (0-21), mapped to dB as level * 50 / 21
-        (0..=21)
-            .map(|l| (l as f64 * 50.0 / 21.0 * 10.0).round() / 10.0)
-            .collect()
-    } else if uri.starts_with("hackrf://") {
-        // LNA 0-40 dB (8 dB steps) + VGA 0-62 dB (2 dB steps), effective 2 dB steps
-        (0..=51).map(|i| i as f64 * 2.0).collect()
-    } else {
-        // Unknown device — fall back to 1 dB steps over 0-50
-        (0..=50).map(|i| i as f64).collect()
     }
 }
 
