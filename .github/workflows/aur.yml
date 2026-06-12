@@ -88,6 +88,9 @@ jobs:
           echo "x86_64=${X86_SHA}" >> "$GITHUB_OUTPUT"
           echo "aarch64=${ARM_SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Clone AUR repo
+        run: git clone https://aur.archlinux.org/${{ matrix.pkg }}.git aur/${{ matrix.pkg }}
+
       - name: Generate PKGBUILD
         run: |
           VERSION="${{ steps.version.outputs.version }}"
