@@ -13,7 +13,8 @@ use super::parser::{RdsGroupJson, RdsParser};
 use desperado::dsp::filters::StatefulLowPassFir;
 use desperado::dsp::{agc::Agc, nco::Nco, symsync::SymSync};
 use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 use std::f32::consts::PI;
 use tracing::{debug, info, trace, warn};
@@ -182,8 +183,8 @@ impl StatefulFir {
 /// This matches redsea's architecture: 171000 / 24 = 7125 Hz, 7125 / 2375 = 3.0 exactly
 /// Now also does coherent mixing down using pilot-derived 57 kHz carrier
 pub struct RdsResamplerCustom {
-    resampler_i: SincFixedOut<f32>,
-    resampler_q: SincFixedOut<f32>,
+    resampler_i: Async<f32>,
+    resampler_q: Async<f32>,
     leftover_i: Vec<f32>,
     leftover_q: Vec<f32>,
     input_rate: f32,
@@ -210,8 +211,10 @@ impl RdsResamplerCustom {
         };
 
         // Output 1024 frames at a time (1 channel each for I and Q)
-        let resampler_i = SincFixedOut::<f32>::new(ratio, 1.1, params_i, 1024, 1).unwrap();
-        let resampler_q = SincFixedOut::<f32>::new(ratio, 1.1, params_q, 1024, 1).unwrap();
+        let resampler_i =
+            Async::<f32>::new_sinc(ratio, 1.1, &params_i, 1024, 1, FixedAsync::Output).unwrap();
+        let resampler_q =
+            Async::<f32>::new_sinc(ratio, 1.1, &params_q, 1024, 1, FixedAsync::Output).unwrap();
 
         debug!(
             "[RDS-RESAMP] Created {}kHz → {}kHz complex resampler (ratio: {:.4})",
@@ -305,20 +308,16 @@ impl RdsResamplerCustom {
                 break;
             }
 
-            // Take exactly what we need for I
-            let input_chunk_i: Vec<Vec<f32>> =
-                vec![self.leftover_i[..input_frames_needed].to_vec()];
-            let input_chunk_q: Vec<Vec<f32>> =
-                vec![self.leftover_q[..input_frames_needed].to_vec()];
-            self.leftover_i.drain(0..input_frames_needed);
-            self.leftover_q.drain(0..input_frames_needed);
-
             // Process I
-            match self.resampler_i.process(&input_chunk_i, None) {
+            let input_chunk_i = InterleavedSlice::new(
+                &self.leftover_i[..input_frames_needed],
+                1,
+                input_frames_needed,
+            )
+            .expect("validated I input length");
+            match self.resampler_i.process(&input_chunk_i, 0, None) {
                 Ok(resampled) => {
-                    if !resampled.is_empty() {
-                        output_i.extend_from_slice(&resampled[0]);
-                    }
+                    output_i.extend(resampled.take_data());
                 }
                 Err(e) => {
                     warn!("[RDS-RESAMP] Error I: {:?}", e);
@@ -326,18 +325,25 @@ impl RdsResamplerCustom {
                 }
             }
 
+            self.leftover_i.drain(0..input_frames_needed);
+
             // Process Q
-            match self.resampler_q.process(&input_chunk_q, None) {
+            let input_chunk_q = InterleavedSlice::new(
+                &self.leftover_q[..input_frames_needed],
+                1,
+                input_frames_needed,
+            )
+            .expect("validated Q input length");
+            match self.resampler_q.process(&input_chunk_q, 0, None) {
                 Ok(resampled) => {
-                    if !resampled.is_empty() {
-                        output_q.extend_from_slice(&resampled[0]);
-                    }
+                    output_q.extend(resampled.take_data());
                 }
                 Err(e) => {
                     warn!("[RDS-RESAMP] Error Q: {:?}", e);
                     break;
                 }
             }
+            self.leftover_q.drain(0..input_frames_needed);
         }
 
         (output_i, output_q)
@@ -358,20 +364,23 @@ impl RdsResamplerCustom {
                 break;
             }
 
-            let input_chunk: Vec<Vec<f32>> = vec![self.leftover_i[..input_frames_needed].to_vec()];
-            self.leftover_i.drain(0..input_frames_needed);
+            let input_chunk = InterleavedSlice::new(
+                &self.leftover_i[..input_frames_needed],
+                1,
+                input_frames_needed,
+            )
+            .expect("validated input length");
 
-            match self.resampler_i.process(&input_chunk, None) {
+            match self.resampler_i.process(&input_chunk, 0, None) {
                 Ok(resampled) => {
-                    if !resampled.is_empty() {
-                        output.extend_from_slice(&resampled[0]);
-                    }
+                    output.extend(resampled.take_data());
                 }
                 Err(e) => {
                     warn!("[RDS-RESAMP] Error: {:?}", e);
                     break;
                 }
             }
+            self.leftover_i.drain(0..input_frames_needed);
         }
 
         output

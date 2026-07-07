@@ -21,7 +21,8 @@
 //! ```
 
 use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 
 /// Adaptive resampler for real-time audio streaming.
@@ -30,7 +31,7 @@ use rubato::{
 /// ratio based on buffer fill level. This helps maintain a stable buffer in streaming
 /// applications where there might be slight mismatches between input and output rates.
 ///
-/// The resampler uses `rubato::SincFixedOut` for high-quality sinc interpolation.
+/// The resampler uses `rubato::Async` for high-quality sinc interpolation.
 ///
 /// # Example
 ///
@@ -52,7 +53,7 @@ use rubato::{
 /// resampler.adjust_ratio(0.3); // 30% full
 /// ```
 pub struct AdaptiveResampler {
-    resampler: SincFixedOut<f32>,
+    resampler: Async<f32>,
     target_fill: f64,
     alpha: f64,
     k_p: f64,
@@ -108,12 +109,13 @@ impl AdaptiveResampler {
         let output_frames = 1024;
         let max_resample_ratio_relative = 1.02;
 
-        let resampler = SincFixedOut::<f32>::new(
+        let resampler = Async::<f32>::new_sinc(
             initial_ratio,
             max_resample_ratio_relative,
-            params,
+            &params,
             output_frames,
             channels,
+            FixedAsync::Output,
         )
         .map_err(|e| format!("Failed to create resampler: {:?}", e))?;
 
@@ -209,29 +211,11 @@ impl AdaptiveResampler {
             }
 
             let chunk: Vec<f32> = self.leftover.drain(..samples_needed).collect();
+            let input_block = InterleavedSlice::new(&chunk, self.channels, input_frames_needed)
+                .expect("validated interleaved input length");
 
-            // Deinterleave for rubato (index-based loop needed for multi-channel interleaving)
-            #[allow(clippy::needless_range_loop)]
-            let mut channels_data: Vec<Vec<f32>> =
-                vec![Vec::with_capacity(input_frames_needed); self.channels];
-            for frame_idx in 0..input_frames_needed {
-                for ch in 0..self.channels {
-                    let idx = frame_idx * self.channels + ch;
-                    channels_data[ch].push(chunk[idx]);
-                }
-            }
-
-            match self.resampler.process(&channels_data, None) {
-                Ok(output_blocks) => {
-                    let out_frames = output_blocks[0].len();
-                    // Reinterleave (index-based loop needed for multi-channel interleaving)
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..out_frames {
-                        for ch in 0..self.channels {
-                            output.push(output_blocks[ch][i]);
-                        }
-                    }
-                }
+            match self.resampler.process(&input_block, 0, None) {
+                Ok(output_block) => output.extend(output_block.take_data()),
                 Err(_) => break,
             }
         }

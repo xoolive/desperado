@@ -69,7 +69,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 use tinyaudio::prelude::*;
 
@@ -978,7 +979,7 @@ async fn run_stereo(
 
     // Optional resampler for raw output (actual_mpx_rate -> target rate)
     let mpx_rate_u32 = mpx_sample_rate as u32;
-    let mut raw_resampler: Option<rubato::SincFixedOut<f32>> = if raw_out {
+    let mut raw_resampler: Option<Async<f32>> = if raw_out {
         if let Some(target_rate) = args.resample_out {
             if target_rate != mpx_rate_u32 {
                 let ratio = target_rate as f64 / mpx_sample_rate as f64;
@@ -993,7 +994,10 @@ async fn run_stereo(
                     "[RAW-OUT] Resampling from {} Hz to {} Hz",
                     mpx_rate_u32, target_rate
                 );
-                Some(SincFixedOut::<f32>::new(ratio, 1.1, params, 1024, 1).unwrap())
+                Some(
+                    Async::<f32>::new_sinc(ratio, 1.1, &params, 1024, 1, FixedAsync::Output)
+                        .unwrap(),
+                )
             } else {
                 None
             }
@@ -1111,14 +1115,13 @@ async fn run_stereo(
                     if raw_leftover.len() < needed {
                         break;
                     }
-                    let input_chunk: Vec<Vec<f32>> = vec![raw_leftover[..needed].to_vec()];
-                    raw_leftover.drain(0..needed);
+                    let input_chunk = InterleavedSlice::new(&raw_leftover[..needed], 1, needed)
+                        .expect("validated raw input length");
 
-                    if let Ok(resampled) = resampler.process(&input_chunk, None)
-                        && !resampled.is_empty()
-                    {
-                        output.extend_from_slice(&resampled[0]);
+                    if let Ok(resampled) = resampler.process(&input_chunk, 0, None) {
+                        output.extend(resampled.take_data());
                     }
+                    raw_leftover.drain(0..needed);
                 }
                 output
             } else {
@@ -1253,7 +1256,7 @@ impl FromStr for Frequency {
 }
 
 struct AudioAdaptiveResampler {
-    resampler: SincFixedOut<f32>,
+    resampler: Async<f32>,
     target_fill: f64,
     alpha: f64,
     k_p: f64,
@@ -1286,8 +1289,15 @@ impl AudioAdaptiveResampler {
 
         let output_frames = 1024;
 
-        let resampler =
-            SincFixedOut::<f32>::new(initial_ratio, 2.0, params, output_frames, channels).unwrap();
+        let resampler = Async::<f32>::new_sinc(
+            initial_ratio,
+            2.0,
+            &params,
+            output_frames,
+            channels,
+            FixedAsync::Output,
+        )
+        .unwrap();
 
         Self {
             resampler,
@@ -1377,39 +1387,11 @@ impl AudioAdaptiveResampler {
             }
 
             let chunk: Vec<f32> = self.leftover.drain(..samples_needed).collect();
+            let input_block = InterleavedSlice::new(&chunk, self.channels, input_frames_needed)
+                .expect("validated interleaved input length");
 
-            // For mono: simple vector wrapping
-            // For stereo: deinterleave
-            let input_block = if self.channels == 1 {
-                vec![chunk]
-            } else {
-                let mut chs: Vec<Vec<f32>> =
-                    vec![Vec::with_capacity(input_frames_needed); self.channels];
-                for frame_idx in 0..input_frames_needed {
-                    #[allow(clippy::needless_range_loop)]
-                    for ch in 0..self.channels {
-                        let idx = frame_idx * self.channels + ch;
-                        chs[ch].push(chunk[idx]);
-                    }
-                }
-                chs
-            };
-
-            match self.resampler.process(&input_block, None) {
-                Ok(output_block) => {
-                    if self.channels == 1 {
-                        output.extend_from_slice(&output_block[0]);
-                    } else {
-                        // Re-interleave stereo
-                        let out_frames = output_block[0].len();
-                        #[allow(clippy::needless_range_loop)]
-                        for i in 0..out_frames {
-                            for ch in 0..self.channels {
-                                output.push(output_block[ch][i]);
-                            }
-                        }
-                    }
-                }
+            match self.resampler.process(&input_block, 0, None) {
+                Ok(output_block) => output.extend(output_block.take_data()),
                 Err(e) => {
                     warn!("Resampler error: {:?}", e);
                     break;
