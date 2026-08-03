@@ -69,7 +69,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use rubato::{
-    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 use tinyaudio::prelude::*;
@@ -985,7 +985,7 @@ async fn run_stereo(
                 let ratio = target_rate as f64 / mpx_sample_rate as f64;
                 let params = SincInterpolationParameters {
                     sinc_len: 128,
-                    f_cutoff: 0.9,
+                    f_cutoff: Some(0.9),
                     interpolation: SincInterpolationType::Cubic,
                     oversampling_factor: 128,
                     window: WindowFunction::BlackmanHarris2,
@@ -1118,7 +1118,7 @@ async fn run_stereo(
                     let input_chunk = InterleavedSlice::new(&raw_leftover[..needed], 1, needed)
                         .expect("validated raw input length");
 
-                    if let Ok(resampled) = resampler.process(&input_chunk, 0, None) {
+                    if let Ok(resampled) = resampler.process(&input_chunk, None) {
                         output.extend(resampled.take_data());
                     }
                     raw_leftover.drain(0..needed);
@@ -1281,7 +1281,7 @@ impl AudioAdaptiveResampler {
     ) -> Self {
         let params = SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Cubic,
             oversampling_factor: 160,
             window: WindowFunction::BlackmanHarris2,
@@ -1390,7 +1390,7 @@ impl AudioAdaptiveResampler {
             let input_block = InterleavedSlice::new(&chunk, self.channels, input_frames_needed)
                 .expect("validated interleaved input length");
 
-            match self.resampler.process(&input_block, 0, None) {
+            match self.resampler.process(&input_block, None) {
                 Ok(output_block) => output.extend(output_block.take_data()),
                 Err(e) => {
                     warn!("Resampler error: {:?}", e);

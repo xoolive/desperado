@@ -195,8 +195,8 @@ impl RdsResamplerCustom {
         let ratio = output_rate as f64 / input_rate as f64;
 
         let params_i = SincInterpolationParameters {
-            sinc_len: 128, // Good quality for this ratio
-            f_cutoff: 0.9, // Cutoff just below Nyquist
+            sinc_len: 128,       // Good quality for this ratio
+            f_cutoff: Some(0.9), // Cutoff just below Nyquist
             interpolation: SincInterpolationType::Cubic,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
@@ -204,7 +204,7 @@ impl RdsResamplerCustom {
 
         let params_q = SincInterpolationParameters {
             sinc_len: 128,
-            f_cutoff: 0.9,
+            f_cutoff: Some(0.9),
             interpolation: SincInterpolationType::Cubic,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
@@ -315,7 +315,7 @@ impl RdsResamplerCustom {
                 input_frames_needed,
             )
             .expect("validated I input length");
-            match self.resampler_i.process(&input_chunk_i, 0, None) {
+            match self.resampler_i.process(&input_chunk_i, None) {
                 Ok(resampled) => {
                     output_i.extend(resampled.take_data());
                 }
@@ -334,7 +334,7 @@ impl RdsResamplerCustom {
                 input_frames_needed,
             )
             .expect("validated Q input length");
-            match self.resampler_q.process(&input_chunk_q, 0, None) {
+            match self.resampler_q.process(&input_chunk_q, None) {
                 Ok(resampled) => {
                     output_q.extend(resampled.take_data());
                 }
@@ -371,7 +371,7 @@ impl RdsResamplerCustom {
             )
             .expect("validated input length");
 
-            match self.resampler_i.process(&input_chunk, 0, None) {
+            match self.resampler_i.process(&input_chunk, None) {
                 Ok(resampled) => {
                     output.extend(resampled.take_data());
                 }

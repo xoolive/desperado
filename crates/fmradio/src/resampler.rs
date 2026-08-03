@@ -21,7 +21,7 @@
 //! ```
 
 use rubato::{
-    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 
@@ -100,7 +100,7 @@ impl AdaptiveResampler {
     ) -> Result<Self, String> {
         let params = SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Cubic,
             oversampling_factor: 160,
             window: WindowFunction::BlackmanHarris2,
@@ -214,7 +214,7 @@ impl AdaptiveResampler {
             let input_block = InterleavedSlice::new(&chunk, self.channels, input_frames_needed)
                 .expect("validated interleaved input length");
 
-            match self.resampler.process(&input_block, 0, None) {
+            match self.resampler.process(&input_block, None) {
                 Ok(output_block) => output.extend(output_block.take_data()),
                 Err(_) => break,
             }
