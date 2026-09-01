@@ -77,7 +77,9 @@ fn decode_rds(offset_hz: i32) -> Vec<RdsGroupJson> {
         buf.truncate(n);
 
         let samples: Vec<num_complex::Complex<f32>> = buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| {
                 let i = (b[0] as f32 - 127.5) / 127.5;
                 let q = (b[1] as f32 - 127.5) / 127.5;

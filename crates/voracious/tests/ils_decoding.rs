@@ -61,7 +61,9 @@ fn load_f32(path: &Path) -> Vec<f64> {
         "file length not a multiple of 4"
     );
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
         .collect()
 }
@@ -113,7 +115,9 @@ fn demodulate_ils_fixture() -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
         buf.truncate(n);
 
         let samples: Vec<num_complex::Complex<f32>> = buf
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|b| {
                 let re = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 let im = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);

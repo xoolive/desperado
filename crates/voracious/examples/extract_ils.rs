@@ -66,7 +66,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Parse cf32 (complex float32, little-endian interleaved)
         let samples: Vec<num_complex::Complex<f32>> = buf
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|b| {
                 let re = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 let im = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);

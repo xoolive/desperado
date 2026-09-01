@@ -1392,15 +1392,21 @@ impl Stream for IqAsyncSource {
 fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>> {
     match format {
         IqFormat::Cu8 => buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| Complex::new((c[0] as f32 - 127.5) / 128.0, (c[1] as f32 - 127.5) / 128.0))
             .collect(),
         IqFormat::Cs8 => buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| Complex::new((c[0] as i8) as f32 / 128.0, (c[1] as i8) as f32 / 128.0))
             .collect(),
         IqFormat::Cs16 => buffer
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 Complex::new(
                     i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0,
@@ -1409,7 +1415,9 @@ fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>
             })
             .collect(),
         IqFormat::Cf32 => buffer
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| {
                 Complex::new(
                     f32::from_le_bytes([c[0], c[1], c[2], c[3]]),

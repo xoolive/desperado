@@ -412,7 +412,7 @@ pub struct AirspySdrReader {
 /// `convert_samples_float`: `(raw - 2048) * (1/2048)`.
 fn convert_airspy_real_to_f32(bytes: &[u8], out: &mut [f32]) -> usize {
     let num_samples = bytes.len() / 2;
-    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
         out[i] = (raw as f32 - 2048.0) / 2048.0;
     }

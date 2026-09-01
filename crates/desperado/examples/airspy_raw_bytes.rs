@@ -80,7 +80,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Interpret as i16 real samples (little-endian)
                 println!("Interpretation 1: REAL i16 samples (LE)");
                 let real_samples: Vec<i16> = buf[..bytes_read.min(64)]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 println!(
@@ -102,7 +104,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Interpret as i16 I/Q pairs (little-endian)
                 println!("\nInterpretation 2: I/Q pairs of i16 (LE)");
                 let iq_samples: Vec<(i16, i16)> = buf[..bytes_read.min(64)]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let i = i16::from_le_bytes([c[0], c[1]]);
                         let q = i16::from_le_bytes([c[2], c[3]]);

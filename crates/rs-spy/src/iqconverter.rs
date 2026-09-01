@@ -180,7 +180,9 @@ impl IqConverter {
 
         // Convert interleaved I/Q to Complex
         real_samples
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|iq| Complex::new(iq[0], iq[1]))
             .collect()
     }
@@ -206,7 +208,7 @@ impl IqConverter {
 
         // Apply rotation sequence in groups of 4
         // Pattern: [-1, -hbc, +1, +hbc]
-        for chunk in samples.chunks_exact_mut(4) {
+        for chunk in samples.as_chunks_mut::<4>().0 {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * hbc;
             // chunk[2] unchanged (multiply by +1)
@@ -420,7 +422,7 @@ mod tests {
         converter.remove_dc(&mut samples);
 
         // Apply rotation sequence
-        for chunk in samples.chunks_exact_mut(4) {
+        for chunk in samples.as_chunks_mut::<4>().0 {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * 0.5;
             // chunk[2] unchanged
@@ -463,7 +465,9 @@ mod tests {
 
         // Convert to complex pairs
         let complex_pairs: Vec<_> = samples
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| Complex::new(chunk[0], chunk[1]))
             .collect();
 
@@ -633,7 +637,12 @@ mod tests {
         converter.process(&mut samples);
 
         // Extract I/Q pairs
-        let pairs: Vec<(f32, f32)> = samples.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let pairs: Vec<(f32, f32)> = samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| (c[0], c[1]))
+            .collect();
 
         // For a properly phase-shifted signal, I and Q should have phase difference
         // Check that they're not identical (would indicate processing failure)
@@ -735,7 +744,7 @@ mod tests {
         let samples_before_fir = samples.clone();
 
         // Apply rotation (samples[0] = -2.0 initially)
-        for chunk in samples.chunks_exact_mut(4) {
+        for chunk in samples.as_chunks_mut::<4>().0 {
             chunk[0] = -chunk[0];
             chunk[1] = -chunk[1] * 0.5;
             chunk[3] *= 0.5;
@@ -783,7 +792,9 @@ mod tests {
 
         // Convert to complex
         let complex: Vec<Complex<f32>> = samples
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| Complex::new(c[0], c[1]))
             .collect();
 
