@@ -15,6 +15,11 @@ use tokio::io::AsyncBufRead;
 
 use crate::{IqFormat, error, expanduser};
 
+pub type ZstdIqReader = zstd::stream::read::Decoder<'static, std::io::BufReader<std::fs::File>>;
+pub type AsyncZstdIqReader = tokio::io::BufReader<
+    async_compression::tokio::bufread::ZstdDecoder<tokio::io::BufReader<tokio::fs::File>>,
+>;
+
 /**
  * I/Q Data Source Configuration
  */
@@ -65,6 +70,22 @@ impl IqRead<std::io::BufReader<std::fs::File>> {
         let path = expanduser(path.as_ref().to_path_buf());
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
+        let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
+        Ok(Self { config, reader })
+    }
+}
+
+impl IqRead<ZstdIqReader> {
+    pub fn from_zstd_file<P: AsRef<Path>>(
+        path: P,
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> error::Result<Self> {
+        let path = expanduser(path.as_ref().to_path_buf());
+        let file = std::fs::File::open(path)?;
+        let reader = zstd::stream::read::Decoder::new(file)?;
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
         Ok(Self { config, reader })
     }
@@ -140,6 +161,24 @@ impl IqAsyncRead<tokio::io::BufReader<tokio::fs::File>> {
             let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
             Ok(IqAsyncRead { config, reader })
         }
+    }
+}
+
+impl IqAsyncRead<AsyncZstdIqReader> {
+    pub async fn from_zstd_file<P: AsRef<Path>>(
+        path: P,
+        center_freq: u32,
+        sample_rate: u32,
+        chunk_size: usize,
+        iq_format: IqFormat,
+    ) -> error::Result<Self> {
+        let path = expanduser(path.as_ref().to_path_buf());
+        let file = tokio::fs::File::open(path).await?;
+        let decoder =
+            async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(file));
+        let reader = tokio::io::BufReader::new(decoder);
+        let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
+        Ok(Self { config, reader })
     }
 }
 

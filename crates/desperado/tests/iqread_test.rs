@@ -1,8 +1,9 @@
 //! Unit and integration tests for the iqread module
 
-use desperado::{IqFormat, IqSource};
+use desperado::{IqAsyncSource, IqFormat, IqSource};
+use futures::StreamExt;
 use std::fs;
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
 
 /// Helper to create a temp file with the given bytes and return (NamedTempFile, path String).
 /// The NamedTempFile must be kept alive for the duration of the test.
@@ -11,6 +12,35 @@ fn temp_iq(data: &[u8]) -> (NamedTempFile, String) {
     let path = f.path().to_str().unwrap().to_string();
     fs::write(&path, data).expect("Failed to write test file");
     (f, path)
+}
+
+#[test]
+fn test_sync_zstd_file_is_decompressed_transparently() {
+    let samples = [0_u8, 255, 127, 128, 255, 0];
+    let compressed = zstd::stream::encode_all(samples.as_slice(), 1).unwrap();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .expect("open compressed IQ source");
+    let chunk = source.next().unwrap().unwrap();
+    assert_eq!(chunk.len(), 3);
+    assert!(source.next().is_none());
+}
+
+#[tokio::test]
+async fn test_async_zstd_file_is_decompressed_transparently() {
+    let samples = [0_u8, 255, 127, 128, 255, 0];
+    let compressed = zstd::stream::encode_all(samples.as_slice(), 1).unwrap();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .expect("open compressed async IQ source");
+    let chunk = source.next().await.unwrap().unwrap();
+    assert_eq!(chunk.len(), 3);
+    assert!(source.next().await.is_none());
 }
 
 #[test]

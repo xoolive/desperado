@@ -849,13 +849,21 @@ impl<'de> Deserialize<'de> for IqFormat {
     }
 }
 
+fn is_zstd_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zst"))
+}
+
 /// Synchronous I/Q Data Source (iterable)
 ///
 /// An enum representing different sources of I/Q data that can be read synchronously.
 /// Implements [`Iterator`] to yield chunks of I/Q samples as [`Complex<f32>`] vectors.
 pub enum IqSource {
-    /// File-based IQ source
+    /// Uncompressed file-based IQ source.
     IqFile(iqread::IqRead<std::io::BufReader<std::fs::File>>),
+    /// Zstandard-compressed file-based IQ source.
+    IqZstdFile(iqread::IqRead<iqread::ZstdIqReader>),
     /// Stdin-based IQ source
     IqStdin(iqread::IqRead<std::io::BufReader<std::io::Stdin>>),
     /// TCP-based IQ source
@@ -883,6 +891,7 @@ impl Iterator for IqSource {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             IqSource::IqFile(source) => source.next(),
+            IqSource::IqZstdFile(source) => source.next(),
             IqSource::IqStdin(source) => source.next(),
             IqSource::IqTcp(source) => source.next(),
             #[cfg(feature = "pluto")]
@@ -899,7 +908,10 @@ impl Iterator for IqSource {
     }
 }
 impl IqSource {
-    /// Create a new file-based I/Q source
+    /// Create a new file-based I/Q source.
+    ///
+    /// Files ending in `.zst` are decompressed incrementally while reading;
+    /// no temporary uncompressed file is created.
     ///
     /// # Example
     ///
@@ -927,9 +939,20 @@ impl IqSource {
         chunk_size: usize,
         iq_format: IqFormat,
     ) -> error::Result<Self> {
-        let source =
-            iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
-        Ok(IqSource::IqFile(source))
+        if is_zstd_path(path.as_ref()) {
+            let source = iqread::IqRead::from_zstd_file(
+                path,
+                center_freq,
+                sample_rate,
+                chunk_size,
+                iq_format,
+            )?;
+            Ok(IqSource::IqZstdFile(source))
+        } else {
+            let source =
+                iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
+            Ok(IqSource::IqFile(source))
+        }
     }
 
     /// Create a new stdin-based I/Q source
@@ -1085,8 +1108,10 @@ impl IqSource {
 ///
 /// Use this when you need non-blocking I/O operations in an async runtime.
 pub enum IqAsyncSource {
-    /// File-based IQ source
+    /// Uncompressed file-based IQ source.
     IqAsyncFile(iqread::IqAsyncRead<tokio::io::BufReader<tokio::fs::File>>),
+    /// Zstandard-compressed file-based IQ source.
+    IqAsyncZstdFile(Box<iqread::IqAsyncRead<iqread::AsyncZstdIqReader>>),
     /// Stdin-based IQ source
     IqAsyncStdin(iqread::IqAsyncRead<tokio::io::BufReader<tokio::io::Stdin>>),
     /// TCP-based IQ source
@@ -1146,7 +1171,10 @@ impl IqAsyncSource {
         }
     }
 
-    /// Create a new file-based asynchronous I/Q source
+    /// Create a new file-based asynchronous I/Q source.
+    ///
+    /// Files ending in `.zst` are decompressed incrementally while reading;
+    /// no temporary uncompressed file is created.
     ///
     /// # Example
     ///
@@ -1178,10 +1206,27 @@ impl IqAsyncSource {
         chunk_size: usize,
         iq_format: IqFormat,
     ) -> error::Result<Self> {
-        let source =
-            iqread::IqAsyncRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)
-                .await?;
-        Ok(IqAsyncSource::IqAsyncFile(source))
+        if is_zstd_path(path.as_ref()) {
+            let source = iqread::IqAsyncRead::from_zstd_file(
+                path,
+                center_freq,
+                sample_rate,
+                chunk_size,
+                iq_format,
+            )
+            .await?;
+            Ok(IqAsyncSource::IqAsyncZstdFile(Box::new(source)))
+        } else {
+            let source = iqread::IqAsyncRead::from_file(
+                path,
+                center_freq,
+                sample_rate,
+                chunk_size,
+                iq_format,
+            )
+            .await?;
+            Ok(IqAsyncSource::IqAsyncFile(source))
+        }
     }
 
     /// Create a new stdin-based asynchronous I/Q source
@@ -1374,6 +1419,7 @@ impl Stream for IqAsyncSource {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
             IqAsyncSource::IqAsyncFile(source) => Pin::new(source).poll_next(cx),
+            IqAsyncSource::IqAsyncZstdFile(source) => Pin::new(source.as_mut()).poll_next(cx),
             IqAsyncSource::IqAsyncStdin(source) => Pin::new(source).poll_next(cx),
             IqAsyncSource::IqAsyncTcp(source) => Pin::new(source).poll_next(cx),
             #[cfg(feature = "pluto")]

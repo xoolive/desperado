@@ -83,11 +83,11 @@ struct Args {
     /// Source: file path, "-" (stdin), or SDR URI (rtlsdr://, airspy://, soapy://)
     source: String,
 
-    /// Center frequency in Hz (accepts k/M suffix, e.g. 105.1M)
+    /// Station frequency in Hz; auto-detected for recognized recording names
     #[arg(short, long, value_parser = Frequency::from_str)]
-    center_freq: Frequency,
+    center_freq: Option<Frequency>,
 
-    /// Sample rate in Hz (default: 3_000_000 for airspy://, 2_000_000 otherwise)
+    /// Input sample rate; auto-detected for recognized recording names
     #[arg(short, long)]
     sample_rate: Option<u32>,
 
@@ -95,9 +95,9 @@ struct Args {
     #[arg(short, long, default_value = None)]
     gain: Option<i32>,
 
-    /// Frequency offset in Hz (can be negative)
-    #[arg(short, long, default_value_t = 200_000, allow_hyphen_values = true)]
-    offset_freq: i32,
+    /// Capture/tuner offset from the station; inferred for recognized files
+    #[arg(short, long, allow_hyphen_values = true)]
+    offset_freq: Option<i32>,
 
     /// Enable automatic frequency correction
     #[arg(short, long, default_value_t = false)]
@@ -119,9 +119,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     tui: bool,
 
-    /// IQ format for file input (cu8, cs8, cs16, cf32)
-    #[arg(long, default_value = "cu8")]
-    format: String,
+    /// IQ format for file input; auto-detected for recognized recording names
+    #[arg(long)]
+    format: Option<String>,
 
     /// Output raw FM-demodulated MPX signal to stdout (for piping to redsea)
     /// Format: signed 16-bit PCM at native MPX rate (use --resample-out for redsea)
@@ -135,9 +135,20 @@ struct Args {
 }
 
 impl Args {
+    fn center_freq_hz(&self) -> u32 {
+        self.center_freq.expect("input arguments resolved").0
+    }
+
     fn sample_rate_hz(&self) -> u32 {
-        self.sample_rate
-            .unwrap_or_else(|| default_sample_rate_for_source(&self.source))
+        self.sample_rate.expect("input arguments resolved")
+    }
+
+    fn offset_freq_hz(&self) -> i32 {
+        self.offset_freq.expect("input arguments resolved")
+    }
+
+    fn format_name(&self) -> &str {
+        self.format.as_deref().expect("input arguments resolved")
     }
 }
 
@@ -147,6 +158,95 @@ fn default_sample_rate_for_source(source: &str) -> u32 {
     } else {
         2_000_000
     }
+}
+
+/// Parse the RTL-SDR recording convention used by the FM fixture corpus:
+/// `rtlsdr_<date>_<centerHz>_<sampleRateHz>_<format>.<ext>`.
+fn parse_rtlsdr_filename(path: &str) -> Option<desperado::gqrx::GqrxMeta> {
+    let file_name = std::path::Path::new(path).file_name()?.to_str()?;
+    let uncompressed_name = file_name
+        .strip_suffix(".zst")
+        .or_else(|| file_name.strip_suffix(".ZST"))
+        .unwrap_or(file_name);
+    let stem = std::path::Path::new(uncompressed_name)
+        .file_stem()?
+        .to_str()?;
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() != 5
+        || !parts[0].eq_ignore_ascii_case("rtlsdr")
+        || parts[1].len() != 8
+        || !parts[1].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let format = IqFormat::from_str(parts[4]).ok()?;
+    Some(desperado::gqrx::GqrxMeta {
+        center_freq_hz: parts[2].parse().ok()?,
+        sample_rate_hz: parts[3].parse().ok()?,
+        format,
+    })
+}
+
+fn resolve_input_args(args: &mut Args) -> desperado::Result<()> {
+    let is_file = args.source != "-" && !is_device_uri(&args.source);
+    let metadata = is_file
+        .then(|| {
+            desperado::gqrx::parse_gqrx_filename(&args.source)
+                .or_else(|| parse_rtlsdr_filename(&args.source))
+        })
+        .flatten();
+
+    let target_center = args
+        .center_freq
+        .map(|frequency| frequency.0)
+        .or_else(|| metadata.map(|meta| meta.center_freq_hz))
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "--center-freq is required unless it can be detected from the file name",
+            )
+        })?;
+    let sample_rate = args
+        .sample_rate
+        .or_else(|| metadata.map(|meta| meta.sample_rate_hz))
+        .unwrap_or_else(|| default_sample_rate_for_source(&args.source));
+    let format = args
+        .format
+        .clone()
+        .or_else(|| metadata.map(|meta| meta.format.to_string()))
+        .unwrap_or_else(|| "cu8".to_string());
+    IqFormat::from_str(&format)
+        .map_err(|error| std::io::Error::other(format!("Invalid format: {error}")))?;
+
+    // The historical device default tunes 200 kHz above the station and
+    // digitally shifts back. A filename-aware file defaults to its actual
+    // capture-center delta instead; an on-station recording therefore uses 0.
+    let offset = if let Some(offset) = args.offset_freq {
+        offset
+    } else if let Some(meta) = metadata {
+        i32::try_from(i64::from(meta.center_freq_hz) - i64::from(target_center)).map_err(|_| {
+            std::io::Error::other("capture/target frequency difference exceeds i32 range")
+        })?
+    } else {
+        200_000
+    };
+
+    args.center_freq = Some(Frequency(target_center));
+    args.sample_rate = Some(sample_rate);
+    args.format = Some(format.clone());
+    args.offset_freq = Some(offset);
+
+    if let Some(meta) = metadata {
+        info!(
+            capture_center_hz = meta.center_freq_hz,
+            target_center_hz = target_center,
+            sample_rate_hz = sample_rate,
+            format,
+            offset_hz = offset,
+            "Auto-detected IQ capture parameters from file name"
+        );
+    }
+    Ok(())
 }
 
 const FM_BANDWIDTH: f32 = 240_000.0;
@@ -430,7 +530,7 @@ fn tuning_freq_from_center(center_freq_hz: u32, offset_freq_hz: i32) -> u32 {
 
 #[tokio::main]
 async fn main() -> desperado::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Initialize tracing with verbosity level
     // 0 = WARN (quiet), 1 = INFO, 2 = DEBUG, 3+ = TRACE
@@ -460,11 +560,13 @@ async fn main() -> desperado::Result<()> {
         )
         .try_init();
 
+    resolve_input_args(&mut args)?;
+
     // Create IQ source based on selected type
-    let mut current_center_hz = args.center_freq.0;
+    let mut current_center_hz = args.center_freq_hz();
     let (mut iq_source, effective_gain) = build_iq_source(
         &args,
-        tuning_freq_from_center(current_center_hz, args.offset_freq),
+        tuning_freq_from_center(current_center_hz, args.offset_freq_hz()),
     )
     .await?;
 
@@ -511,7 +613,7 @@ async fn main() -> desperado::Result<()> {
     let tui_state = Arc::new(Mutex::new(TuiState {
         mode: if initial_stereo { "stereo" } else { "mono" },
         source: args.source.clone(),
-        center_freq_hz: args.center_freq.0,
+        center_freq_hz: args.center_freq_hz(),
         sample_rate_hz: args.sample_rate_hz(),
         mpx_rate_hz: 0.0,
         iq_level_dbfs: -120.0,
@@ -552,7 +654,7 @@ async fn main() -> desperado::Result<()> {
     });
 
     let mut rotate =
-        Rotate::new(-2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32);
+        Rotate::new(-2.0 * PI * args.offset_freq_hz() as f32 / args.sample_rate_hz() as f32);
     let mut phase_extractor = PhaseExtractor::new();
     let factor = (args.sample_rate_hz() as f32 / FM_BANDWIDTH).round() as usize;
     let mut decimator = Decimator::new(factor);
@@ -648,7 +750,7 @@ async fn build_iq_source(
     tuning_freq: u32,
 ) -> desperado::Result<(IqAsyncSource, Option<f64>)> {
     if args.source == "-" {
-        let format = IqFormat::from_str(&args.format)
+        let format = IqFormat::from_str(args.format_name())
             .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
         let gain = args.gain.map(|g| g as f64 / 10.0);
         return Ok((
@@ -658,7 +760,7 @@ async fn build_iq_source(
     }
 
     if !is_device_uri(&args.source) {
-        let format = IqFormat::from_str(&args.format)
+        let format = IqFormat::from_str(args.format_name())
             .map_err(|e| std::io::Error::other(format!("Invalid format: {}", e)))?;
         let gain = args.gain.map(|g| g as f64 / 10.0);
         return Ok((
@@ -805,13 +907,15 @@ async fn run_mono(
                 RtlSdrMessage::Frequency(desired_center)
                     if desired_center != *current_center_hz =>
                 {
-                    let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
+                    let tuning_freq =
+                        tuning_freq_from_center(desired_center, args.offset_freq_hz());
                     match iq_source.tune(tuning_freq) {
                         Ok(()) => {
                             *current_center_hz = desired_center;
                             // Reset DSP state so demod/RDS reacquires on the new station.
                             *rotate = Rotate::new(
-                                -2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32,
+                                -2.0 * PI * args.offset_freq_hz() as f32
+                                    / args.sample_rate_hz() as f32,
                             );
                             phase_extractor.reset();
                             decimator.reset();
@@ -1024,13 +1128,15 @@ async fn run_stereo(
                 RtlSdrMessage::Frequency(desired_center)
                     if desired_center != *current_center_hz =>
                 {
-                    let tuning_freq = tuning_freq_from_center(desired_center, args.offset_freq);
+                    let tuning_freq =
+                        tuning_freq_from_center(desired_center, args.offset_freq_hz());
                     match iq_source.tune(tuning_freq) {
                         Ok(()) => {
                             *current_center_hz = desired_center;
                             // Reset DSP state so stereo/RDS lock is reacquired for new station.
                             *rotate = Rotate::new(
-                                -2.0 * PI * args.offset_freq as f32 / args.sample_rate_hz() as f32,
+                                -2.0 * PI * args.offset_freq_hz() as f32
+                                    / args.sample_rate_hz() as f32,
                             );
                             phase_extractor.reset();
                             decimator.reset();
@@ -1428,6 +1534,66 @@ fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_args(source: &str) -> Args {
+        Args {
+            source: source.to_string(),
+            center_freq: None,
+            sample_rate: None,
+            gain: None,
+            offset_freq: None,
+            afc: false,
+            mono: false,
+            verbose: 0,
+            no_audio: true,
+            tui: false,
+            format: None,
+            raw_out: false,
+            resample_out: None,
+        }
+    }
+
+    #[test]
+    fn resolves_gqrx_file_metadata_without_flags() {
+        let mut args = file_args("gqrx_20260728_225737_94500000_1024000_fc.raw");
+        resolve_input_args(&mut args).unwrap();
+        assert_eq!(args.center_freq_hz(), 94_500_000);
+        assert_eq!(args.sample_rate_hz(), 1_024_000);
+        assert_eq!(args.format_name(), "cf32");
+        assert_eq!(args.offset_freq_hz(), 0);
+    }
+
+    #[test]
+    fn resolves_rtlsdr_file_metadata_and_compression_suffix() {
+        let mut args = file_args("rtlsdr_20210215_103300000_1102500_cu8.bin.zst");
+        resolve_input_args(&mut args).unwrap();
+        assert_eq!(args.center_freq_hz(), 103_300_000);
+        assert_eq!(args.sample_rate_hz(), 1_102_500);
+        assert_eq!(args.format_name(), "cu8");
+        assert_eq!(args.offset_freq_hz(), 0);
+    }
+
+    #[test]
+    fn explicit_station_uses_capture_center_delta() {
+        let mut args = file_args("gqrx_20260728_225737_94500000_1024000_fc.raw");
+        args.center_freq = Some(Frequency(94_700_000));
+        resolve_input_args(&mut args).unwrap();
+        assert_eq!(args.offset_freq_hz(), -200_000);
+    }
+
+    #[test]
+    fn explicit_file_parameters_override_filename() {
+        let mut args = file_args("gqrx_20260728_225737_94500000_1024000_fc.raw");
+        args.center_freq = Some(Frequency(95_000_000));
+        args.sample_rate = Some(2_400_000);
+        args.format = Some("cs16".to_string());
+        args.offset_freq = Some(123_000);
+        resolve_input_args(&mut args).unwrap();
+        assert_eq!(args.center_freq_hz(), 95_000_000);
+        assert_eq!(args.sample_rate_hz(), 2_400_000);
+        assert_eq!(args.format_name(), "cs16");
+        assert_eq!(args.offset_freq_hz(), 123_000);
+    }
 
     #[test]
     fn hackrf_default_uri_enables_rf_amp() {
