@@ -1,6 +1,6 @@
 //! Stream RX samples from HackRF to a file.
 //!
-//! This example demonstrates synchronous bulk streaming from a HackRF device.
+//! This example demonstrates multi-transfer streaming from a HackRF device.
 //! Samples are written to a file in raw 8-bit signed I/Q format (compatible
 //! with GNU Radio, Inspectrum, hackrf_transfer, and other SDR tools).
 //!
@@ -23,8 +23,8 @@
 //! - Each I and Q sample is an `i8` value (-128 to 127)
 //! - Compatible with hackrf_transfer -r output
 
+use rs_hackrf::HackRf;
 use rs_hackrf::transport::board_id_name;
-use rs_hackrf::{HackRf, RECOMMENDED_BUFFER_SIZE};
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
@@ -180,7 +180,7 @@ struct Stats {
 
 fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
     eprintln!("Opening HackRF device...");
-    let mut hackrf = HackRf::open_first()?;
+    let hackrf = HackRf::open_first()?;
 
     // Device info
     let board_id = hackrf.board_id()?;
@@ -236,21 +236,21 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
         args.sample_rate as f64 / 1_000_000.0
     );
 
-    // Start streaming
+    // Start multi-transfer streaming. A disconnect is reported as an error
+    // from `recv()` rather than an indistinguishable end-of-stream.
     eprintln!("Starting RX streaming...");
-    hackrf.start_rx()?;
+    let reader = hackrf.into_streaming_reader(0, 0)?;
 
-    let mut buf = vec![0u8; RECOMMENDED_BUFFER_SIZE];
     let mut total_bytes: usize = 0;
     let start_time = Instant::now();
     let duration = Duration::from_secs_f64(args.duration_secs);
 
     // Read loop
     while start_time.elapsed() < duration {
-        match hackrf.read_sync(&mut buf) {
-            Ok(n) if n > 0 => {
-                output.write_all(&buf[..n])?;
-                total_bytes += n;
+        match reader.recv() {
+            Some(Ok(bytes)) if !bytes.is_empty() => {
+                output.write_all(&bytes)?;
+                total_bytes += bytes.len();
 
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let rate = total_bytes as f64 / elapsed / 1_000_000.0;
@@ -260,19 +260,11 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
                     rate
                 );
             }
-            Ok(_) => {
-                tracing::debug!("Zero-length read");
-            }
-            Err(e) => {
-                eprintln!("\nRead error: {}", e);
-                break;
-            }
+            Some(Ok(_)) => tracing::debug!("Zero-length read"),
+            Some(Err(error)) => return Err(error.into()),
+            None => return Err("HackRF stream ended unexpectedly".into()),
         }
     }
-
-    // Stop streaming
-    eprintln!("\nStopping RX...");
-    hackrf.stop_rx()?;
 
     let actual_duration = start_time.elapsed().as_secs_f64();
 

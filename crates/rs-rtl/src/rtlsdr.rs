@@ -218,6 +218,7 @@ impl DeviceDescriptors {
 ///
 /// let reader = sdr.start_streaming()?;
 /// while let Some(data) = reader.recv() {
+///     let data = data?;
 ///     // process IQ data...
 /// }
 /// # Ok::<(), rs_rtl::Error>(())
@@ -722,7 +723,7 @@ impl RtlSdr {
             .write_reg(device::BLOCK_USB, device::USB_EPA_CTL, 0x0000, 2)?;
 
         // Create the sample delivery channel
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(queue_depth);
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(queue_depth);
 
         // Shared stop flag
         let stop = Arc::new(AtomicBool::new(false));
@@ -803,7 +804,7 @@ enum StreamControl {
 ///
 /// Dropping this handle stops the streaming thread.
 pub struct AsyncReadHandle {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     ctrl_tx: Option<mpsc::Sender<StreamControl>>,
@@ -813,14 +814,15 @@ pub struct AsyncReadHandle {
 impl AsyncReadHandle {
     /// Receive the next chunk of IQ data (blocking).
     ///
-    /// Returns `None` if the streaming thread has exited (device disconnected
-    /// or stop requested).
-    pub fn recv(&self) -> Option<Vec<u8>> {
+    /// Returns `None` after clean shutdown, or `Some(Err(_))` when the
+    /// streaming thread terminates unexpectedly (for example after unplugging
+    /// the device).
+    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
         self.rx.recv().ok()
     }
 
     /// Try to receive the next chunk without blocking.
-    pub fn try_recv(&self) -> Option<Vec<u8>> {
+    pub fn try_recv(&self) -> Option<Result<Vec<u8>>> {
         self.rx.try_recv().ok()
     }
 
@@ -919,7 +921,7 @@ fn streaming_thread(
     dev: Device,
     mut tuner: R82xx,
     rtl_xtal_freq: u32,
-    tx: mpsc::SyncSender<Vec<u8>>,
+    tx: mpsc::SyncSender<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     ctrl_rx: mpsc::Receiver<StreamControl>,
@@ -934,7 +936,9 @@ fn streaming_thread(
     // Open the bulk IN endpoint
     let iface = dev.interface();
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(BULK_ENDPOINT) else {
-        warn!("failed to open bulk endpoint 0x{:02x}", BULK_ENDPOINT);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{BULK_ENDPOINT:02x}"
+        ))));
         return;
     };
 
@@ -1026,6 +1030,9 @@ fn streaming_thread(
                     "dongle disconnected ({} consecutive transfer errors: {})",
                     consecutive_errors, e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -1054,7 +1061,7 @@ fn streaming_thread(
         // IMPORTANT: We use blocking send here to provide backpressure.
         // Lesson 20.1: never use try_send in real-time signal processing
         // pipelines — dropped samples corrupt protocol framing.
-        match tx.send(data) {
+        match tx.send(Ok(data)) {
             Ok(()) => {}
             Err(_) => {
                 // Channel closed — consumer is gone

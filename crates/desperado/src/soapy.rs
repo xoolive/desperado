@@ -229,7 +229,10 @@ impl AsyncSoapySdrReader {
                         match stream.read(&mut [&mut buffer], 5_000_000) {
                             Ok(len) => {
                                 if len == 0 {
-                                    let _ = tx.blocking_send(Ok(Vec::new()));
+                                    let _ = tx.blocking_send(Err(error::Error::stream_terminated(
+                                        "SoapySDR",
+                                        "reader returned zero samples",
+                                    )));
                                     return;
                                 }
                                 let samples: Vec<Complex<f32>> = buffer[..len]
@@ -247,7 +250,10 @@ impl AsyncSoapySdrReader {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.blocking_send(Err(e.into()));
+                                let _ = tx.blocking_send(Err(error::Error::stream_terminated(
+                                    "SoapySDR",
+                                    e.to_string(),
+                                )));
                                 return;
                             }
                         }

@@ -927,7 +927,9 @@ fn streaming_thread(
 
     // Open the bulk IN endpoint
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(RX_ENDPOINT_ADDRESS) else {
-        tracing::warn!("failed to open bulk endpoint 0x{:02x}", RX_ENDPOINT_ADDRESS);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{RX_ENDPOINT_ADDRESS:02x}"
+        ))));
         return;
     };
 
@@ -940,7 +942,9 @@ fn streaming_thread(
     tracing::debug!("submitted {} initial transfers", num_transfers);
 
     if let Err(e) = dev.set_transceiver_mode(TRANSCEIVER_MODE_RECEIVE) {
-        tracing::warn!("failed to enable HackRF RX mode: {}", e);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to enable HackRF RX mode: {e}"
+        ))));
         ep_in.cancel_all();
         while ep_in.pending() > 0 {
             let _ = ep_in.wait_next_complete(Duration::from_millis(100));
@@ -1005,6 +1009,9 @@ fn streaming_thread(
                     consecutive_errors,
                     e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }

@@ -1016,7 +1016,9 @@ fn streaming_thread(
 
     // Open the bulk IN endpoint
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(BULK_ENDPOINT_IN) else {
-        tracing::warn!("failed to open bulk endpoint 0x{:02x}", BULK_ENDPOINT_IN);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{BULK_ENDPOINT_IN:02x}"
+        ))));
         return;
     };
 
@@ -1073,6 +1075,9 @@ fn streaming_thread(
                     consecutive_errors,
                     e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }

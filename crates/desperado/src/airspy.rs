@@ -759,6 +759,8 @@ impl AsyncAirspySdrReader {
             let mut float_buf = vec![0.0f32; max_samples];
             let mut iq_converter = IqConverter::new();
             let mut chunk_count = 0usize;
+            let mut consumer_closed = false;
+            let mut terminal_error_sent = false;
 
             while let Some(chunk_res) = reader.recv() {
                 match chunk_res {
@@ -790,15 +792,30 @@ impl AsyncAirspySdrReader {
                         // pipelines — dropped samples corrupt protocol framing).
                         if tx.blocking_send(Ok(samples)).is_err() {
                             debug!("Airspy channel closed, exiting");
+                            consumer_closed = true;
                             break;
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .blocking_send(Err(error::Error::device(format!("Read error: {}", e))));
+                        terminal_error_sent = true;
+                        if tx
+                            .blocking_send(Err(error::Error::stream_terminated(
+                                "Airspy",
+                                e.to_string(),
+                            )))
+                            .is_err()
+                        {
+                            consumer_closed = true;
+                        }
                         break;
                     }
                 }
+            }
+            if !consumer_closed && !terminal_error_sent {
+                let _ = tx.blocking_send(Err(error::Error::stream_terminated(
+                    "Airspy",
+                    "reader ended unexpectedly",
+                )));
             }
             debug!(chunks = chunk_count, "Airspy background thread exiting");
         });

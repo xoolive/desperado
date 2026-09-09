@@ -26,6 +26,7 @@
 //!
 //! let reader = sdr.start_streaming()?;
 //! while let Some(data) = reader.recv() {
+//!     let data = data?;
 //!     // data contains interleaved u8 I/Q samples: [I0, Q0, I1, Q1, ...]
 //!     println!("received {} bytes", data.len());
 //! }

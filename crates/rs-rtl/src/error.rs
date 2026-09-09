@@ -61,6 +61,10 @@ pub enum Error {
     #[error("timeout waiting for USB data")]
     Timeout,
 
+    /// Streaming terminated unexpectedly.
+    #[error("streaming error: {0}")]
+    StreamingError(String),
+
     /// Invalid parameter supplied by the caller.
     #[error("invalid parameter: {0}")]
     InvalidParam(String),
