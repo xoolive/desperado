@@ -89,8 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rs_rtl::NUM_TRANSFERS
     );
     let reader = sdr.start_streaming()?;
-    while let Some(bytes) = reader.recv() {
-        let bytes = bytes?;
+    while let Some(bytes) = reader.recv()? {
         if !infinite {
             let samples_in_chunk = bytes.len() as u64 / 2;
             if samples_in_chunk >= remaining {

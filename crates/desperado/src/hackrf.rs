@@ -300,42 +300,28 @@ impl AsyncHackRfReader {
         std::thread::Builder::new()
             .name("hackrf-bridge".into())
             .spawn(move || {
-                let mut consumer_closed = false;
-                let mut terminal_error_sent = false;
-                while let Some(result) = reader.recv() {
-                    match result {
-                        Ok(bytes) => {
+                loop {
+                    match reader.recv() {
+                        Ok(Some(bytes)) => {
                             if bytes.is_empty() {
                                 continue;
                             }
                             let samples =
                                 Ok(crate::convert_bytes_to_complex(IqFormat::Cs8, &bytes));
                             if samples_tx.blocking_send(samples).is_err() {
-                                consumer_closed = true;
                                 break; // consumer dropped
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("HackRF read error: {e}");
-                            terminal_error_sent = true;
-                            if samples_tx
-                                .blocking_send(Err(error::Error::stream_terminated(
-                                    "HackRF",
-                                    e.to_string(),
-                                )))
-                                .is_err()
-                            {
-                                consumer_closed = true;
-                            }
+                        Ok(None) => break,
+                        Err(reader_error) => {
+                            tracing::error!("HackRF read error: {reader_error}");
+                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
+                                "HackRF",
+                                reader_error.to_string(),
+                            )));
                             break;
                         }
                     }
-                }
-                if !consumer_closed && !terminal_error_sent {
-                    let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
-                        "HackRF",
-                        "reader ended unexpectedly",
-                    )));
                 }
             })
             .map_err(|e| {

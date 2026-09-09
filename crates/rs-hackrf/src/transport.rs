@@ -51,6 +51,17 @@ pub enum StreamControl {
     SetAmpEnable(bool),
 }
 
+/// Result of a non-blocking receive attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecv<T> {
+    /// A sample chunk is available.
+    Item(T),
+    /// The reader is still active but no chunk is available yet.
+    Empty,
+    /// The reader stopped cleanly.
+    End,
+}
+
 /// Handle for receiving streaming data from a HackRF device.
 ///
 /// Obtained from [`HackRf::into_streaming_reader()`]. The streaming thread
@@ -77,15 +88,32 @@ pub struct AsyncReadControlHandle {
 impl AsyncReadHandle {
     /// Receive the next chunk of raw IQ bytes (blocking).
     ///
-    /// Returns `None` when the streaming thread has exited (device disconnected,
-    /// stop requested, or handle dropped).
-    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.recv().ok()
+    /// Returns `Ok(None)` after an intentional stop. An unexpected reader
+    /// termination, including a device disconnect, is returned as `Err`.
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        match self.rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
+            Err(_) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Try to receive the next chunk without blocking.
-    pub fn try_recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.try_recv().ok()
+    pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
+        match self.rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::TryRecvError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Get a clonable control handle for sending commands to the streaming thread.
@@ -1073,7 +1101,55 @@ fn streaming_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_baseband_filter_bw;
+    use super::*;
+
+    fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel();
+        let handle = AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            thread: None,
+        };
+        (handle, tx)
+    }
+
+    #[test]
+    fn recv_distinguishes_data_error_and_clean_end() {
+        let (handle, tx) = handle();
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(handle.recv().unwrap(), Some(vec![1, 2]));
+
+        tx.send(Err(Error::StreamingError("unplugged".into())))
+            .unwrap();
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message == "unplugged")
+        );
+
+        handle.stop();
+        drop(tx);
+        assert_eq!(handle.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn recv_rejects_unexpected_channel_close() {
+        let (handle, tx) = handle();
+        drop(tx);
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message.contains("ended unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn try_recv_distinguishes_empty_and_end() {
+        let (handle, tx) = handle();
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::Empty));
+        handle.stop();
+        drop(tx);
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::End));
+    }
 
     #[test]
     fn baseband_filter_bandwidth_matches_libhackrf_round_down() {

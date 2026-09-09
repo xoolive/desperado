@@ -260,15 +260,16 @@ impl RtlSdrReader {
             };
             let _ = tx_init.send(Ok(()));
 
-            while let Some(data) = reader.recv() {
-                match data {
-                    Ok(data) if data.is_empty() => continue,
-                    Ok(data) => {
+            loop {
+                match reader.recv() {
+                    Ok(Some(data)) if data.is_empty() => continue,
+                    Ok(Some(data)) => {
                         // Use blocking send for backpressure (lesson 20.1)
                         if tx.send(Ok(data)).is_err() {
                             break;
                         }
                     }
+                    Ok(None) => break,
                     Err(error) => {
                         let _ = tx.send(Err(error.to_string()));
                         break;
@@ -377,38 +378,24 @@ impl AsyncRtlSdrReader {
             .spawn(move || {
                 // Keep sdr alive so the device is not dropped while streaming
                 let _sdr = sdr;
-                let mut consumer_closed = false;
-                let mut terminal_error_sent = false;
-                while let Some(bytes) = reader.recv() {
-                    match bytes {
-                        Ok(bytes) => {
+                loop {
+                    match reader.recv() {
+                        Ok(Some(bytes)) => {
                             let samples =
                                 Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
                             if samples_tx.blocking_send(samples).is_err() {
-                                consumer_closed = true;
                                 break;
                             }
                         }
-                        Err(error) => {
-                            terminal_error_sent = true;
-                            if samples_tx
-                                .blocking_send(Err(error::Error::stream_terminated(
-                                    "RTL-SDR",
-                                    error.to_string(),
-                                )))
-                                .is_err()
-                            {
-                                consumer_closed = true;
-                            }
+                        Ok(None) => break,
+                        Err(reader_error) => {
+                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
+                                "RTL-SDR",
+                                reader_error.to_string(),
+                            )));
                             break;
                         }
                     }
-                }
-                if !consumer_closed && !terminal_error_sent {
-                    let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
-                        "RTL-SDR",
-                        "reader ended unexpectedly",
-                    )));
                 }
             })
             .map_err(|e| error::Error::device(format!("Failed to spawn bridge thread: {e}")))?;

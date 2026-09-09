@@ -30,7 +30,7 @@ fn main() {
 
     while start.elapsed().as_secs() < 5 {
         match reader.recv() {
-            Some(Ok(data)) => {
+            Ok(Some(data)) => {
                 total_bytes += data.len() as u64;
                 chunk_count += 1;
 
@@ -44,11 +44,11 @@ fn main() {
                     println!("...\n");
                 }
             }
-            Some(Err(error)) => {
+            Err(error) => {
                 eprintln!("Stream terminated: {error}");
                 break;
             }
-            None => break,
+            Ok(None) => break,
         }
     }
 

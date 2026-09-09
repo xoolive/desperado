@@ -257,7 +257,7 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
     // Read loop
     while start_time.elapsed() < duration {
         match reader.recv() {
-            Some(Ok(bytes)) if !bytes.is_empty() => {
+            Ok(Some(bytes)) if !bytes.is_empty() => {
                 output.write_all(&bytes)?;
                 total_bytes += bytes.len();
 
@@ -270,9 +270,9 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
                     rate
                 );
             }
-            Some(Ok(_)) => tracing::debug!("Zero-length read"),
-            Some(Err(error)) => return Err(error.into()),
-            None => return Err("Airspy stream ended unexpectedly".into()),
+            Ok(Some(_)) => tracing::debug!("Zero-length read"),
+            Err(error) => return Err(error.into()),
+            Ok(None) => break,
         }
     }
 
