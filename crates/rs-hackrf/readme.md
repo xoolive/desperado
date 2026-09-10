@@ -73,7 +73,7 @@ let ctrl = reader.control_handle();
 ctrl.tune(200_000_000)?;
 ctrl.set_lna_gain(32)?;
 
-while let Some(Ok(data)) = reader.recv() {
+while let Some(data) = reader.recv()? {
     // data: Vec<u8> of interleaved i8 I/Q samples
     println!("received {} bytes", data.len());
 }

@@ -36,7 +36,7 @@ Add Desperado to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-desperado = "0.1"
+desperado = "0.5"
 ```
 
 ### With SDR device support
@@ -45,15 +45,15 @@ To use hardware SDR devices, enable the appropriate feature flags:
 
 ```toml
 [dependencies]
-desperado = { version = "0.1", features = ["rtlsdr"] }  # For RTL-SDR devices
+desperado = { version = "0.5", features = ["rtlsdr"] }  # For RTL-SDR devices
 # or
-desperado = { version = "0.1", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
+desperado = { version = "0.5", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
 # or
-desperado = { version = "0.1", features = ["hackrf"] }  # For HackRF devices
+desperado = { version = "0.5", features = ["hackrf"] }  # For HackRF devices
 # or
-desperado = { version = "0.1", features = ["soapy"] }   # For SoapySDR-compatible devices
+desperado = { version = "0.5", features = ["soapy"] }   # For SoapySDR-compatible devices
 # or
-desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto devices
+desperado = { version = "0.5", features = ["pluto"] }   # For Adalm-Pluto devices
 ```
 
 ### Available features
@@ -125,15 +125,28 @@ async fn main() -> desperado::Result<()> {
     let center_freq = 1_090_000_000;
     let gain = Some(496);
 
-    let reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
+    let mut reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
 
-    while let Some(samples) = reader.next().await {
+    while let Some(chunk) = reader.next().await {
+        let samples = chunk?;
         // Process samples...
     }
 
     Ok(())
 }
 ```
+
+### Streaming contract
+
+`IqAsyncSource` yields `Result<Vec<Complex<f32>>>` items. A live device or
+bridge failure is returned as `Error::StreamTerminated`; clean completion is
+represented by the stream ending. For controlled shutdown of a live source,
+call `source.stop().await` before dropping it.
+
+The low-level `rs-rtl`, `rs-spy`, and `rs-hackrf` readers return
+`Result<Option<Vec<u8>>>`: data is `Ok(Some(_))`, a clean stop is `Ok(None)`,
+and a device or transport failure is `Err(_)`. Their nonblocking `try_recv()`
+methods distinguish `TryRecv::Empty` from `TryRecv::End`.
 
 ### More data sources
 

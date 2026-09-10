@@ -74,7 +74,7 @@ let reader = device.into_multi_transfer_reader(0, 0)?; // 0 = use defaults
 let ctrl = reader.control_handle();
 ctrl.tune(200_000_000)?;
 
-while let Some(Ok(data)) = reader.recv() {
+while let Some(data) = reader.recv()? {
     // data: Vec<u8> of raw 16-bit real ADC samples
     println!("received {} bytes", data.len());
 }
