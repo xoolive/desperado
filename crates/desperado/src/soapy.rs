@@ -149,17 +149,35 @@ impl Iterator for SoapySdrReader {
     }
 }
 
+/// Event sent from the blocking Soapy worker to its async stream adapter.
+///
+/// A `futures::Stream` represents clean completion as `None`; this enum keeps
+/// successful samples and terminal failures explicit inside the worker bridge.
+enum AsyncReadEvent {
+    Samples(Vec<Complex<f32>>),
+    Terminated(error::Error),
+}
+
+impl AsyncReadEvent {
+    fn into_stream_item(self) -> error::Result<Vec<Complex<f32>>> {
+        match self {
+            Self::Samples(samples) => Ok(samples),
+            Self::Terminated(error) => Err(error),
+        }
+    }
+}
+
 /**
  * Asynchronous SoapySDR I/Q Reader
  */
 pub struct AsyncSoapySdrReader {
-    rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
+    rx: tokio::sync::mpsc::Receiver<AsyncReadEvent>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl AsyncSoapySdrReader {
     pub fn new(config: &SoapyConfig) -> error::Result<Self> {
-        let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
+        let (tx, rx) = tokio::sync::mpsc::channel::<AsyncReadEvent>(32);
         let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
@@ -229,7 +247,12 @@ impl AsyncSoapySdrReader {
                         match stream.read(&mut [&mut buffer], 5_000_000) {
                             Ok(len) => {
                                 if len == 0 {
-                                    let _ = tx.blocking_send(Ok(Vec::new()));
+                                    let _ = tx.blocking_send(AsyncReadEvent::Terminated(
+                                        error::Error::stream_terminated(
+                                            "SoapySDR",
+                                            "reader returned zero samples",
+                                        ),
+                                    ));
                                     return;
                                 }
                                 let samples: Vec<Complex<f32>> = buffer[..len]
@@ -242,12 +265,14 @@ impl AsyncSoapySdrReader {
                                     })
                                     .collect();
 
-                                if tx.blocking_send(Ok(samples)).is_err() {
+                                if tx.blocking_send(AsyncReadEvent::Samples(samples)).is_err() {
                                     return;
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.blocking_send(Err(e.into()));
+                                let _ = tx.blocking_send(AsyncReadEvent::Terminated(
+                                    error::Error::stream_terminated("SoapySDR", e.to_string()),
+                                ));
                                 return;
                             }
                         }
@@ -279,7 +304,9 @@ impl Stream for AsyncSoapySdrReader {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = &mut *self;
         match this.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
+            std::task::Poll::Ready(Some(event)) => {
+                std::task::Poll::Ready(Some(event.into_stream_item()))
+            }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
@@ -289,4 +316,28 @@ impl Stream for AsyncSoapySdrReader {
 /// Enumerate available SoapySDR devices
 pub fn enumerate_devices(args: &str) -> Result<Vec<Args>, SoapyError> {
     soapysdr::enumerate(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_event_keeps_samples_and_terminal_errors_distinct() {
+        let samples = vec![Complex::new(0.25, -0.5)];
+        assert_eq!(
+            AsyncReadEvent::Samples(samples.clone())
+                .into_stream_item()
+                .unwrap(),
+            samples
+        );
+        assert!(matches!(
+            AsyncReadEvent::Terminated(error::Error::stream_terminated("SoapySDR", "zero"))
+                .into_stream_item(),
+            Err(error::Error::StreamTerminated {
+                backend: "SoapySDR",
+                ..
+            })
+        ));
+    }
 }

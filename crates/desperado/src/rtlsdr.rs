@@ -260,13 +260,20 @@ impl RtlSdrReader {
             };
             let _ = tx_init.send(Ok(()));
 
-            while let Some(data) = reader.recv() {
-                if data.is_empty() {
-                    continue;
-                }
-                // Use blocking send for backpressure (lesson 20.1)
-                if tx.send(Ok(data)).is_err() {
-                    break;
+            loop {
+                match reader.recv() {
+                    Ok(Some(data)) if data.is_empty() => continue,
+                    Ok(Some(data)) => {
+                        // Use blocking send for backpressure (lesson 20.1)
+                        if tx.send(Ok(data)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string()));
+                        break;
+                    }
                 }
             }
         });
@@ -371,10 +378,23 @@ impl AsyncRtlSdrReader {
             .spawn(move || {
                 // Keep sdr alive so the device is not dropped while streaming
                 let _sdr = sdr;
-                while let Some(bytes) = reader.recv() {
-                    let samples = Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
-                    if samples_tx.blocking_send(samples).is_err() {
-                        break;
+                loop {
+                    match reader.recv() {
+                        Ok(Some(bytes)) => {
+                            let samples =
+                                Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
+                            if samples_tx.blocking_send(samples).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(reader_error) => {
+                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
+                                "RTL-SDR",
+                                reader_error.to_string(),
+                            )));
+                            break;
+                        }
                     }
                 }
             })

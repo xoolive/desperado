@@ -759,10 +759,9 @@ impl AsyncAirspySdrReader {
             let mut float_buf = vec![0.0f32; max_samples];
             let mut iq_converter = IqConverter::new();
             let mut chunk_count = 0usize;
-
-            while let Some(chunk_res) = reader.recv() {
-                match chunk_res {
-                    Ok(bytes) => {
+            loop {
+                match reader.recv() {
+                    Ok(Some(bytes)) => {
                         if bytes.is_empty() {
                             continue;
                         }
@@ -793,9 +792,12 @@ impl AsyncAirspySdrReader {
                             break;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .blocking_send(Err(error::Error::device(format!("Read error: {}", e))));
+                    Ok(None) => break,
+                    Err(reader_error) => {
+                        let _ = tx.blocking_send(Err(error::Error::stream_terminated(
+                            "Airspy",
+                            reader_error.to_string(),
+                        )));
                         break;
                     }
                 }

@@ -300,9 +300,9 @@ impl AsyncHackRfReader {
         std::thread::Builder::new()
             .name("hackrf-bridge".into())
             .spawn(move || {
-                while let Some(result) = reader.recv() {
-                    match result {
-                        Ok(bytes) => {
+                loop {
+                    match reader.recv() {
+                        Ok(Some(bytes)) => {
                             if bytes.is_empty() {
                                 continue;
                             }
@@ -312,11 +312,13 @@ impl AsyncHackRfReader {
                                 break; // consumer dropped
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("HackRF read error: {e}");
-                            let _ = samples_tx.blocking_send(Err(error::Error::device(format!(
-                                "HackRF read error: {e}"
-                            ))));
+                        Ok(None) => break,
+                        Err(reader_error) => {
+                            tracing::error!("HackRF read error: {reader_error}");
+                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
+                                "HackRF",
+                                reader_error.to_string(),
+                            )));
                             break;
                         }
                     }

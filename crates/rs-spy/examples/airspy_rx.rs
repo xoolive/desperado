@@ -1,6 +1,6 @@
 //! Stream samples from Airspy to a file.
 //!
-//! This example demonstrates synchronous bulk streaming from an Airspy device.
+//! This example demonstrates multi-transfer streaming from an Airspy device.
 //! Samples are written to a file in raw 16-bit format (compatible with GNU Radio,
 //! Inspectrum, and other SDR tools).
 //!
@@ -23,7 +23,7 @@
 //! - Sample values are 12-bit resolution in the upper bits (0-4095 << 4)
 //! - Real samples (not IQ) - use external tools for IQ conversion
 
-use rs_spy::{Airspy, RECOMMENDED_BUFFER_SIZE};
+use rs_spy::Airspy;
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
@@ -243,22 +243,23 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
         sample_rate as f64 / 1_000_000.0
     );
 
-    // Start streaming
+    // Airspy requires RX mode before its bulk endpoint produces samples.
+    // The multi-transfer reader then reports a disconnect as an error from
+    // `recv()` rather than an indistinguishable end-of-stream.
     eprintln!("Starting streaming...");
     airspy.start_rx()?;
+    let reader = airspy.into_multi_transfer_reader(0, 0)?;
 
-    // Allocate buffer
-    let mut buf = vec![0u8; RECOMMENDED_BUFFER_SIZE];
     let mut total_bytes: usize = 0;
     let start_time = Instant::now();
     let duration = Duration::from_secs_f64(args.duration_secs);
 
     // Read loop
     while start_time.elapsed() < duration {
-        match airspy.read_sync(&mut buf) {
-            Ok(n) if n > 0 => {
-                output.write_all(&buf[..n])?;
-                total_bytes += n;
+        match reader.recv() {
+            Ok(Some(bytes)) if !bytes.is_empty() => {
+                output.write_all(&bytes)?;
+                total_bytes += bytes.len();
 
                 // Progress indicator (to stderr so it doesn't mix with data)
                 let elapsed = start_time.elapsed().as_secs_f64();
@@ -269,20 +270,11 @@ fn run(args: &Args) -> Result<Stats, Box<dyn std::error::Error>> {
                     rate
                 );
             }
-            Ok(_) => {
-                // Zero bytes read, might be timeout
-                tracing::debug!("Zero-length read");
-            }
-            Err(e) => {
-                eprintln!("\nRead error: {}", e);
-                break;
-            }
+            Ok(Some(_)) => tracing::debug!("Zero-length read"),
+            Err(error) => return Err(error.into()),
+            Ok(None) => break,
         }
     }
-
-    // Stop streaming
-    eprintln!("\nStopping streaming...");
-    airspy.stop_rx()?;
 
     let total_samples = total_bytes / 2; // 16-bit samples
     let actual_duration = start_time.elapsed().as_secs_f64();

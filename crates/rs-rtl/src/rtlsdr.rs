@@ -217,7 +217,7 @@ impl DeviceDescriptors {
 /// sdr.set_gain_manual(496)?;          // 49.6 dB
 ///
 /// let reader = sdr.start_streaming()?;
-/// while let Some(data) = reader.recv() {
+/// while let Some(data) = reader.recv()? {
 ///     // process IQ data...
 /// }
 /// # Ok::<(), rs_rtl::Error>(())
@@ -722,7 +722,7 @@ impl RtlSdr {
             .write_reg(device::BLOCK_USB, device::USB_EPA_CTL, 0x0000, 2)?;
 
         // Create the sample delivery channel
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(queue_depth);
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(queue_depth);
 
         // Shared stop flag
         let stop = Arc::new(AtomicBool::new(false));
@@ -795,6 +795,17 @@ enum StreamControl {
     Stop,
 }
 
+/// Result of a non-blocking receive attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecv<T> {
+    /// A sample chunk is available.
+    Item(T),
+    /// The reader is still active but no chunk is available yet.
+    Empty,
+    /// The reader stopped cleanly.
+    End,
+}
+
 /// Handle to an active streaming session.
 ///
 /// IQ sample data is delivered as `Vec<u8>` chunks through the internal
@@ -803,7 +814,7 @@ enum StreamControl {
 ///
 /// Dropping this handle stops the streaming thread.
 pub struct AsyncReadHandle {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     ctrl_tx: Option<mpsc::Sender<StreamControl>>,
@@ -813,15 +824,35 @@ pub struct AsyncReadHandle {
 impl AsyncReadHandle {
     /// Receive the next chunk of IQ data (blocking).
     ///
-    /// Returns `None` if the streaming thread has exited (device disconnected
-    /// or stop requested).
-    pub fn recv(&self) -> Option<Vec<u8>> {
-        self.rx.recv().ok()
+    /// Returns `Ok(None)` after an intentional stop. An unexpected reader
+    /// termination, including a device disconnect, is returned as `Err`.
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        match self.rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
+            Err(_) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Try to receive the next chunk without blocking.
-    pub fn try_recv(&self) -> Option<Vec<u8>> {
-        self.rx.try_recv().ok()
+    ///
+    /// `Empty` means the reader is still active. `End` means it stopped
+    /// cleanly; unexpected termination is returned as `Err`.
+    pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
+        match self.rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::TryRecvError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Get the number of chunks dropped due to channel backpressure.
@@ -919,7 +950,7 @@ fn streaming_thread(
     dev: Device,
     mut tuner: R82xx,
     rtl_xtal_freq: u32,
-    tx: mpsc::SyncSender<Vec<u8>>,
+    tx: mpsc::SyncSender<Result<Vec<u8>>>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     ctrl_rx: mpsc::Receiver<StreamControl>,
@@ -934,7 +965,9 @@ fn streaming_thread(
     // Open the bulk IN endpoint
     let iface = dev.interface();
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(BULK_ENDPOINT) else {
-        warn!("failed to open bulk endpoint 0x{:02x}", BULK_ENDPOINT);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{BULK_ENDPOINT:02x}"
+        ))));
         return;
     };
 
@@ -1026,6 +1059,9 @@ fn streaming_thread(
                     "dongle disconnected ({} consecutive transfer errors: {})",
                     consecutive_errors, e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -1054,7 +1090,7 @@ fn streaming_thread(
         // IMPORTANT: We use blocking send here to provide backpressure.
         // Lesson 20.1: never use try_send in real-time signal processing
         // pipelines — dropped samples corrupt protocol framing.
-        match tx.send(data) {
+        match tx.send(Ok(data)) {
             Ok(()) => {}
             Err(_) => {
                 // Channel closed — consumer is gone
@@ -1079,4 +1115,56 @@ fn streaming_thread(
         "streaming thread exited (dropped {} chunks)",
         dropped.load(Ordering::Relaxed)
     );
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let handle = AsyncReadHandle {
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            ctrl_tx: None,
+            thread: None,
+        };
+        (handle, tx)
+    }
+
+    #[test]
+    fn recv_distinguishes_data_error_and_clean_end() {
+        let (handle, tx) = handle();
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(handle.recv().unwrap(), Some(vec![1, 2]));
+
+        tx.send(Err(Error::StreamingError("unplugged".into())))
+            .unwrap();
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message == "unplugged")
+        );
+
+        handle.stop();
+        drop(tx);
+        assert_eq!(handle.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn recv_rejects_unexpected_channel_close() {
+        let (handle, tx) = handle();
+        drop(tx);
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message.contains("ended unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn try_recv_distinguishes_empty_and_end() {
+        let (handle, tx) = handle();
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::Empty));
+        handle.stop();
+        drop(tx);
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::End));
+    }
 }
