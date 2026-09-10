@@ -88,7 +88,7 @@ use tracing_subscriber::prelude::*;
 enum IqChunkSource {
     Sync(Box<IqSource>),
     Async {
-        source: IqAsyncSource,
+        source: Box<IqAsyncSource>,
         chunk_size: usize,
         pending: Vec<Complex<f32>>,
     },
@@ -1891,7 +1891,7 @@ async fn open_iq_source(
     let source = IqAsyncSource::from_device_config(&config).await?;
     Ok((
         IqChunkSource::Async {
-            source,
+            source: Box::new(source),
             chunk_size,
             pending: Vec::with_capacity(chunk_size * 2),
         },
