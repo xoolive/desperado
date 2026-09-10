@@ -1162,8 +1162,10 @@ impl IqAsyncSource {
             IqAsyncSource::Airspy(source) => source.stop().await,
             #[cfg(feature = "hackrf")]
             IqAsyncSource::HackRf(source) => source.stop().await,
+            #[cfg(feature = "soapy")]
+            IqAsyncSource::SoapySdr(source) => source.stop().await,
             _ => Err(error::Error::other(
-                "Explicit stop is only supported for live RTL-SDR, Airspy, and HackRF sources",
+                "Explicit stop is only supported for live SDR async sources",
             )),
         }
     }
