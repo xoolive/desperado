@@ -9,10 +9,15 @@
 //! HackRF outputs interleaved 8-bit signed I/Q samples (Cs8) directly over USB.
 //! Each sample pair is `[I, Q]` where both I and Q are `i8` values (-128 to 127).
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::Stream;
 use num_complex::Complex;
 
-use crate::{Gain, GainElement, GainElementName, IqFormat, error};
+use crate::{Gain, GainElement, GainElementName, IqFormat, error, lifecycle};
 
 /// Tokio-side bridge queue depth between the USB reader thread and the async consumer.
 ///
@@ -276,6 +281,8 @@ pub struct AsyncHackRfReader {
     control: rs_hackrf::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
+    cancelled: Arc<AtomicBool>,
+    bridge: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncHackRfReader {
@@ -293,14 +300,19 @@ impl AsyncHackRfReader {
         let control = reader.control_handle();
 
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge_cancelled = Arc::clone(&cancelled);
 
         // Bridge thread: receives raw bytes from the USB streaming thread,
         // converts Cs8 to Complex<f32>, sends to tokio channel.
         // Exits when the consumer drops `samples_rx`.
-        std::thread::Builder::new()
+        let bridge = std::thread::Builder::new()
             .name("hackrf-bridge".into())
             .spawn(move || {
                 loop {
+                    if bridge_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
                     match reader.recv() {
                         Ok(Some(bytes)) => {
                             if bytes.is_empty() {
@@ -308,17 +320,23 @@ impl AsyncHackRfReader {
                             }
                             let samples =
                                 Ok(crate::convert_bytes_to_complex(IqFormat::Cs8, &bytes));
-                            if samples_tx.blocking_send(samples).is_err() {
-                                break; // consumer dropped
+                            if !lifecycle::send_or_cancel(&samples_tx, &bridge_cancelled, samples) {
+                                break;
                             }
                         }
                         Ok(None) => break,
                         Err(reader_error) => {
-                            tracing::error!("HackRF read error: {reader_error}");
-                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
-                                "HackRF",
-                                reader_error.to_string(),
-                            )));
+                            if !bridge_cancelled.load(Ordering::Acquire) {
+                                tracing::error!("HackRF read error: {reader_error}");
+                                let _ = lifecycle::send_or_cancel(
+                                    &samples_tx,
+                                    &bridge_cancelled,
+                                    Err(error::Error::stream_terminated(
+                                        "HackRF",
+                                        reader_error.to_string(),
+                                    )),
+                                );
+                            }
                             break;
                         }
                     }
@@ -331,6 +349,8 @@ impl AsyncHackRfReader {
         Ok(Self {
             control,
             samples_rx,
+            cancelled,
+            bridge: Some(bridge),
         })
     }
 
@@ -357,6 +377,22 @@ impl AsyncHackRfReader {
     /// Change gain setting.
     pub fn set_gain(&self, gain: Gain) -> error::Result<()> {
         self.adjust(HackRfMessage::Gain(gain))
+    }
+
+    /// Stop the live stream and wait for its bridge thread to exit.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        lifecycle::join_bridge(self.bridge.take()).await;
+        Ok(())
+    }
+}
+
+impl Drop for AsyncHackRfReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        // Dropping the JoinHandle detaches; Drop must never block an async executor.
     }
 }
 

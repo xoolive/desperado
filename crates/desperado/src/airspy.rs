@@ -36,12 +36,17 @@
 //! # Ok::<(), desperado::Error>(())
 //! ```
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::Stream;
 use num_complex::Complex;
 use rs_spy::{Airspy, AirspyGainStages, IqConverter, RECOMMENDED_BUFFER_SIZE};
 use tracing::{debug, info, warn};
 
-use crate::{Gain, GainElementName, error};
+use crate::{Gain, GainElementName, error, lifecycle};
 
 /// Airspy gain preset mode
 ///
@@ -686,7 +691,8 @@ pub struct AsyncAirspySdrReader {
     rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
     ctrl: rs_spy::transport::AsyncReadControlHandle,
     gain_mode: AirspyGainMode,
-    _handle: std::thread::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
+    bridge: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncAirspySdrReader {
@@ -696,6 +702,8 @@ impl AsyncAirspySdrReader {
     /// an async channel.
     pub fn new(config: &AirspyConfig) -> error::Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel::<error::Result<Vec<Complex<f32>>>>(32);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge_cancelled = Arc::clone(&cancelled);
         let cfg = config.clone();
 
         let device = open_device_with_selector(&cfg.device)?;
@@ -760,6 +768,9 @@ impl AsyncAirspySdrReader {
             let mut iq_converter = IqConverter::new();
             let mut chunk_count = 0usize;
             loop {
+                if bridge_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
                 match reader.recv() {
                     Ok(Some(bytes)) => {
                         if bytes.is_empty() {
@@ -787,17 +798,23 @@ impl AsyncAirspySdrReader {
                         // Use blocking_send for backpressure (lesson 20.1:
                         // never use try_send in real-time signal processing
                         // pipelines — dropped samples corrupt protocol framing).
-                        if tx.blocking_send(Ok(samples)).is_err() {
-                            debug!("Airspy channel closed, exiting");
+                        if !lifecycle::send_or_cancel(&tx, &bridge_cancelled, Ok(samples)) {
+                            debug!("Airspy bridge cancelled or channel closed, exiting");
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(reader_error) => {
-                        let _ = tx.blocking_send(Err(error::Error::stream_terminated(
-                            "Airspy",
-                            reader_error.to_string(),
-                        )));
+                        if !bridge_cancelled.load(Ordering::Acquire) {
+                            let _ = lifecycle::send_or_cancel(
+                                &tx,
+                                &bridge_cancelled,
+                                Err(error::Error::stream_terminated(
+                                    "Airspy",
+                                    reader_error.to_string(),
+                                )),
+                            );
+                        }
                         break;
                     }
                 }
@@ -809,7 +826,8 @@ impl AsyncAirspySdrReader {
             rx,
             ctrl,
             gain_mode: cfg.gain_mode,
-            _handle: handle,
+            cancelled,
+            bridge: Some(handle),
         })
     }
 
@@ -818,6 +836,14 @@ impl AsyncAirspySdrReader {
     }
 
     /// Send a control message to the device thread (tune or gain change).
+    /// Stop the live stream and wait for its bridge thread to exit.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        self.ctrl.stop();
+        lifecycle::join_bridge(self.bridge.take()).await;
+        Ok(())
+    }
+
     pub fn adjust(&self, message: AirspyMessage) -> error::Result<()> {
         match message {
             AirspyMessage::Frequency(freq) => self
@@ -831,6 +857,14 @@ impl AsyncAirspySdrReader {
                 })
             }
         }
+    }
+}
+
+impl Drop for AsyncAirspySdrReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.ctrl.stop();
+        // Dropping the JoinHandle detaches; Drop must never block an async executor.
     }
 }
 
