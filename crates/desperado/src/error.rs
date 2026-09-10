@@ -21,6 +21,14 @@ pub enum Error {
     /// Invalid I/Q format or conversion error
     Format(String),
 
+    /// Raw I/Q input ended with bytes that cannot form a complete complex sample.
+    TruncatedIq {
+        /// Declared input sample format.
+        format: crate::IqFormat,
+        /// Number of trailing bytes that do not form a full sample.
+        remaining_bytes: usize,
+    },
+
     /// A live SDR stream ended unexpectedly.
     StreamTerminated {
         /// Backend that owned the live stream.
@@ -55,6 +63,16 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "I/O error: {}", err),
             Error::Device(msg) => write!(f, "Device error: {}", msg),
             Error::Format(msg) => write!(f, "Format error: {}", msg),
+            Error::TruncatedIq {
+                format,
+                remaining_bytes,
+            } => write!(
+                f,
+                "truncated {:?} I/Q input: {} trailing byte{}",
+                format,
+                remaining_bytes,
+                if *remaining_bytes == 1 { "" } else { "s" }
+            ),
             Error::StreamTerminated { backend, reason } => {
                 write!(f, "{} stream terminated: {}", backend, reason)
             }
@@ -138,6 +156,14 @@ impl Error {
     /// Create a format error with a custom message
     pub fn format<S: Into<String>>(msg: S) -> Self {
         Error::Format(msg.into())
+    }
+
+    /// Create an error for raw I/Q input with incomplete trailing sample bytes.
+    pub fn truncated_iq(format: crate::IqFormat, remaining_bytes: usize) -> Self {
+        Error::TruncatedIq {
+            format,
+            remaining_bytes,
+        }
     }
 
     /// Create an error for an unexpected live SDR stream termination.

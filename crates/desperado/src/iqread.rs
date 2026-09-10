@@ -47,15 +47,54 @@ impl IqConfig {
 pub struct IqRead<R: Read> {
     config: IqConfig,
     reader: R,
+    ended: bool,
+    pending_truncation: Option<error::Error>,
 }
 
 impl<R: Read> IqRead<R> {
-    fn read_samples(&mut self) -> error::Result<Vec<Complex<f32>>> {
+    fn new(config: IqConfig, reader: R) -> Self {
+        Self {
+            config,
+            reader,
+            ended: false,
+            pending_truncation: None,
+        }
+    }
+
+    fn read_samples(&mut self) -> error::Result<Option<Vec<Complex<f32>>>> {
         let bytes_per_sample = self.config.iq_format.bytes_per_sample();
         let mut buffer = vec![0u8; self.config.chunk_size * bytes_per_sample];
-        self.reader.read_exact(&mut buffer)?;
+        let mut total_read = 0;
+
+        while total_read < buffer.len() {
+            match self.reader.read(&mut buffer[total_read..]) {
+                Ok(0) => break,
+                Ok(read) => total_read += read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if total_read == 0 {
+            self.ended = true;
+            return Ok(None);
+        }
+
+        let complete_bytes = total_read - total_read % bytes_per_sample;
+        let remaining_bytes = total_read - complete_bytes;
+        if remaining_bytes != 0 {
+            let error = error::Error::truncated_iq(self.config.iq_format, remaining_bytes);
+            if complete_bytes == 0 {
+                self.ended = true;
+                return Err(error);
+            }
+            self.pending_truncation = Some(error);
+        }
+
+        buffer.truncate(complete_bytes);
         let samples = crate::convert_bytes_to_complex(self.config.iq_format, &buffer);
-        Ok(samples)
+        Ok(Some(samples))
     }
 }
 
@@ -71,7 +110,7 @@ impl IqRead<std::io::BufReader<std::fs::File>> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
-        Ok(Self { config, reader })
+        Ok(Self::new(config, reader))
     }
 }
 
@@ -87,7 +126,7 @@ impl IqRead<ZstdIqReader> {
         let file = std::fs::File::open(path)?;
         let reader = zstd::stream::read::Decoder::new(file)?;
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
-        Ok(Self { config, reader })
+        Ok(Self::new(config, reader))
     }
 }
 
@@ -100,7 +139,7 @@ impl IqRead<std::io::BufReader<std::io::Stdin>> {
     ) -> Self {
         let reader = std::io::BufReader::new(std::io::stdin());
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
-        Self { config, reader }
+        Self::new(config, reader)
     }
 }
 
@@ -116,7 +155,7 @@ impl IqRead<std::io::BufReader<std::net::TcpStream>> {
         let stream = std::net::TcpStream::connect((addr, port))?;
         let reader = std::io::BufReader::new(stream);
         let config = IqConfig::new(center_freq, sample_rate, chunk_size, iq_format);
-        Ok(Self { config, reader })
+        Ok(Self::new(config, reader))
     }
 }
 
@@ -124,13 +163,17 @@ impl<R: Read> Iterator for IqRead<R> {
     type Item = error::Result<Vec<Complex<f32>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        if let Some(error) = self.pending_truncation.take() {
+            self.ended = true;
+            return Some(Err(error));
+        }
+
         match self.read_samples() {
-            Ok(samples) => Some(Ok(samples)),
-            Err(error::Error::Io(ref io_err))
-                if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                None
-            }
+            Ok(Some(samples)) => Some(Ok(samples)),
+            Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
     }
@@ -146,6 +189,8 @@ pub struct IqAsyncRead<R: tokio::io::AsyncBufRead + Unpin> {
     pending: Vec<u8>,
     /// Number of initialized bytes in `pending`.
     pending_len: usize,
+    ended: bool,
+    pending_truncation: Option<error::Error>,
 }
 
 impl<R: tokio::io::AsyncBufRead + Unpin> IqAsyncRead<R> {
@@ -155,6 +200,8 @@ impl<R: tokio::io::AsyncBufRead + Unpin> IqAsyncRead<R> {
             reader,
             pending: Vec::new(),
             pending_len: 0,
+            ended: false,
+            pending_truncation: None,
         }
     }
 }
@@ -231,6 +278,14 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        if let Some(error) = this.pending_truncation.take() {
+            this.ended = true;
+            return Poll::Ready(Some(Err(error)));
+        }
+
         let bytes_per_sample = this.config.iq_format.bytes_per_sample();
         let chunk_bytes = this.config.chunk_size * bytes_per_sample;
 
@@ -253,6 +308,7 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof && this.pending_len > 0 {
                         break;
                     } else if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        this.ended = true;
                         return Poll::Ready(None);
                     } else {
                         return Poll::Ready(Some(Err(e.into())));
@@ -264,14 +320,26 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
 
         if this.pending_len == 0 {
             this.pending.clear();
-            Poll::Ready(None)
-        } else {
-            let mut buffer = std::mem::take(&mut this.pending);
-            let total_read = std::mem::take(&mut this.pending_len);
-            buffer.truncate(total_read);
-            let samples = crate::convert_bytes_to_complex(this.config.iq_format, &buffer);
-            Poll::Ready(Some(Ok(samples)))
+            this.ended = true;
+            return Poll::Ready(None);
         }
+
+        let mut buffer = std::mem::take(&mut this.pending);
+        let total_read = std::mem::take(&mut this.pending_len);
+        let complete_bytes = total_read - total_read % bytes_per_sample;
+        let remaining_bytes = total_read - complete_bytes;
+        if remaining_bytes != 0 {
+            let error = error::Error::truncated_iq(this.config.iq_format, remaining_bytes);
+            if complete_bytes == 0 {
+                this.ended = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            this.pending_truncation = Some(error);
+        }
+
+        buffer.truncate(complete_bytes);
+        let samples = crate::convert_bytes_to_complex(this.config.iq_format, &buffer);
+        Poll::Ready(Some(Ok(samples)))
     }
 }
 

@@ -223,9 +223,7 @@ fn test_iqread_integration_multiple_chunks() {
 
 #[test]
 fn test_iqread_integration_partial_chunk() {
-    // Integration test: File size not exactly divisible by chunk size
-    // Current behavior: read_exact will fail on partial chunk (UnexpectedEof)
-    // Create 25 samples, request chunks of 10
+    // Create 25 samples, request chunks of 10.
     let mut samples = Vec::new();
     for i in 0..25 {
         samples.push(i as u8);
@@ -246,10 +244,63 @@ fn test_iqread_integration_partial_chunk() {
         assert_eq!(chunk.len(), 10, "Chunk {} should be full", i);
     }
 
-    // Third attempt will encounter UnexpectedEof (only 5 samples = 10 bytes remaining)
-    // The Iterator impl treats UnexpectedEof as None (end of stream)
-    let result = iq_source.next();
-    assert!(result.is_none(), "Partial chunk should result in EOF");
+    // The final complete samples must not be discarded merely because the chunk is short.
+    let final_chunk = iq_source
+        .next()
+        .expect("Missing final partial chunk")
+        .unwrap();
+    assert_eq!(final_chunk.len(), 5);
+    assert!(
+        iq_source.next().is_none(),
+        "Should reach EOF after final chunk"
+    );
+}
+
+#[tokio::test]
+async fn test_iqasyncread_emits_complete_final_partial_chunk() {
+    let samples = [0_u8, 255, 127, 128, 255, 0, 1, 2, 3, 4]; // 5 CU8 samples
+    let (_tmp, path) = temp_iq(&samples);
+    let mut source = IqAsyncSource::from_file(&path, 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 3);
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 2);
+    assert!(source.next().await.is_none());
+}
+
+#[test]
+fn test_iqread_reports_trailing_incomplete_sample_after_complete_samples() {
+    let (_tmp, path) = temp_iq(&[0, 255, 127]);
+    let mut source = IqSource::from_file(&path, 162_000_000, 96_000, 2, IqFormat::Cu8).unwrap();
+
+    assert_eq!(source.next().unwrap().unwrap().len(), 1);
+    assert!(matches!(
+        source.next(),
+        Some(Err(desperado::Error::TruncatedIq {
+            format: IqFormat::Cu8,
+            remaining_bytes: 1,
+        }))
+    ));
+    assert!(source.next().is_none());
+}
+
+#[tokio::test]
+async fn test_iqasyncread_reports_trailing_incomplete_sample_after_complete_samples() {
+    let (_tmp, path) = temp_iq(&[0, 255, 127]);
+    let mut source = IqAsyncSource::from_file(&path, 162_000_000, 96_000, 2, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 1);
+    assert!(matches!(
+        source.next().await,
+        Some(Err(desperado::Error::TruncatedIq {
+            format: IqFormat::Cu8,
+            remaining_bytes: 1,
+        }))
+    ));
+    assert!(source.next().await.is_none());
 }
 
 #[test]
