@@ -8,10 +8,15 @@
 //! via nusb's endpoint queue, eliminating the inter-transfer gap that causes
 //! RTL2832U FIFO overflow at high sample rates.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::Stream;
 use num_complex::Complex;
 
-use crate::{Gain, IqFormat, error};
+use crate::{Gain, IqFormat, error, lifecycle};
 
 /// Tokio-side bridge queue depth between the USB reader thread and the async consumer.
 ///
@@ -353,6 +358,8 @@ pub struct AsyncRtlSdrReader {
     control: rs_rtl::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
+    cancelled: Arc<AtomicBool>,
+    bridge: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncRtlSdrReader {
@@ -369,30 +376,41 @@ impl AsyncRtlSdrReader {
         let control = reader.control_handle();
 
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge_cancelled = Arc::clone(&cancelled);
 
         // Bridge thread: receives raw bytes from the USB streaming thread,
         // converts to complex, sends to tokio channel.
         // Exits when the consumer drops `samples_rx`.
-        std::thread::Builder::new()
+        let bridge = std::thread::Builder::new()
             .name("rtlsdr-bridge".into())
             .spawn(move || {
                 // Keep sdr alive so the device is not dropped while streaming
                 let _sdr = sdr;
                 loop {
+                    if bridge_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
                     match reader.recv() {
                         Ok(Some(bytes)) => {
                             let samples =
                                 Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
-                            if samples_tx.blocking_send(samples).is_err() {
+                            if !lifecycle::send_or_cancel(&samples_tx, &bridge_cancelled, samples) {
                                 break;
                             }
                         }
                         Ok(None) => break,
                         Err(reader_error) => {
-                            let _ = samples_tx.blocking_send(Err(error::Error::stream_terminated(
-                                "RTL-SDR",
-                                reader_error.to_string(),
-                            )));
+                            if !bridge_cancelled.load(Ordering::Acquire) {
+                                let _ = lifecycle::send_or_cancel(
+                                    &samples_tx,
+                                    &bridge_cancelled,
+                                    Err(error::Error::stream_terminated(
+                                        "RTL-SDR",
+                                        reader_error.to_string(),
+                                    )),
+                                );
+                            }
                             break;
                         }
                     }
@@ -403,6 +421,8 @@ impl AsyncRtlSdrReader {
         Ok(Self {
             control,
             samples_rx,
+            cancelled,
+            bridge: Some(bridge),
         })
     }
 
@@ -447,6 +467,22 @@ impl AsyncRtlSdrReader {
     /// Retune to a specific center frequency.
     pub fn tune(&self, center_freq: u32) -> error::Result<()> {
         self.adjust(RtlSdrMessage::Frequency(center_freq))
+    }
+
+    /// Stop the live stream and wait for its bridge thread to exit.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        lifecycle::join_bridge(self.bridge.take()).await;
+        Ok(())
+    }
+}
+
+impl Drop for AsyncRtlSdrReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        // Dropping the JoinHandle detaches; Drop must never block an async executor.
     }
 }
 

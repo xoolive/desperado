@@ -25,6 +25,7 @@ pub mod gqrx;
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 pub mod iqread;
+mod lifecycle;
 pub mod metrics;
 #[cfg(feature = "pluto")]
 pub mod pluto;
@@ -1145,6 +1146,20 @@ impl IqAsyncSource {
             IqAsyncSource::HackRf(source) => source.tune(_center_freq as u64),
             _ => Err(error::Error::other(
                 "Retune is only supported for RTL-SDR/Airspy/HackRF async sources".to_string(),
+            )),
+        }
+    }
+
+    /// Stop a live SDR source and wait for its bridge thread to exit.
+    ///
+    /// Dropping a source only requests best-effort nonblocking shutdown. Call this
+    /// method when deterministic live-stream cleanup is required.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        match self {
+            #[cfg(feature = "rtlsdr")]
+            IqAsyncSource::RtlSdr(source) => source.stop().await,
+            _ => Err(error::Error::other(
+                "Explicit stop is currently supported for RTL-SDR async sources",
             )),
         }
     }
