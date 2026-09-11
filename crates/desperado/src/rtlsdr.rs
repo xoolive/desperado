@@ -205,23 +205,53 @@ fn open_and_configure(config: &RtlSdrConfig) -> error::Result<rs_rtl::RtlSdr> {
 
     match config.gain {
         Gain::Manual(gain_db) => {
-            let gain_tenths = (gain_db * 10.0) as i32;
-            tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
-            sdr.set_gain_manual(gain_tenths)?;
+            set_manual_tuner_gain(&mut sdr, gain_db)?;
         }
         Gain::Auto => {
             tracing::info!("Setting automatic tuner gain");
             sdr.set_gain_auto()?;
         }
-        Gain::Elements(_) => {
-            tracing::warn!("RTL-SDR does not support element-based gain control, using auto gain");
-            sdr.set_gain_auto()?;
+        Gain::Elements(ref elements) => {
+            let tuner_gain = elements.iter().find_map(|element| match &element.name {
+                crate::GainElementName::Tuner => Some(element.value_db),
+                name => {
+                    tracing::warn!(
+                        ?name,
+                        "RTL-SDR does not support this gain element; ignoring"
+                    );
+                    None
+                }
+            });
+            if let Some(gain_db) = tuner_gain {
+                set_manual_tuner_gain(&mut sdr, gain_db)?;
+            } else {
+                tracing::warn!("RTL-SDR gain elements did not include TUNER; using automatic gain");
+                sdr.set_gain_auto()?;
+            }
         }
     }
 
     let _ = sdr.set_bias_t(config.bias_tee);
 
     Ok(sdr)
+}
+
+/// Select and apply the nearest tuner gain advertised by this RTL-SDR device.
+fn set_manual_tuner_gain(sdr: &mut rs_rtl::RtlSdr, requested_db: f64) -> error::Result<()> {
+    let requested_tenths = (requested_db * 10.0).round() as i32;
+    let effective_tenths = sdr
+        .gains()
+        .iter()
+        .min_by_key(|gain| (i64::from(**gain) - i64::from(requested_tenths)).abs())
+        .copied()
+        .ok_or_else(|| error::Error::device("RTL-SDR reports no tuner gain values"))?;
+    tracing::info!(
+        requested_db,
+        effective_db = f64::from(effective_tenths) / 10.0,
+        "Setting RTL-SDR tuner gain"
+    );
+    sdr.set_gain_manual(effective_tenths)?;
+    Ok(())
 }
 
 /**
@@ -443,9 +473,29 @@ impl AsyncRtlSdrReader {
                         .set_gain(gain_tenths)
                         .map_err(|e| error::Error::device(format!("RTL-SDR set gain failed: {e}")))
                 }
-                Gain::Elements(_) => {
-                    tracing::warn!("Element-based gain not supported for RTL-SDR; ignoring");
-                    Ok(())
+                Gain::Elements(elements) => {
+                    let tuner_gain = elements.iter().find_map(|element| match &element.name {
+                        crate::GainElementName::Tuner => Some(element.value_db),
+                        name => {
+                            tracing::warn!(
+                                ?name,
+                                "RTL-SDR does not support this gain element; ignoring"
+                            );
+                            None
+                        }
+                    });
+                    if let Some(gain_db) = tuner_gain {
+                        let gain_tenths = (gain_db * 10.0).round() as i32;
+                        tracing::info!(gain_db, "Setting RTL-SDR runtime tuner gain");
+                        self.control.set_gain(gain_tenths).map_err(|e| {
+                            error::Error::device(format!("RTL-SDR set gain failed: {e}"))
+                        })
+                    } else {
+                        tracing::warn!(
+                            "RTL-SDR gain elements did not include TUNER; leaving gain unchanged"
+                        );
+                        Ok(())
+                    }
                 }
             },
             RtlSdrMessage::SampleRate(_rate) => {
