@@ -92,9 +92,11 @@ fn open_and_configure(config: &HackRfConfig) -> error::Result<rs_hackrf::HackRf>
 fn apply_gain(hackrf: &rs_hackrf::HackRf, gain: &Gain) -> error::Result<()> {
     match gain {
         Gain::Auto => {
-            // HackRF has no AGC — use sensible defaults
-            tracing::info!(
-                "HackRF has no AGC; using default LNA={DEFAULT_LNA_GAIN} VGA={DEFAULT_VGA_GAIN}"
+            // HackRF has no AGC; this is a documented recommended fixed profile.
+            tracing::warn!(
+                lna_db = DEFAULT_LNA_GAIN,
+                vga_db = DEFAULT_VGA_GAIN,
+                "HackRF does not support automatic gain; using the recommended fixed profile"
             );
             hackrf.set_lna_gain(DEFAULT_LNA_GAIN)?;
             hackrf.set_vga_gain(DEFAULT_VGA_GAIN)?;
@@ -102,13 +104,17 @@ fn apply_gain(hackrf: &rs_hackrf::HackRf, gain: &Gain) -> error::Result<()> {
         Gain::Manual(db) => {
             // Split manual gain roughly 40/60 between LNA and VGA
             let total = *db as u32;
-            let lna = (total * 2 / 5).min(40); // ~40% to LNA, max 40 dB
-            let vga = total.saturating_sub(lna).min(62); // rest to VGA, max 62 dB
+            let requested_lna = (total * 2 / 5).min(40); // ~40% to LNA, max 40 dB
+            let requested_vga = total.saturating_sub(requested_lna).min(62);
+            let lna = rs_hackrf::HackRf::normalize_lna_gain(requested_lna);
+            let vga = rs_hackrf::HackRf::normalize_vga_gain(requested_vga);
             tracing::info!(
                 total,
-                lna,
-                vga,
-                "Setting HackRF manual gain (split LNA/VGA)"
+                requested_lna,
+                requested_vga,
+                effective_lna = lna,
+                effective_vga = vga,
+                "Setting HackRF manual gain (split and normalized LNA/VGA)"
             );
             hackrf.set_lna_gain(lna)?;
             hackrf.set_vga_gain(vga)?;
@@ -403,8 +409,10 @@ fn apply_gain_via_control(
 ) -> error::Result<()> {
     match gain {
         Gain::Auto => {
-            tracing::info!(
-                "HackRF has no AGC; using default LNA={DEFAULT_LNA_GAIN} VGA={DEFAULT_VGA_GAIN}"
+            tracing::warn!(
+                lna_db = DEFAULT_LNA_GAIN,
+                vga_db = DEFAULT_VGA_GAIN,
+                "HackRF does not support automatic gain; using the recommended fixed profile"
             );
             control
                 .set_lna_gain(DEFAULT_LNA_GAIN)
@@ -415,8 +423,18 @@ fn apply_gain_via_control(
         }
         Gain::Manual(db) => {
             let total = *db as u32;
-            let lna = (total * 2 / 5).min(40);
-            let vga = total.saturating_sub(lna).min(62);
+            let requested_lna = (total * 2 / 5).min(40);
+            let requested_vga = total.saturating_sub(requested_lna).min(62);
+            let lna = rs_hackrf::HackRf::normalize_lna_gain(requested_lna);
+            let vga = rs_hackrf::HackRf::normalize_vga_gain(requested_vga);
+            tracing::info!(
+                total,
+                requested_lna,
+                requested_vga,
+                effective_lna = lna,
+                effective_vga = vga,
+                "Setting HackRF runtime manual gain"
+            );
             control
                 .set_lna_gain(lna)
                 .map_err(|e| error::Error::device(format!("HackRF set LNA gain failed: {e}")))?;

@@ -280,17 +280,17 @@ fn configure_gain(
     // If individual gains are specified, apply them directly
     if let Some(lna_val) = lna {
         device
-            .set_lna_gain(lna_val.min(14))
+            .set_lna_gain(lna_val)
             .map_err(|e| error::Error::device(format!("Failed to set LNA gain: {}", e)))?;
     }
     if let Some(mixer_val) = mixer {
         device
-            .set_mixer_gain(mixer_val.min(15))
+            .set_mixer_gain(mixer_val)
             .map_err(|e| error::Error::device(format!("Failed to set Mixer gain: {}", e)))?;
     }
     if let Some(vga_val) = vga {
         device
-            .set_vga_gain(vga_val.min(15))
+            .set_vga_gain(vga_val)
             .map_err(|e| error::Error::device(format!("Failed to set VGA gain: {}", e)))?;
     }
 
@@ -352,22 +352,22 @@ fn configure_gain(
             for element in elements {
                 match &element.name {
                     GainElementName::Lna => {
-                        // LNA gain: 0-14
-                        let gain = (element.value_db as u8).min(14);
+                        // The direct driver clamps and warns when needed.
+                        let gain = element.value_db as u8;
                         device.set_lna_gain(gain).map_err(|e| {
                             error::Error::device(format!("Failed to set LNA gain: {}", e))
                         })?;
                     }
                     GainElementName::Mix => {
-                        // Mixer gain: 0-15
-                        let gain = (element.value_db as u8).min(15);
+                        // The direct driver clamps and warns when needed.
+                        let gain = element.value_db as u8;
                         device.set_mixer_gain(gain).map_err(|e| {
                             error::Error::device(format!("Failed to set Mixer gain: {}", e))
                         })?;
                     }
                     GainElementName::Vga => {
-                        // VGA gain: 0-15
-                        let gain = (element.value_db as u8).min(15);
+                        // The direct driver clamps and warns when needed.
+                        let gain = element.value_db as u8;
                         device.set_vga_gain(gain).map_err(|e| {
                             error::Error::device(format!("Failed to set VGA gain: {}", e))
                         })?;
