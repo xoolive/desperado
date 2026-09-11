@@ -25,6 +25,12 @@ pub mod gqrx;
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 pub mod iqread;
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "airspy",
+    feature = "hackrf",
+    feature = "soapy"
+))]
 mod lifecycle;
 pub mod metrics;
 #[cfg(feature = "pluto")]

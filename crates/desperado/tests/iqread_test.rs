@@ -44,6 +44,44 @@ async fn test_async_zstd_file_is_decompressed_transparently() {
 }
 
 #[test]
+fn test_sync_zstd_truncated_frame_is_an_error() {
+    let raw = vec![42_u8; 4096];
+    let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+    compressed.truncate(compressed.len() - 1);
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .expect("open truncated compressed IQ source");
+    let error = source.next().unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        desperado::Error::Io(ref io_error)
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[tokio::test]
+async fn test_async_zstd_truncated_frame_is_an_error() {
+    let raw = vec![42_u8; 4096];
+    let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+    compressed.truncate(compressed.len() - 1);
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source =
+        IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+            .await
+            .expect("open truncated compressed async IQ source");
+    let error = source.next().await.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        desperado::Error::Io(ref io_error)
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[test]
 fn test_iqformat_bytes_per_sample_cu8() {
     // Cu8 format: 2 bytes per sample (1 byte I, 1 byte Q)
     let format = IqFormat::Cu8;

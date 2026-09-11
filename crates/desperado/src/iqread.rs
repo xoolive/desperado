@@ -71,7 +71,6 @@ impl<R: Read> IqRead<R> {
                 Ok(0) => break,
                 Ok(read) => total_read += read,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -304,16 +303,7 @@ impl<R: AsyncBufRead + Unpin + Send + 'static> Stream for IqAsyncRead<R> {
                     }
                     this.pending_len += filled;
                 }
-                Poll::Ready(Err(e)) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof && this.pending_len > 0 {
-                        break;
-                    } else if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        this.ended = true;
-                        return Poll::Ready(None);
-                    } else {
-                        return Poll::Ready(Some(Err(e.into())));
-                    }
-                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
                 Poll::Pending => return Poll::Pending,
             }
         }
