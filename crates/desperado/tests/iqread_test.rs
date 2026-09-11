@@ -3,7 +3,16 @@
 use desperado::{IqAsyncSource, IqFormat, IqSource};
 use futures::StreamExt;
 use std::fs;
+use std::io::Write;
+use std::time::Duration;
 use tempfile::{Builder, NamedTempFile};
+
+fn zstd_with_checksum(data: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.include_checksum(true).unwrap();
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
 
 /// Helper to create a temp file with the given bytes and return (NamedTempFile, path String).
 /// The NamedTempFile must be kept alive for the duration of the test.
@@ -44,6 +53,35 @@ async fn test_async_zstd_file_is_decompressed_transparently() {
 }
 
 #[test]
+fn test_sync_zstd_checksum_failure_is_an_error() {
+    let mut compressed = zstd_with_checksum(&[42_u8; 4096]);
+    *compressed.last_mut().unwrap() ^= 1;
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .expect("open corrupt compressed IQ source");
+    assert!(matches!(source.next(), Some(Err(desperado::Error::Io(_)))));
+}
+
+#[tokio::test]
+async fn test_async_zstd_checksum_failure_is_an_error() {
+    let mut compressed = zstd_with_checksum(&[42_u8; 4096]);
+    *compressed.last_mut().unwrap() ^= 1;
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source =
+        IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+            .await
+            .expect("open corrupt compressed async IQ source");
+    assert!(matches!(
+        source.next().await,
+        Some(Err(desperado::Error::Io(_)))
+    ));
+}
+
+#[test]
 fn test_sync_zstd_truncated_frame_is_an_error() {
     let raw = vec![42_u8; 4096];
     let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
@@ -79,6 +117,61 @@ async fn test_async_zstd_truncated_frame_is_an_error() {
         desperado::Error::Io(ref io_error)
             if io_error.kind() == std::io::ErrorKind::UnexpectedEof
     ));
+}
+
+#[test]
+fn test_sync_zstd_spans_multiple_output_chunks() {
+    let samples: Vec<u8> = (0..20).flat_map(|value| [value, value]).collect();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all(samples.as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let source = IqSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8).unwrap();
+
+    assert_eq!(
+        source.map(|chunk| chunk.unwrap().len()).collect::<Vec<_>>(),
+        [3, 3, 3, 3, 3, 3, 2]
+    );
+}
+
+#[tokio::test]
+async fn test_async_zstd_spans_multiple_output_chunks() {
+    let samples: Vec<u8> = (0..20).flat_map(|value| [value, value]).collect();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all(samples.as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let mut source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .unwrap();
+    let mut lengths = Vec::new();
+    while let Some(chunk) = source.next().await {
+        lengths.push(chunk.unwrap().len());
+    }
+    assert_eq!(lengths, [3, 3, 3, 3, 3, 3, 2]);
+}
+
+#[tokio::test]
+async fn test_async_zstd_source_drop_is_nonblocking() {
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all([42_u8; 4096].as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), async move { drop(source) })
+            .await
+            .is_ok()
+    );
 }
 
 #[test]
