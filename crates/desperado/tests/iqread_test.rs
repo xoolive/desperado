@@ -23,6 +23,45 @@ fn temp_iq(data: &[u8]) -> (NamedTempFile, String) {
     (f, path)
 }
 
+fn temp_wav_iq(channels: u16, samples: &[i16]) -> NamedTempFile {
+    let file = Builder::new().suffix(".wav").tempfile().unwrap();
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: 2_048_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(file.path(), spec).unwrap();
+    for sample in samples {
+        writer.write_sample(*sample).unwrap();
+    }
+    writer.finalize().unwrap();
+    file
+}
+
+#[test]
+fn test_stereo_pcm16_wav_iq_uses_header_sample_rate() {
+    let file = temp_wav_iq(2, &[-32768, 32767, 0, -16384, 16384, 0]);
+    let mut source = IqSource::from_wav_iq_file(file.path(), 2).unwrap();
+
+    assert_eq!(source.wav_iq_sample_rate(), Some(2_048_000));
+    let first = source.next().unwrap().unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0], num_complex::Complex::new(-1.0, 32767.0 / 32768.0));
+    assert_eq!(first[1], num_complex::Complex::new(0.0, -0.5));
+    assert_eq!(source.next().unwrap().unwrap().len(), 1);
+    assert!(source.next().is_none());
+}
+
+#[test]
+fn test_wav_iq_rejects_mono_input() {
+    let file = temp_wav_iq(1, &[0, 0]);
+    assert!(matches!(
+        IqSource::from_wav_iq_file(file.path(), 2),
+        Err(desperado::Error::Format(_))
+    ));
+}
+
 #[test]
 fn test_sync_zstd_file_is_decompressed_transparently() {
     let samples = [0_u8, 255, 127, 128, 255, 0];

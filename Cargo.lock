@@ -937,6 +937,7 @@ dependencies = [
  "clap 4.6.6",
  "dirs",
  "futures",
+ "hound",
  "industrial-io",
  "num-complex",
  "plotters",

@@ -157,6 +157,7 @@ Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncI
 | **Frontend**   | Method name                    | Optional feature | Identifier       |
 | -------------- | ------------------------------ | ---------------- | ---------------- |
 | I/Q File       | `[Async]IqSource::from_file`   |                  | file name        |
+| WAV-IQ File    | `IqSource::from_wav_iq_file`   |                  | file name        |
 | Standard Input | `[Async]IqSource::from_stdin`  |                  |
 | TCP socket     | `[Async]IqSource::from_tcp`    |                  | address and port |
 | RTL-SDR        | `[Async]IqSource::from_rtlsdr` | `rtlsdr`         | device index     |
@@ -166,6 +167,11 @@ Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncI
 | Adalm-Pluto    | `[Async]IqSource::from_pluto`  | `pluto`          | URI              |
 
 All samples are returned as `Complex<f32>` values, regardless of the source.
+
+WAV-IQ input is intentionally strict: it accepts stereo signed PCM16 WAV only,
+with I in the left channel and Q in the right channel. The WAV header supplies
+the sample rate; it does not contain RF center frequency metadata. This input
+is separate from decoded-audio WAV output.
 
 - The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementation of the RTL-SDR driver.
 - The `airspy` feature enables support for Airspy devices (R2, Mini, HF+). It is based on the `rs_spy` crate, a pure Rust implementation using `nusb` for USB access. Airspy hardware outputs real samples from a single ADC; the driver performs Fs/4 frequency translation and half-band filtering to produce proper I/Q output.

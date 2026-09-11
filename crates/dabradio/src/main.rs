@@ -71,6 +71,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1865,6 +1866,28 @@ async fn open_iq_source(
     }
 
     if !is_device_uri(input) {
+        if Path::new(input)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            let source = IqSource::from_wav_iq_file(input, chunk_size)?;
+            let wav_sample_rate = source
+                .wav_iq_sample_rate()
+                .expect("WAV-IQ source must expose its header sample rate");
+            info!(
+                path = input,
+                sample_rate = wav_sample_rate,
+                "Opening stereo PCM16 WAV-IQ capture"
+            );
+            return Ok((
+                IqChunkSource::Sync(Box::new(source)),
+                true,
+                wav_sample_rate,
+                None,
+            ));
+        }
+
         let source = IqSource::from_file(input, center_freq, sample_rate, chunk_size, iq_format)?;
         return Ok((
             IqChunkSource::Sync(Box::new(source)),

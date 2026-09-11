@@ -40,6 +40,7 @@ pub mod rtlsdr;
 pub mod sdr;
 #[cfg(feature = "soapy")]
 pub mod soapy;
+pub mod wav_iq;
 
 /// Expand tilde (~) in path to home directory
 ///
@@ -875,6 +876,8 @@ pub enum IqSource {
     IqStdin(iqread::IqRead<std::io::BufReader<std::io::Stdin>>),
     /// TCP-based IQ source
     IqTcp(iqread::IqRead<std::io::BufReader<std::net::TcpStream>>),
+    /// Stereo PCM16 WAV-IQ source.
+    WavIqFile(wav_iq::WavIqReader),
     /// Adalm Pluto-based IQ source (requires "pluto" feature)
     #[cfg(feature = "pluto")]
     PlutoSdr(pluto::PlutoSdrReader),
@@ -901,6 +904,7 @@ impl Iterator for IqSource {
             IqSource::IqZstdFile(source) => source.next(),
             IqSource::IqStdin(source) => source.next(),
             IqSource::IqTcp(source) => source.next(),
+            IqSource::WavIqFile(source) => source.next(),
             #[cfg(feature = "pluto")]
             IqSource::PlutoSdr(source) => source.next(),
             #[cfg(feature = "rtlsdr")]
@@ -959,6 +963,27 @@ impl IqSource {
             let source =
                 iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
             Ok(IqSource::IqFile(source))
+        }
+    }
+
+    /// Open a stereo signed-PCM16 WAV-IQ capture.
+    ///
+    /// The WAV header supplies the sample rate. The left channel is I and the
+    /// right channel is Q; decoded-audio WAV input is not accepted here.
+    pub fn from_wav_iq_file<P: AsRef<std::path::Path>>(
+        path: P,
+        chunk_size: usize,
+    ) -> error::Result<Self> {
+        Ok(IqSource::WavIqFile(wav_iq::WavIqReader::from_file(
+            path, chunk_size,
+        )?))
+    }
+
+    /// Return the WAV header sample rate for a WAV-IQ source.
+    pub fn wav_iq_sample_rate(&self) -> Option<u32> {
+        match self {
+            IqSource::WavIqFile(source) => Some(source.sample_rate()),
+            _ => None,
         }
     }
 
