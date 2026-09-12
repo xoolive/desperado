@@ -31,6 +31,19 @@ pub const TRANSFER_BUFFER_SIZE: usize = 262_144;
 /// Recommended buffer size for user reads (same as TRANSFER_BUFFER_SIZE).
 pub const RECOMMENDED_BUFFER_SIZE: usize = TRANSFER_BUFFER_SIZE;
 
+/// Gain constraints declared by the HackRF C driver and hardware protocol.
+///
+/// These are not queried from the device at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HackRfDeclaredGainCapabilities {
+    /// LNA range as `(minimum, maximum, step)` in dB.
+    pub lna: (u32, u32, u32),
+    /// VGA range as `(minimum, maximum, step)` in dB.
+    pub vga: (u32, u32, u32),
+    /// RF amplifier choices in dB.
+    pub amp: [u32; 2],
+}
+
 /// Bulk read timeout for streaming (1 second).
 const BULK_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -595,19 +608,48 @@ impl HackRf {
         Ok(())
     }
 
+    /// Return gain constraints declared by the HackRF C driver and protocol.
+    pub fn declared_gain_capabilities() -> HackRfDeclaredGainCapabilities {
+        HackRfDeclaredGainCapabilities {
+            lna: (0, 40, 8),
+            vga: (0, 62, 2),
+            amp: [0, 14],
+        }
+    }
+
+    /// Normalize an LNA request to the value accepted by the hardware.
+    pub fn normalize_lna_gain(gain_db: u32) -> u32 {
+        let applied = gain_db.min(40) & !0x07;
+        if applied != gain_db {
+            tracing::warn!(
+                requested = gain_db,
+                applied,
+                "HackRF LNA gain was normalized"
+            );
+        }
+        applied
+    }
+
+    /// Normalize a VGA request to the value accepted by the hardware.
+    pub fn normalize_vga_gain(gain_db: u32) -> u32 {
+        let applied = gain_db.min(62) & !0x01;
+        if applied != gain_db {
+            tracing::warn!(
+                requested = gain_db,
+                applied,
+                "HackRF VGA gain was normalized"
+            );
+        }
+        applied
+    }
+
     /// Set LNA (low noise amplifier) gain.
     ///
     /// Range: 0-40 dB in 8 dB steps. Value is rounded down to nearest 8 dB.
     ///
     /// Reference: hackrf.c `hackrf_set_lna_gain()` - vendor request 19
     pub fn set_lna_gain(&self, gain_db: u32) -> Result<()> {
-        if gain_db > 40 {
-            return Err(Error::ConfigFailed(format!(
-                "LNA gain must be 0-40, got {gain_db}"
-            )));
-        }
-        // Round down to 8 dB steps (mask off lower 3 bits)
-        let value = gain_db & !0x07;
+        let value = Self::normalize_lna_gain(gain_db);
 
         let retval = self.control_in(VendorRequest::SetLnaGain, 0, value as u16, 1)?;
 
@@ -627,13 +669,7 @@ impl HackRf {
     ///
     /// Reference: hackrf.c `hackrf_set_vga_gain()` - vendor request 20
     pub fn set_vga_gain(&self, gain_db: u32) -> Result<()> {
-        if gain_db > 62 {
-            return Err(Error::ConfigFailed(format!(
-                "VGA gain must be 0-62, got {gain_db}"
-            )));
-        }
-        // Round down to 2 dB steps (mask off LSB)
-        let value = gain_db & !0x01;
+        let value = Self::normalize_vga_gain(gain_db);
 
         let retval = self.control_in(VendorRequest::SetVgaGain, 0, value as u16, 1)?;
 
@@ -1173,5 +1209,16 @@ mod tests {
     #[test]
     fn baseband_filter_bandwidth_caps_above_maximum() {
         assert_eq!(compute_baseband_filter_bw(99_000_000), 28_000_000);
+    }
+
+    #[test]
+    fn declared_gain_constraints_match_hackrf_protocol() {
+        let capabilities = HackRf::declared_gain_capabilities();
+        assert_eq!(capabilities.lna, (0, 40, 8));
+        assert_eq!(capabilities.vga, (0, 62, 2));
+        assert_eq!(capabilities.amp, [0, 14]);
+        assert_eq!(HackRf::normalize_lna_gain(29), 24);
+        assert_eq!(HackRf::normalize_lna_gain(99), 40);
+        assert_eq!(HackRf::normalize_vga_gain(63), 62);
     }
 }

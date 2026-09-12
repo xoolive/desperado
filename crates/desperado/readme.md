@@ -36,7 +36,7 @@ Add Desperado to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-desperado = "0.1"
+desperado = "0.5"
 ```
 
 ### With SDR device support
@@ -45,15 +45,15 @@ To use hardware SDR devices, enable the appropriate feature flags:
 
 ```toml
 [dependencies]
-desperado = { version = "0.1", features = ["rtlsdr"] }  # For RTL-SDR devices
+desperado = { version = "0.5", features = ["rtlsdr"] }  # For RTL-SDR devices
 # or
-desperado = { version = "0.1", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
+desperado = { version = "0.5", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
 # or
-desperado = { version = "0.1", features = ["hackrf"] }  # For HackRF devices
+desperado = { version = "0.5", features = ["hackrf"] }  # For HackRF devices
 # or
-desperado = { version = "0.1", features = ["soapy"] }   # For SoapySDR-compatible devices
+desperado = { version = "0.5", features = ["soapy"] }   # For SoapySDR-compatible devices
 # or
-desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto devices
+desperado = { version = "0.5", features = ["pluto"] }   # For Adalm-Pluto devices
 ```
 
 ### Available features
@@ -125,15 +125,28 @@ async fn main() -> desperado::Result<()> {
     let center_freq = 1_090_000_000;
     let gain = Some(496);
 
-    let reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
+    let mut reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
 
-    while let Some(samples) = reader.next().await {
+    while let Some(chunk) = reader.next().await {
+        let samples = chunk?;
         // Process samples...
     }
 
     Ok(())
 }
 ```
+
+### Streaming contract
+
+`IqAsyncSource` yields `Result<Vec<Complex<f32>>>` items. A live device or
+bridge failure is returned as `Error::StreamTerminated`; clean completion is
+represented by the stream ending. For controlled shutdown of a live source,
+call `source.stop().await` before dropping it.
+
+The low-level `rs-rtl`, `rs-spy`, and `rs-hackrf` readers return
+`Result<Option<Vec<u8>>>`: data is `Ok(Some(_))`, a clean stop is `Ok(None)`,
+and a device or transport failure is `Err(_)`. Their nonblocking `try_recv()`
+methods distinguish `TryRecv::Empty` from `TryRecv::End`.
 
 ### More data sources
 
@@ -144,6 +157,7 @@ Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncI
 | **Frontend**   | Method name                    | Optional feature | Identifier       |
 | -------------- | ------------------------------ | ---------------- | ---------------- |
 | I/Q File       | `[Async]IqSource::from_file`   |                  | file name        |
+| WAV-IQ File    | `IqSource::from_wav_iq_file`   |                  | file name        |
 | Standard Input | `[Async]IqSource::from_stdin`  |                  |
 | TCP socket     | `[Async]IqSource::from_tcp`    |                  | address and port |
 | RTL-SDR        | `[Async]IqSource::from_rtlsdr` | `rtlsdr`         | device index     |
@@ -153,6 +167,11 @@ Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncI
 | Adalm-Pluto    | `[Async]IqSource::from_pluto`  | `pluto`          | URI              |
 
 All samples are returned as `Complex<f32>` values, regardless of the source.
+
+WAV-IQ input is intentionally strict: it accepts stereo signed PCM16 WAV only,
+with I in the left channel and Q in the right channel. The WAV header supplies
+the sample rate; it does not contain RF center frequency metadata. This input
+is separate from decoded-audio WAV output.
 
 - The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementation of the RTL-SDR driver.
 - The `airspy` feature enables support for Airspy devices (R2, Mini, HF+). It is based on the `rs_spy` crate, a pure Rust implementation using `nusb` for USB access. Airspy hardware outputs real samples from a single ADC; the driver performs Fs/4 frequency translation and half-band filtering to produce proper I/Q output.

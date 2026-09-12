@@ -4,11 +4,19 @@
 //! This module provides functionality to read I/Q samples from SoapySDR devices,
 //! both synchronously and asynchronously.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::Stream;
 use num_complex::Complex;
-use soapysdr::{Args, Device, Direction, Error as SoapyError};
+use soapysdr::{Args, Device, Direction, Error as SoapyError, ErrorCode};
 
-use crate::{Gain, GainElementName, error};
+use crate::{Gain, GainElementName, error, lifecycle};
+
+/// Maximum time a Soapy worker waits in one blocking read before checking cancellation.
+const ASYNC_READ_TIMEOUT_US: i64 = 100_000;
 
 /**
  * SoapySDR Configuration
@@ -172,12 +180,15 @@ impl AsyncReadEvent {
  */
 pub struct AsyncSoapySdrReader {
     rx: tokio::sync::mpsc::Receiver<AsyncReadEvent>,
-    _handle: std::thread::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
+    bridge: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncSoapySdrReader {
     pub fn new(config: &SoapyConfig) -> error::Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel::<AsyncReadEvent>(32);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge_cancelled = Arc::clone(&cancelled);
         let (tx_init, rx_init) = std::sync::mpsc::channel::<error::Result<()>>();
         let cfg = config.clone();
 
@@ -244,15 +255,24 @@ impl AsyncSoapySdrReader {
                     let mut buffer = vec![Complex::new(0, 0); mtu];
 
                     loop {
-                        match stream.read(&mut [&mut buffer], 5_000_000) {
+                        if bridge_cancelled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        match stream.read(&mut [&mut buffer], ASYNC_READ_TIMEOUT_US) {
                             Ok(len) => {
                                 if len == 0 {
-                                    let _ = tx.blocking_send(AsyncReadEvent::Terminated(
-                                        error::Error::stream_terminated(
-                                            "SoapySDR",
-                                            "reader returned zero samples",
-                                        ),
-                                    ));
+                                    if !bridge_cancelled.load(Ordering::Acquire) {
+                                        let _ = lifecycle::send_or_cancel(
+                                            &tx,
+                                            &bridge_cancelled,
+                                            AsyncReadEvent::Terminated(
+                                                error::Error::stream_terminated(
+                                                    "SoapySDR",
+                                                    "reader returned zero samples",
+                                                ),
+                                            ),
+                                        );
+                                    }
                                     return;
                                 }
                                 let samples: Vec<Complex<f32>> = buffer[..len]
@@ -265,14 +285,28 @@ impl AsyncSoapySdrReader {
                                     })
                                     .collect();
 
-                                if tx.blocking_send(AsyncReadEvent::Samples(samples)).is_err() {
+                                if !lifecycle::send_or_cancel(
+                                    &tx,
+                                    &bridge_cancelled,
+                                    AsyncReadEvent::Samples(samples),
+                                ) {
                                     return;
                                 }
                             }
+                            Err(e) if e.code == ErrorCode::Timeout => continue,
                             Err(e) => {
-                                let _ = tx.blocking_send(AsyncReadEvent::Terminated(
-                                    error::Error::stream_terminated("SoapySDR", e.to_string()),
-                                ));
+                                if !bridge_cancelled.load(Ordering::Acquire) {
+                                    let _ = lifecycle::send_or_cancel(
+                                        &tx,
+                                        &bridge_cancelled,
+                                        AsyncReadEvent::Terminated(
+                                            error::Error::stream_terminated(
+                                                "SoapySDR",
+                                                e.to_string(),
+                                            ),
+                                        ),
+                                    );
+                                }
                                 return;
                             }
                         }
@@ -287,11 +321,28 @@ impl AsyncSoapySdrReader {
         match rx_init.recv() {
             Ok(Ok(())) => Ok(Self {
                 rx,
-                _handle: handle,
+                cancelled,
+                bridge: Some(handle),
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(error::Error::device("Failed to initialize SoapySDR device")),
         }
+    }
+}
+
+impl AsyncSoapySdrReader {
+    /// Stop the Soapy worker and wait for its current read timeout to elapse.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        lifecycle::join_bridge(self.bridge.take()).await;
+        Ok(())
+    }
+}
+
+impl Drop for AsyncSoapySdrReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Dropping the JoinHandle detaches; Drop must never block an async executor.
     }
 }
 

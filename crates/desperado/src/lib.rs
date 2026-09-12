@@ -25,6 +25,13 @@ pub mod gqrx;
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 pub mod iqread;
+#[cfg(any(
+    feature = "rtlsdr",
+    feature = "airspy",
+    feature = "hackrf",
+    feature = "soapy"
+))]
+mod lifecycle;
 pub mod metrics;
 #[cfg(feature = "pluto")]
 pub mod pluto;
@@ -33,6 +40,7 @@ pub mod rtlsdr;
 pub mod sdr;
 #[cfg(feature = "soapy")]
 pub mod soapy;
+pub mod wav_iq;
 
 /// Expand tilde (~) in path to home directory
 ///
@@ -868,6 +876,8 @@ pub enum IqSource {
     IqStdin(iqread::IqRead<std::io::BufReader<std::io::Stdin>>),
     /// TCP-based IQ source
     IqTcp(iqread::IqRead<std::io::BufReader<std::net::TcpStream>>),
+    /// Stereo PCM16 WAV-IQ source.
+    WavIqFile(wav_iq::WavIqReader),
     /// Adalm Pluto-based IQ source (requires "pluto" feature)
     #[cfg(feature = "pluto")]
     PlutoSdr(pluto::PlutoSdrReader),
@@ -894,6 +904,7 @@ impl Iterator for IqSource {
             IqSource::IqZstdFile(source) => source.next(),
             IqSource::IqStdin(source) => source.next(),
             IqSource::IqTcp(source) => source.next(),
+            IqSource::WavIqFile(source) => source.next(),
             #[cfg(feature = "pluto")]
             IqSource::PlutoSdr(source) => source.next(),
             #[cfg(feature = "rtlsdr")]
@@ -952,6 +963,27 @@ impl IqSource {
             let source =
                 iqread::IqRead::from_file(path, center_freq, sample_rate, chunk_size, iq_format)?;
             Ok(IqSource::IqFile(source))
+        }
+    }
+
+    /// Open a stereo signed-PCM16 WAV-IQ capture.
+    ///
+    /// The WAV header supplies the sample rate. The left channel is I and the
+    /// right channel is Q; decoded-audio WAV input is not accepted here.
+    pub fn from_wav_iq_file<P: AsRef<std::path::Path>>(
+        path: P,
+        chunk_size: usize,
+    ) -> error::Result<Self> {
+        Ok(IqSource::WavIqFile(wav_iq::WavIqReader::from_file(
+            path, chunk_size,
+        )?))
+    }
+
+    /// Return the WAV header sample rate for a WAV-IQ source.
+    pub fn wav_iq_sample_rate(&self) -> Option<u32> {
+        match self {
+            IqSource::WavIqFile(source) => Some(source.sample_rate()),
+            _ => None,
         }
     }
 
@@ -1145,6 +1177,26 @@ impl IqAsyncSource {
             IqAsyncSource::HackRf(source) => source.tune(_center_freq as u64),
             _ => Err(error::Error::other(
                 "Retune is only supported for RTL-SDR/Airspy/HackRF async sources".to_string(),
+            )),
+        }
+    }
+
+    /// Stop a live SDR source and wait for its bridge thread to exit.
+    ///
+    /// Dropping a source only requests best-effort nonblocking shutdown. Call this
+    /// method when deterministic live-stream cleanup is required.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        match self {
+            #[cfg(feature = "rtlsdr")]
+            IqAsyncSource::RtlSdr(source) => source.stop().await,
+            #[cfg(feature = "airspy")]
+            IqAsyncSource::Airspy(source) => source.stop().await,
+            #[cfg(feature = "hackrf")]
+            IqAsyncSource::HackRf(source) => source.stop().await,
+            #[cfg(feature = "soapy")]
+            IqAsyncSource::SoapySdr(source) => source.stop().await,
+            _ => Err(error::Error::other(
+                "Explicit stop is only supported for live SDR async sources",
             )),
         }
     }
