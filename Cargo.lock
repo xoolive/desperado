@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "dabradio"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "clap 4.6.7",
  "crossbeam-channel",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "desperado"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "approx",
  "async-compression",
@@ -1175,7 +1175,7 @@ checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
 
 [[package]]
 name = "fmradio"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "approx",
  "clap 4.6.7",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "rs-hackrf"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "nusb",
  "thiserror 2.0.20",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "rs-rtl"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "nusb",
  "thiserror 2.0.20",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "rs-spy"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "num-complex",
  "nusb",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "voracious"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "biquad",
  "chrono",
