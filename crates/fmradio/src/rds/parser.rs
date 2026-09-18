@@ -12,8 +12,11 @@
 //! - redsea (<https://github.com/windytan/redsea>)
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt::{self, Display};
 use tracing::{debug, trace};
+use traffic::TrafficFeature;
+use traffic::tmc::{TmcDecoder, is_tmc_aid};
 
 use super::constants::*;
 
@@ -297,7 +300,7 @@ pub struct ProgramItemInfo {
 }
 
 /// Open Data Application (ODA) info from Group 3A
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ODAInfo {
     /// Target group type for this ODA (0-15)
     pub target_group_type: u8,
@@ -430,6 +433,12 @@ pub struct RdsGroupJson {
     /// Raw hex blocks for debugging
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// ODA application ID when this group carries an Open Data Application
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oda_aid: Option<String>,
+    /// Decoded RDS-TMC GeoJSON feature, if this group completed one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<TrafficFeature>,
 }
 
 impl RdsGroupJson {
@@ -448,6 +457,8 @@ impl RdsGroupJson {
             ct: None,
             partial: None,
             raw: None,
+            oda_aid: None,
+            traffic: None,
         }
     }
 
@@ -508,6 +519,10 @@ pub struct RdsParser {
     json_output_queue: Vec<RdsGroupJson>,
     /// Enable JSON output mode (disables verbose text output)
     json_mode: bool,
+    /// ALERT-C decoder (populated once AID CD46/CD47 is seen in Group 3A)
+    tmc: TmcDecoder,
+    /// Completed traffic GeoJSON features
+    traffic_features: Vec<TrafficFeature>,
 }
 
 /// Extracted station metadata from RDS group 0A/0B
@@ -541,8 +556,10 @@ pub struct StationInfo {
     pub has_linkage: bool,
 
     // Group 3A data
-    /// Open Data Application (ODA) info from Group 3A
+    /// Open Data Application (ODA) info from Group 3A (last seen)
     pub oda_info: Option<ODAInfo>,
+    /// All registered ODAs keyed by allocated group (type << 1 | version).
+    pub oda_apps: HashMap<u8, ODAInfo>,
 
     // Group 4A data
     /// Clock/Time/Date info from Group 4A
@@ -588,6 +605,8 @@ impl RdsParser {
             bitcount: 0,
             json_output_queue: Vec::new(),
             json_mode: false,
+            tmc: TmcDecoder::new(),
+            traffic_features: Vec::new(),
         }
     }
 
@@ -612,6 +631,20 @@ impl RdsParser {
     /// Take pending JSON outputs (drains the queue)
     pub fn take_json_outputs(&mut self) -> Vec<RdsGroupJson> {
         std::mem::take(&mut self.json_output_queue)
+    }
+
+    /// Take completed TMC/TPEG-aligned GeoJSON traffic features.
+    pub fn take_traffic_features(&mut self) -> Vec<TrafficFeature> {
+        std::mem::take(&mut self.traffic_features)
+    }
+
+    /// Attach an optional TMC location table (CSV / directory).
+    pub fn set_location_table(&mut self, table: traffic::LocationTable) {
+        self.tmc.set_location_table(table);
+    }
+
+    pub fn tmc_is_encrypted(&self) -> bool {
+        self.tmc.is_encrypted()
     }
 
     /// Check if any groups have been decoded
@@ -1421,62 +1454,76 @@ impl RdsParser {
             }
             (3, 0) => {
                 // 3A - Open Data Application (ODA) Registration
-                // Only version A is valid for ODA
-                let target_group_type = (block2 & 0x1F) as u8; // Bits 4..0
-                let oda_app_id = block4;
-                let oda_message = block3;
+                // Only version A is valid for ODA. Require both C and D CRC so a
+                // partial group cannot overwrite a valid registration or mark TMC
+                // encrypted via a corrupted application-info / AID word.
+                if has_block3 && has_block4 {
+                    let target_group_type = (block2 & 0x1F) as u8; // Bits 4..0
+                    let oda_app_id = block4;
+                    let oda_message = block3;
 
-                // Verbose debug output (converted to tracing)
-                if self.verbose {
-                    debug!(
-                        "  [ODA] Target Group: {}A, App ID: 0x{:04X} ({})",
-                        target_group_type,
-                        oda_app_id,
-                        Self::oda_app_name(oda_app_id)
-                    );
-                }
-
-                // Store ODA info for reference
-                self.station_info.oda_info = Some(ODAInfo {
-                    target_group_type,
-                    app_id: oda_app_id,
-                    message: oda_message,
-                });
-
-                // Handle specific ODA applications
-                match oda_app_id {
-                    0x4BD7 if self.verbose => {
-                        // RadioText+ (RT+)
-                        // Verbose debug output (converted to tracing)
-                        let cb = (oda_message >> 12) & 0x01 != 0;
-                        let scb = (oda_message >> 8) & 0x0F;
-                        let template_num = (oda_message & 0xFF) as u8;
+                    // Verbose debug output (converted to tracing)
+                    if self.verbose {
                         debug!(
-                            "    [RT+] CB={}, SCB=0x{:X}, Template={}",
-                            cb, scb, template_num
+                            "  [ODA] Target Group: {}A, App ID: 0x{:04X} ({})",
+                            target_group_type,
+                            oda_app_id,
+                            Self::oda_app_name(oda_app_id)
                         );
                     }
-                    0x6552 if self.verbose => {
-                        // Enhanced RadioText (eRT)
-                        // Verbose debug output (converted to tracing)
-                        let encoding = if (oda_message & 0x01) != 0 {
-                            "UTF-8"
-                        } else {
-                            "UCS2"
-                        };
-                        let direction = if (oda_message & 0x02) != 0 {
-                            "RTL"
-                        } else {
-                            "LTR"
-                        };
-                        debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
+
+                    let oda = ODAInfo {
+                        target_group_type,
+                        app_id: oda_app_id,
+                        message: oda_message,
+                    };
+                    self.station_info.oda_info = Some(oda.clone());
+                    self.station_info.oda_apps.insert(target_group_type, oda);
+                    json_out.oda_aid = Some(format!("0x{oda_app_id:04X}"));
+
+                    if is_tmc_aid(oda_app_id) {
+                        if self.verbose {
+                            debug!("    [TMC] ALERT-C system info: 0x{:04X}", oda_message);
+                        }
+                        if let Some(feature) = self.tmc.handle_system_group(oda_message) {
+                            self.traffic_features.push(feature.clone());
+                            json_out.traffic = Some(feature);
+                        }
                     }
-                    0xCD46 | 0xCD47 if self.verbose => {
-                        // RDS-TMC (Traffic Message Channel)
-                        // Verbose debug output (converted to tracing)
-                        debug!("    [TMC] ALERT-C message: 0x{:04X}", oda_message);
+
+                    // Handle specific ODA applications
+                    match oda_app_id {
+                        0x4BD7 if self.verbose => {
+                            // RadioText+ (RT+)
+                            // Verbose debug output (converted to tracing)
+                            let cb = (oda_message >> 12) & 0x01 != 0;
+                            let scb = (oda_message >> 8) & 0x0F;
+                            let template_num = (oda_message & 0xFF) as u8;
+                            debug!(
+                                "    [RT+] CB={}, SCB=0x{:X}, Template={}",
+                                cb, scb, template_num
+                            );
+                        }
+                        0x6552 if self.verbose => {
+                            // Enhanced RadioText (eRT)
+                            // Verbose debug output (converted to tracing)
+                            let encoding = if (oda_message & 0x01) != 0 {
+                                "UTF-8"
+                            } else {
+                                "UCS2"
+                            };
+                            let direction = if (oda_message & 0x02) != 0 {
+                                "RTL"
+                            } else {
+                                "LTR"
+                            };
+                            debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
+                        }
+                        0xCD46 | 0xCD47 if self.verbose => {
+                            debug!("    [TMC] allocated group bits=0x{target_group_type:02X}");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             (4, 0) => {
@@ -1759,6 +1806,22 @@ impl RdsParser {
             _ => {
                 // For other group types, log at trace level
                 trace!(group = %group_type_str, "Unhandled RDS group type");
+            }
+        }
+
+        // ODA user groups (including 8A when AID CD46/CD47 is registered).
+        let oda_key = (group_type << 1) | version;
+        if (group_type, version) != (3, 0)
+            && let Some(oda) = self.station_info.oda_apps.get(&oda_key).cloned()
+            && is_tmc_aid(oda.app_id)
+            && has_block3
+            && has_block4
+        {
+            json_out.oda_aid = Some(format!("0x{:04X}", oda.app_id));
+            let x = block2 & 0x1F;
+            if let Some(feature) = self.tmc.handle_user_group(x, block3, block4) {
+                self.traffic_features.push(feature.clone());
+                json_out.traffic = Some(feature);
             }
         }
 

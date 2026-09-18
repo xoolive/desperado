@@ -74,6 +74,10 @@ fn build_output_table() -> Vec<[[u8; 4]; 2]> {
 /// Renormalization: after each step, metrics are shifted down to prevent overflow.
 /// welle.io renormalizes when any metric exceeds 137 (in unsigned 16-bit space).
 /// We renormalize by subtracting the maximum metric when it gets large.
+///
+/// Production MSC/FIC paths use [`viterbi_decode_state0`]; this best-state
+/// variant remains for unit tests and metric comparisons.
+#[allow(dead_code)]
 pub fn viterbi_decode_with_metric(soft_bits: &[i8]) -> (Vec<u8>, i32) {
     let n_steps = soft_bits.len() / 4;
     if n_steps == 0 {

@@ -799,6 +799,14 @@ impl RdsDecoder {
         out
     }
 
+    pub fn take_traffic_features(&mut self) -> Vec<traffic::TrafficFeature> {
+        self.rds_parser.take_traffic_features()
+    }
+
+    pub fn set_location_table(&mut self, table: traffic::LocationTable) {
+        self.rds_parser.set_location_table(table);
+    }
+
     pub fn set_print_json_output(&mut self, enabled: bool) {
         self.print_json_output = enabled;
     }

@@ -14,6 +14,7 @@ A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting
   - **DLS (Dynamic Label Segment)**: Song titles, artist names, and text metadata
   - **MOT (Multimedia Object Transfer)**: Album art and slideshow images (JPEG/PNG)
 - **JSON output** — Service listings as JSON for programmatic access
+- **Packet-mode data** — FIG 0/3, 0/8, 0/13; MSC packet reassembly; TPEG/TEC GeoJSON when UAtype 0x004 is signalled
 - **Multiple input formats** — cu8, cs8, cs16, cf32 IQ samples from files or network streams
 - **Real-time audio playback** — Streams decoded audio directly to soundcard via tinyaudio
 - **Cross-platform** — Tested on Linux x86_64 and macOS Apple Silicon
@@ -166,63 +167,110 @@ OPTIONS:
     --bypass-deinterleave
             Debug: skip time de-interleaving in MSC (testing only)
 
+    --dump-fic
+            Dump parsed FIG 0/0–0/3, 0/8, 0/13, 0/18, 0/19 as JSON after the full input
+            (accumulates across the whole run; use without --max-frames for a
+            complete FIG 0/13 sweep)
+
+    --dump-packets
+            Decode packet-mode MSC subchannels and print CRC stats as JSON
+
+    --traffic
+            Decode TPEG/TEC (FIG 0/13 UAtype 0x004) and emit GeoJSON
+
+    --announcements
+            Emit FIG 0/18/0/19 announcement events (bearer dab-announcement)
+
+    --location-tables <PATH>
+            Optional TMC/GLR location table (CSV or directory with points.csv)
+
     -h, --help
             Print help information
 ```
 
-## Architecture
+### Packet-mode data and TPEG/TEC
 
-### OFDM Processing (`ofdm/processor.rs`)
+FIG 0/3, FIG 0/8, and FIG 0/13 are parsed so packet-mode components can be
+resolved to a SubChId and packet address. TPEG is only treated as confirmed
+when FIG 0/13 signals user-application type `0x004`. Conditional-access
+components are reported and skipped; they are not descrambled.
 
-The OFDM processor implements DAB's frame synchronization pipeline:
+Packet-mode FEC (EN 300 401 §5.3.5, RS(204,188), FEC packets at address 1022)
+is applied automatically when those packets are seen. Without it, FEC-protected
+muxes show inflated CRC rates on address-0 padding and never reassemble
+target-address data groups.
 
-1. **Null symbol detection** — finds power drops in the IQ stream
-2. **PRS correlation** — IFFT-based timing via Phase Reference Symbol
-3. **Frequency estimation** — cyclic prefix and coarse frequency correction
-4. **Symbol extraction** — FFT of 76 OFDM symbols (1 PRS + 75 data)
+A short NRK Riks (channel 12D) cf32 clip is checked in under
+`crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq` (~1.25 s at 2.048 MS/s)
+for FIC lock and FIG dumps without a multi-GB capture.
 
-**Robustness feature**: When PRS correlation SNR drops below 5.0 (indicating alignment drift), the processor automatically re-detects the null symbol and re-synchronizes. This handles files with dropped samples (e.g., gqrx cf32 recordings with capture interrupts).
-
-### FIC Handler (`fic/handler.rs`, `fic/fib.rs`)
-
-Decodes the Fast Information Channel (FIC):
-
-- **FIC symbols 0-2** → depuncture, Viterbi decode, energy dispersal → FIBs (Fast Information Blocks)
-- **FIB parsing** → FIG (Fast Information Group) processing
-- **Ensemble & service discovery** → service labels, subchannel config, bitrates, protection levels
-
-Waits for complete FIC data (all services with labels, all subchannels) before declaring sync complete.
-
-### MSC Handler (`msc/mod.rs`)
-
-Decodes the Main Service Channel (MSC):
-
-- **CIF assembly** — buffers OFDM symbols into Common Interleaved Frames
-- **Time de-interleaving** — reverses the time-domain interleave applied by transmitter
-- **Subchannel extraction** — isolates the target service's data
-- **FEC decoding** — depuncturing (UEP or EEP), Viterbi, energy dispersal
-
-Supports both UEP (Unequal Error Protection) and EEP (Equal Error Protection) schemes.
-
-### DAB+ Audio Decoder (`audio/mod.rs`)
-
-Decodes DAB+ superframes to PCM audio:
-
-1. **Superframe sync** — finds fire code in logical frames
-2. **Reed-Solomon correction** — RS(120,110) error correction
-3. **AU extraction** — parses Access Units with CRC validation
-4. **AAC decoding** — fdk-aac library handles AudioSpecificConfig and decoding
-5. **Audio output** — sends 48 kHz stereo PCM to tinyaudio for playback
-
-## Performance
-
-- **Real-time decode** — typical 5-10x realtime on modern CPUs
-- **Memory-efficient** — circular buffers and lazy allocation
-- **Low-latency audio** — 4-second crossbeam buffer for smooth playback
-
-## Testing
+**GQRX wideband Belgian capture** (not in git; ~695 MiB zstd cf32, centre
+220.936 MHz, 16 MS/s, SHA-256 `7515b924…f3f9f2`):
 
 ```bash
+zstd -dc gqrx_….raw.zst | dabradio - --channel 12A --format cf32 \
+  --sample-rate 16000000 --center-freq 220936000 --no-audio \
+  --dump-fic --dump-packets --traffic --announcements
+```
+
+On 12A (`DAB+ VRT`) this confirms FIG 0/13 `UAtype 0x004` (TPEG, SubCh 0,
+addr 1) and live FIG 0/18/0/19 road-traffic announcements. The TPEG
+subchannel’s FEC frames decode cleanly but carry only address-0 padding in
+this clip (`groups_complete=0`). On 12B (`DAB Bruxelles`) the same FEC path
+yields strong packet CRC (~99.8%) and completed EPG/SPI data groups.
+Artifacts: `IQ-files/gqrx_be_validation/`.
+
+NRK Riks (12D) and Innland (13E) full sweeps confirmed FIG 0/13 has no
+`UAtype 0x004`. A 2017 Belgian RTBF DAB (12B) cu8 sample from
+[dab-cmdline#27](https://github.com/JvanKatwijk/dab-cmdline/issues/27)
+(`IQ-files/be_12b_20171226.iq`, results in `IQ-files/be_12b_validation/`)
+does carry `UAtype 0x004` on service `TPEG_PACKET` / SId `0xE0606361`
+(SubCh 14, packet address 1, 16 kbps EEP 3-A). That is confirmed by both
+`dabradio --dump-fic` and `welle-cli` `dump.fic` with matching 12-service
+lists. MSC packet CRC on that TPEG subchannel is above chance (~3.4% after
+state-0 Viterbi; ~5.9% with a small sample-rate ppm tweak) but far below the
+~84–91% seen on RIKS/Innland EPG components of the same EEP family. Welch
+spectrum shows no DC spike; `cu8` centering and `--center-freq` NCO mix are
+verified. FIC FIB success on this clip peaks around ~80% vs ~99.9% on the
+cf32 captures, so the remaining gap looks like soft-bit/OFDM quality on the
+2017 RTL sample rather than a puncturing-table bug. `--traffic` is still an
+empty FeatureCollection on that older clip — transport/TEC e2e is not yet
+proven on real TPEG bytes.
+
+```bash
+# Inspect FIC (ensemble, packet components, user applications)
+./target/release/dabradio crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq \
+  --channel 12D --format cf32 --dump-fic --max-frames 40
+
+# Belgian 12B cu8 sample (needs +12 kHz capture-center correction on this file)
+./target/release/dabradio IQ-files/be_12b_20171226.iq \
+  --channel 12B --format cu8 --sample-rate 2048000 --center-freq 225660000 \
+  --dump-fic --no-audio
+
+# Validate packet-mode MSC (CRC pass rate; chance-level means decode is wrong)
+# Needs a longer capture than the short fixture; use your own IQ file:
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-packets --max-frames 200
+
+# TPEG/TEC GeoJSON when a TPEG component is present
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --traffic
+```
+
+### Traffic announcements (FIG 0/18 / 0/19)
+
+NRK-style traffic announcements are audio-side stream switching, not packet-mode
+TPEG. `--announcements` emits `AnnouncementEvent` JSON lines
+(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster.
+Use a longer Innland/13E capture when available:
+
+```bash
+./target/release/dabradio recording.cf32.iq --channel 13E --format cf32 \
+  --dump-fic --announcements
+```
+
+`--dump-fic` also reports per-service FIG 0/18 support bitmaps when present.
+
+
+
 # Run all tests
 cargo test -p dabradio
 

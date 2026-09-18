@@ -19,7 +19,7 @@ A high-performance FM radio demodulator and RDS (Radio Data System) decoder in p
 
 - **Real-time FM Reception:** Tune any FM frequency (88.0–108.0 MHz)
 - **Stereo Audio:** Automatic L/R channel decoding
-- **RDS Data:** Station name, song metadata (RadioText), time/date, program type
+- **RDS Data:** Station name, song metadata (RadioText), time/date, program type, ODA (including RDS-TMC)
 - **Low Latency:** <100 ms audio-to-output latency on modern hardware
 - **Pipe-friendly:** Output raw PCM or JSON for integration with `redsea`, `play`, `sox`
 - **Cross-platform:** Runs on Linux, macOS, Windows (with WinUSB drivers)
@@ -136,6 +136,19 @@ Example output:
 {"group":"4A","time":"2026-02-11T14:23:45Z"}
 ```
 
+### RDS-TMC traffic GeoJSON
+
+Unencrypted RDS-TMC (ALERT-C) is still carried on many European FM networks
+(for example Germany and France). Decode from a live tuner or an IQ capture of
+such a station; unit tests in `crates/fmradio` and `crates/traffic` also cover
+ALERT-C parsing without RF.
+
+```bash
+cargo run --release -p fmradio -- capture.cf32 --freq 96.9M --format cf32 --no-audio --traffic
+```
+
+Encrypted ISO 14819-6 streams are flagged in the GeoJSON `encrypted` / `unsupported_ca` properties and are not decoded.
+
 ### Pipe to redsea (External RDS Decoder)
 
 Output raw MPX signal for comparison with reference implementation:
@@ -170,9 +183,10 @@ Input (6 MSps)
 - **Symbol Sync:** Polyphase filterbank (liquid-dsp compatible)
 - **Clock Recovery:** NCO-based PLL with adaptive bandwidth
 - **Biphase Decoding:** Clock polarity detection + FEC correction
-- **Group Parsing:** 9 of 32 RDS group types fully implemented
-  - **Complete:** 0A/0B (PS), 1A (PIN), 2A/2B (RadioText), 4A (Clock), 10A (PTYN)
-  - **Partial:** 3A (ODA), 14A (EON)
+- **Group Parsing:** RDS group types implemented
+  - **Complete:** 0A/0B (PS), 1A (PIN), 2A/2B (RadioText), 3A (ODA/AID), 4A (Clock), 8A (ALERT-C via ODA), 10A (PTYN)
+  - **Partial:** 14A (EON)
+- **RDS-TMC:** Group 3A registers AID `CD46`/`CD47` and the allocated group; that group (typically 8A) is decoded as ALERT-C. Encrypted services (LTN=0 or encryption-administration groups) are reported and not decrypted.
 
 ## Examples
 

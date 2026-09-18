@@ -19,6 +19,8 @@ use crate::fec::{eep, energy_dispersal, uep, viterbi};
 use crate::fic::fib::SubchannelInfo;
 use tracing::debug;
 
+pub mod packet;
+
 /// Number of MSC OFDM symbols per CIF.
 const MSC_SYMBOLS_PER_CIF: usize = 18;
 
@@ -217,14 +219,11 @@ impl MscHandler {
             ProtectionParams::Uep(profile) => uep::depuncture(&deinterleaved, profile),
         };
 
-        // The six termination bits force the legacy UEP convolutional code to
-        // state zero; an unrestricted best-state traceback can select an
-        // unrelated path on noisy frames.
-        let (decoded_bits, metric) = if is_uep {
-            viterbi::viterbi_decode_state0(&depunctured)
-        } else {
-            viterbi::viterbi_decode_with_metric(&depunctured)
-        };
+        // Both EEP and UEP MSC frames are tail-bit terminated to state 0
+        // (ETSI EN 300 401 §11.1; dab-cmdline/welle `chainback_viterbi(..., 0)`).
+        // Best-state traceback is wrong here and hurts noisy packet-mode
+        // subchannels far more than FIC (which already used state-0).
+        let (decoded_bits, metric) = viterbi::viterbi_decode_state0(&depunctured);
 
         // Log Viterbi metric for signal quality monitoring
         if self.frames_decoded < 3 {

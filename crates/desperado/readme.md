@@ -74,8 +74,9 @@ The following features are only needed for examples:
 
 This Desperado workspace includes several specialized crates built on top of the core I/Q streaming library:
 
-- **[fmradio](crates/fmradio)** - FM radio receiver with RDS data decoding and adaptive audio resampling
-- **[dabradio](crates/dabradio)** - DAB/DAB+ digital radio decoder with OFDM and AAC audio
+- **[fmradio](crates/fmradio)** - FM radio receiver with RDS data decoding, RDS-TMC ALERT-C, and adaptive audio resampling
+- **[dabradio](crates/dabradio)** - DAB/DAB+ digital radio decoder with OFDM, AAC audio, packet-mode data, and TPEG/TEC
+- **[traffic](crates/traffic)** - Shared TPEG/TEC and RDS-TMC application layer (GeoJSON)
 - **[voracious](crates/voracious)** - VOR/ILS/DME aviation navigation signal decoder
 
 External projects that depend on Desperado for I/Q streaming:

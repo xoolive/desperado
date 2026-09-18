@@ -844,6 +844,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "traffic",
  "viuer",
 ]
 
@@ -1194,6 +1195,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "traffic",
 ]
 
 [[package]]
@@ -3550,6 +3552,15 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "traffic"
+version = "0.4.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

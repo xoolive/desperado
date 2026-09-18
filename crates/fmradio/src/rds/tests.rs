@@ -576,3 +576,117 @@ fn test_rds_parser_has_data() {
     parser.groups_decoded = 1;
     assert!(parser.has_data(), "Should have data after group decoded");
 }
+
+#[test]
+fn group_3a_registers_tmc_aid_and_allocated_group() {
+    let mut parser = RdsParser::new();
+    // Group 3A: GT=3, A=0, allocated group 8A (bits 4-0 = 0x10)
+    let block2 = (3u16 << 12) | 0x10;
+    let ltn = 17u16;
+    let block3 = ltn << 6; // variant 0, LTN=17
+    let block4 = 0xCD46;
+    parser.handle_group([0xF201, block2, block3, block4], [true, true, true, true]);
+    let oda = parser.station_info().oda_info.as_ref().unwrap();
+    assert_eq!(oda.app_id, 0xCD46);
+    assert_eq!(oda.target_group_type, 0x10);
+    assert!(parser.station_info().oda_apps.contains_key(&0x10));
+    assert!(!parser.tmc_is_encrypted());
+}
+
+#[test]
+fn group_8a_decodes_alert_c_after_3a() {
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 17u16 << 6, 0xCD46],
+        [true, true, true, true],
+    );
+
+    // 8A single-group: T=0 F=1 duration=1, event 101, location 0x1234
+    let block2_8a = (8u16 << 12) | 0x08 | 0x01;
+    let y = 101u16; // no diversion, +, extent 0
+    parser.handle_group([0xF201, block2_8a, y, 0x1234], [true, true, true, true]);
+    let features = parser.take_traffic_features();
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].properties.event_code, Some(101));
+    assert_eq!(features[0].properties.location_code, Some(0x1234));
+    assert_eq!(features[0].properties.bearer, "fm-rds-tmc");
+}
+
+#[test]
+fn encrypted_tmc_is_not_decoded() {
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 0, 0xCD46], // LTN=0
+        [true, true, true, true],
+    );
+    let notice = parser.take_traffic_features();
+    assert_eq!(notice.len(), 1);
+    assert_eq!(notice[0].properties.encrypted, Some(true));
+
+    let block2_8a = (8u16 << 12) | 0x08;
+    parser.handle_group([0xF201, block2_8a, 101, 0x1234], [true, true, true, true]);
+    let features = parser.take_traffic_features();
+    assert!(features.iter().all(|f| f.properties.event_code.is_none()));
+    assert!(
+        features
+            .iter()
+            .all(|f| f.properties.encrypted == Some(true))
+    );
+}
+
+#[test]
+fn traffic_feature_queue_is_drained_when_not_printed() {
+    // Mirrors the main-loop contract: always take_traffic_features(), gate only
+    // printing on --traffic. Without the drain, a long TMC receive grows forever.
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 17u16 << 6, 0xCD46],
+        [true, true, true, true],
+    );
+    let block2_8a = (8u16 << 12) | 0x08 | 0x01;
+    parser.handle_group(
+        [0xF201, block2_8a, 101u16, 0x1234],
+        [true, true, true, true],
+    );
+
+    let emit = false;
+    let mut seen = 0usize;
+    for _feature in parser.take_traffic_features() {
+        seen += 1;
+        if emit {
+            unreachable!("emit is false");
+        }
+    }
+    assert!(seen >= 1);
+    assert!(parser.take_traffic_features().is_empty());
+}
+
+#[test]
+fn partial_3a_with_bad_block_c_or_d_does_not_corrupt_oda_state() {
+    let mut parser = RdsParser::new();
+    let block2 = (3u16 << 12) | 0x10;
+    let good_ltn = 17u16 << 6;
+    parser.handle_group([0xF201, block2, good_ltn, 0xCD46], [true, true, true, true]);
+    assert!(!parser.tmc_is_encrypted());
+    let before = parser.station_info().oda_apps.clone();
+
+    // Valid A/B, corrupted C (LTN=0 would mark encrypted if applied)
+    parser.handle_group([0xF201, block2, 0, 0xCD46], [true, true, false, true]);
+    assert_eq!(parser.station_info().oda_apps, before);
+    assert!(!parser.tmc_is_encrypted());
+
+    // Valid A/B, corrupted D (would overwrite AID if applied)
+    parser.handle_group(
+        [0xF201, block2, good_ltn, 0x0000],
+        [true, true, true, false],
+    );
+    assert_eq!(parser.station_info().oda_apps, before);
+    assert_eq!(
+        parser.station_info().oda_info.as_ref().unwrap().app_id,
+        0xCD46
+    );
+    assert!(!parser.tmc_is_encrypted());
+}

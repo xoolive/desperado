@@ -1494,7 +1494,10 @@ fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|c| Complex::new((c[0] as f32 - 127.5) / 128.0, (c[1] as f32 - 127.5) / 128.0))
+            // RTL-SDR-native unsigned IQ: recenter on mid-scale then normalize
+            // to ±1. Use 127.5 for both steps (not a signed reinterpret, and not
+            // `/128` after recentering — that leaves a ~0.4% scale error).
+            .map(|c| Complex::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
             .collect(),
         IqFormat::Cs8 => buffer
             .as_chunks::<2>()
@@ -1570,6 +1573,21 @@ mod tests {
             let parsed: IqFormat = s.parse().unwrap();
             assert_eq!(parsed, format);
         }
+    }
+
+    #[test]
+    fn cu8_conversion_recenters_on_midscale() {
+        // Mid-scale bytes must become ~0, not a signed reinterpret of 0..=255.
+        let bytes = [127u8, 128, 0, 255, 127, 127];
+        let samples = convert_bytes_to_complex(IqFormat::Cu8, &bytes);
+        assert_eq!(samples.len(), 3);
+        assert!(samples[0].re.abs() < 0.01);
+        assert!((samples[0].im - (0.5 / 127.5)).abs() < 1e-6);
+        assert!((samples[1].re - (-127.5 / 127.5)).abs() < 1e-6);
+        assert!((samples[1].im - (127.5 / 127.5)).abs() < 1e-6);
+        // (127,127) is the nearest integer mid-scale pair; residual is 0.5/127.5 per axis.
+        let mid = f32::hypot(0.5 / 127.5, 0.5 / 127.5);
+        assert!((samples[2].norm() - mid).abs() < 1e-6);
     }
 
     #[test]

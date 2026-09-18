@@ -309,8 +309,8 @@ impl OfdmProcessor {
     }
 
     /// Brute-force search for the best coarse frequency offset by trying
-    /// PRS IFFT correlation at each candidate offset from -5 to +5 and
-    /// returning the one with the highest SNR.
+    /// PRS IFFT correlation at each candidate offset in ±36 carriers
+    /// (welle.io SEARCH_RANGE/2) and returning the one with the highest SNR.
     ///
     /// This is used as a fallback when `getMiddle` returns an implausible
     /// result (e.g., on noisy/partial PRS data). More expensive than
@@ -332,7 +332,8 @@ impl OfdmProcessor {
         let mut best_offset = 0i32;
         let mut second_snr = 0.0f32;
 
-        for d in -5..=5i32 {
+        let half_range = (SEARCH_RANGE / 2) as i32;
+        for d in -half_range..=half_range {
             // Build correlation buffer with this candidate offset
             let mut corr_buf: Vec<Complex<f32>> = (0..T_U)
                 .map(|k| {
@@ -489,23 +490,23 @@ impl OfdmProcessor {
                             self.fft.process(&mut prs_spec);
 
                             let middle_offset = Self::get_middle(&prs_spec);
-                            // Sanity check: real hardware offsets are at most a few
-                            // carriers. getMiddle can return wild values (100+) when
-                            // it sees a partial/misaligned PRS or noise. Clamp to ±5
-                            // to prevent catastrophic divergence while still covering
-                            // any realistic tuner frequency offset.
-                            if middle_offset != 0 && middle_offset.abs() <= 5 {
+                            // Accept offsets within welle.io's SEARCH_RANGE/2 (±36
+                            // carriers / ±36 kHz). The Belgian 12B cu8 capture sits
+                            // ~12 kHz off; the old ±5 clamp forced a manual digital
+                            // mix via --center-freq and left residual tracking worse
+                            // than letting the OFDM coarse corrector absorb it.
+                            // getMiddle can still return wild values (100+) on
+                            // misaligned PRS — those fall through to brute-force.
+                            if middle_offset != 0 && middle_offset.abs() <= 36 {
                                 debug!(middle_offset, "Initial coarse freq from getMiddle");
                                 self.coarse_freq_carriers += middle_offset;
-                            } else if middle_offset.abs() > 5 {
+                            } else if middle_offset.abs() > 36 {
                                 debug!(
                                     middle_offset,
                                     "getMiddle implausible, trying brute-force PRS search"
                                 );
                                 // getMiddle failed (noisy data). Fall back to trying
-                                // PRS IFFT correlation at each candidate coarse offset
-                                // from -5 to +5 and picking the one with best SNR.
-                                // This is more expensive but very robust.
+                                // PRS IFFT correlation across ±36 carriers.
                                 let best = Self::brute_force_coarse_search(
                                     &prs_spec,
                                     &self.prs_ref_conj,

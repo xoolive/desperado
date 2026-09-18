@@ -18,6 +18,7 @@ pub const CARRIER_DIFF: f64 = 1000.0; // Carrier spacing in Hz
 pub const FIC_SYMBOLS: usize = 3; // Symbols 1..3 carry FIC data
 pub const FIBS_PER_FIC: usize = 3; // 3 FIBs per FIC (Mode I)
 pub const FIB_LENGTH: usize = 32; // bytes per FIB (30 data + 2 CRC)
+#[allow(dead_code)]
 pub const FIB_CRC_LENGTH: usize = 2;
 
 // CIF parameters (used by MSC decoding)
@@ -467,12 +468,11 @@ pub fn phase_reference_table() -> Vec<num_complex::Complex<f32>> {
 
 /// CRC-16 for FIB (CCITT polynomial x^16 + x^12 + x^5 + 1, init 0xFFFF, inverted).
 pub fn fib_crc_valid(fib: &[u8]) -> bool {
-    if fib.len() < FIB_LENGTH {
-        return false;
-    }
-    let data = &fib[..FIB_LENGTH - FIB_CRC_LENGTH]; // 30 bytes
-    let crc_bytes = &fib[FIB_LENGTH - FIB_CRC_LENGTH..FIB_LENGTH]; // 2 bytes
+    fib.len() >= FIB_LENGTH && crc16_check(&fib[..FIB_LENGTH])
+}
 
+/// CRC-16 CCITT (ITU-T X.25) over `data` (CRC field not included).
+pub fn crc16_ccitt(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &byte in data {
         crc ^= (byte as u16) << 8;
@@ -484,10 +484,17 @@ pub fn fib_crc_valid(fib: &[u8]) -> bool {
             }
         }
     }
-    crc ^= 0xFFFF;
+    crc ^ 0xFFFF
+}
 
-    let received = ((crc_bytes[0] as u16) << 8) | (crc_bytes[1] as u16);
-    crc == received
+/// True when the last two bytes of `buf` match the CRC of the preceding bytes.
+pub fn crc16_check(buf: &[u8]) -> bool {
+    if buf.len() < 2 {
+        return false;
+    }
+    let calc = crc16_ccitt(&buf[..buf.len() - 2]);
+    let recv = u16::from_be_bytes([buf[buf.len() - 2], buf[buf.len() - 1]]);
+    calc == recv
 }
 
 #[cfg(test)]
