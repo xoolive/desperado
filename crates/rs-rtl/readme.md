@@ -35,7 +35,7 @@ sdr.set_sample_rate(2_048_000)?;    // 2.048 MS/s
 sdr.set_gain_manual(496)?;          // 49.6 dB
 
 let reader = sdr.start_streaming()?;
-while let Some(data) = reader.recv() {
+while let Some(data) = reader.recv()? {
     // data contains interleaved u8 I/Q samples: [I0, Q0, I1, Q1, ...]
     println!("received {} bytes", data.len());
 }

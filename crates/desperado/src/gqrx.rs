@@ -55,7 +55,15 @@ pub struct GqrxMeta {
 /// assert!(parse_gqrx_filename("dab_12A_2min.iq").is_none());
 /// ```
 pub fn parse_gqrx_filename(path: impl AsRef<Path>) -> Option<GqrxMeta> {
-    let stem = path.as_ref().file_stem()?.to_str()?;
+    let path = path.as_ref();
+    let file_name = path.file_name()?.to_str()?;
+    // Compression is a transport suffix, not part of the GQRX capture name.
+    // Strip it before stripping the underlying `.raw`/`.iq` extension.
+    let uncompressed_name = file_name
+        .strip_suffix(".zst")
+        .or_else(|| file_name.strip_suffix(".ZST"))
+        .unwrap_or(file_name);
+    let stem = Path::new(uncompressed_name).file_stem()?.to_str()?;
     parse_gqrx_stem(stem)
 }
 
@@ -128,6 +136,15 @@ mod tests {
     fn parse_existing_12a_2msps_file() {
         let meta = parse_gqrx_filename("gqrx_20260314_131107_223936000_2048000_fc.raw")
             .expect("narrowband gqrx file should parse");
+        assert_eq!(meta.center_freq_hz, 223_936_000);
+        assert_eq!(meta.sample_rate_hz, 2_048_000);
+        assert_eq!(meta.format, IqFormat::Cf32);
+    }
+
+    #[test]
+    fn parses_zstd_compressed_gqrx_name() {
+        let meta = parse_gqrx_filename("gqrx_20260314_131130_223936000_2048000_fc.raw.zst")
+            .expect("compressed gqrx file should parse");
         assert_eq!(meta.center_freq_hz, 223_936_000);
         assert_eq!(meta.sample_rate_hz, 2_048_000);
         assert_eq!(meta.format, IqFormat::Cf32);

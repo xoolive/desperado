@@ -21,6 +21,22 @@ pub enum Error {
     /// Invalid I/Q format or conversion error
     Format(String),
 
+    /// Raw I/Q input ended with bytes that cannot form a complete complex sample.
+    TruncatedIq {
+        /// Declared input sample format.
+        format: crate::IqFormat,
+        /// Number of trailing bytes that do not form a full sample.
+        remaining_bytes: usize,
+    },
+
+    /// A live SDR stream ended unexpectedly.
+    StreamTerminated {
+        /// Backend that owned the live stream.
+        backend: &'static str,
+        /// Backend-provided reason, when available.
+        reason: String,
+    },
+
     /// RTL-SDR specific error (requires "rtlsdr" feature)
     #[cfg(feature = "rtlsdr")]
     RtlSdr(rs_rtl::Error),
@@ -47,6 +63,19 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "I/O error: {}", err),
             Error::Device(msg) => write!(f, "Device error: {}", msg),
             Error::Format(msg) => write!(f, "Format error: {}", msg),
+            Error::TruncatedIq {
+                format,
+                remaining_bytes,
+            } => write!(
+                f,
+                "truncated {:?} I/Q input: {} trailing byte{}",
+                format,
+                remaining_bytes,
+                if *remaining_bytes == 1 { "" } else { "s" }
+            ),
+            Error::StreamTerminated { backend, reason } => {
+                write!(f, "{} stream terminated: {}", backend, reason)
+            }
             #[cfg(feature = "rtlsdr")]
             Error::RtlSdr(err) => write!(f, "RTL-SDR error: {}", err),
             #[cfg(feature = "soapy")]
@@ -129,6 +158,22 @@ impl Error {
         Error::Format(msg.into())
     }
 
+    /// Create an error for raw I/Q input with incomplete trailing sample bytes.
+    pub fn truncated_iq(format: crate::IqFormat, remaining_bytes: usize) -> Self {
+        Error::TruncatedIq {
+            format,
+            remaining_bytes,
+        }
+    }
+
+    /// Create an error for an unexpected live SDR stream termination.
+    pub fn stream_terminated<S: Into<String>>(backend: &'static str, reason: S) -> Self {
+        Error::StreamTerminated {
+            backend,
+            reason: reason.into(),
+        }
+    }
+
     /// Create a generic error with a custom message
     pub fn other<S: Into<String>>(msg: S) -> Self {
         Error::Other(msg.into())
@@ -179,6 +224,22 @@ mod tests {
     fn test_error_display() {
         let err = Error::Device("test device error".to_string());
         assert_eq!(err.to_string(), "Device error: test device error");
+    }
+
+    #[test]
+    fn test_stream_terminated_error() {
+        let err = Error::stream_terminated("RTL-SDR", "USB transfers stopped");
+        assert!(matches!(
+            err,
+            Error::StreamTerminated {
+                backend: "RTL-SDR",
+                ..
+            }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "RTL-SDR stream terminated: USB transfers stopped"
+        );
     }
 
     #[test]

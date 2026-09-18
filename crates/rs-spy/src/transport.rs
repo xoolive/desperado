@@ -73,6 +73,21 @@ pub const SAMPLES_PER_BUFFER: usize = RECOMMENDED_BUFFER_SIZE / 2;
 
 pub const DEFAULT_ASYNC_QUEUE_LEN: usize = 16;
 
+/// Gain constraints declared by the Airspy C driver and hardware protocol.
+///
+/// These are not queried from the device at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AirspyDeclaredGainCapabilities {
+    /// LNA range as `(minimum, maximum, step)` in hardware gain units.
+    pub lna: (u8, u8, u8),
+    /// Mixer range as `(minimum, maximum, step)` in hardware gain units.
+    pub mixer: (u8, u8, u8),
+    /// VGA range as `(minimum, maximum, step)` in hardware gain units.
+    pub vga: (u8, u8, u8),
+    /// Sensitivity and linearity preset range as `(minimum, maximum, step)`.
+    pub preset: (u8, u8, u8),
+}
+
 /// Raw gain stage values sent over the async control channel.
 ///
 /// The dB-to-preset mapping lives in the caller (e.g. `desperado`); here we
@@ -84,6 +99,17 @@ pub struct AirspyGainStages {
     pub lna: u8,   // 0-14
     pub mixer: u8, // 0-15
     pub vga: u8,   // 0-15
+}
+
+/// Result of a non-blocking receive attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecv<T> {
+    /// A sample chunk is available.
+    Item(T),
+    /// The reader is still active but no chunk is available yet.
+    Empty,
+    /// The reader stopped cleanly.
+    End,
 }
 
 pub struct AsyncReadHandle {
@@ -107,8 +133,34 @@ enum AsyncReadControl {
 }
 
 impl AsyncReadHandle {
-    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.recv().ok()
+    /// Receive the next chunk of raw data (blocking).
+    ///
+    /// Returns `Ok(None)` after an intentional stop. An unexpected reader
+    /// termination, including a device disconnect, is returned as `Err`.
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        match self.rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
+            Err(_) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
+    }
+
+    /// Try to receive the next chunk without blocking.
+    pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
+        match self.rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::TryRecvError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     pub fn control_handle(&self) -> AsyncReadControlHandle {
@@ -563,13 +615,50 @@ impl Airspy {
         Ok(())
     }
 
+    /// Return gain constraints declared by the Airspy C driver and protocol.
+    pub fn declared_gain_capabilities() -> AirspyDeclaredGainCapabilities {
+        AirspyDeclaredGainCapabilities {
+            lna: (0, 14, 1),
+            mixer: (0, 15, 1),
+            vga: (0, 15, 1),
+            preset: (0, (GAIN_COUNT - 1) as u8, 1),
+        }
+    }
+
+    /// Normalize an LNA gain request to a supported hardware value.
+    pub fn normalize_lna_gain(gain: u8) -> u8 {
+        let applied = gain.min(14);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy LNA gain was clamped");
+        }
+        applied
+    }
+
+    /// Normalize a mixer gain request to a supported hardware value.
+    pub fn normalize_mixer_gain(gain: u8) -> u8 {
+        let applied = gain.min(15);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy mixer gain was clamped");
+        }
+        applied
+    }
+
+    /// Normalize a VGA gain request to a supported hardware value.
+    pub fn normalize_vga_gain(gain: u8) -> u8 {
+        let applied = gain.min(15);
+        if applied != gain {
+            tracing::warn!(requested = gain, applied, "Airspy VGA gain was clamped");
+        }
+        applied
+    }
+
     /// Set the LNA (Low Noise Amplifier) gain.
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-14 (clamped if out of range)
+    /// * `gain` - Gain value 0-14; higher values are clamped with a warning.
     pub fn set_lna_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(14);
+        let gain = Self::normalize_lna_gain(gain);
         let data = self.control_in(AirspyCommand::SetLnaGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -586,9 +675,9 @@ impl Airspy {
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    /// * `gain` - Gain value 0-15; higher values are clamped with a warning.
     pub fn set_mixer_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15);
+        let gain = Self::normalize_mixer_gain(gain);
         let data = self.control_in(AirspyCommand::SetMixerGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -605,9 +694,9 @@ impl Airspy {
     ///
     /// # Arguments
     ///
-    /// * `gain` - Gain value 0-15 (clamped if out of range)
+    /// * `gain` - Gain value 0-15; higher values are clamped with a warning.
     pub fn set_vga_gain(&self, gain: u8) -> Result<()> {
-        let gain = gain.min(15);
+        let gain = Self::normalize_vga_gain(gain);
         let data = self.control_in(AirspyCommand::SetVgaGain.as_u8(), 0, gain as u16, 1)?;
 
         if data.is_empty() {
@@ -1016,7 +1105,9 @@ fn streaming_thread(
 
     // Open the bulk IN endpoint
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(BULK_ENDPOINT_IN) else {
-        tracing::warn!("failed to open bulk endpoint 0x{:02x}", BULK_ENDPOINT_IN);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{BULK_ENDPOINT_IN:02x}"
+        ))));
         return;
     };
 
@@ -1073,6 +1164,9 @@ fn streaming_thread(
                     consecutive_errors,
                     e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -1143,4 +1237,67 @@ fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
     }
     dev.set_vga_gain(stages.vga)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel();
+        let handle = AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            thread: None,
+        };
+        (handle, tx)
+    }
+
+    #[test]
+    fn recv_distinguishes_data_error_and_clean_end() {
+        let (handle, tx) = handle();
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(handle.recv().unwrap(), Some(vec![1, 2]));
+
+        tx.send(Err(Error::StreamingError("unplugged".into())))
+            .unwrap();
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message == "unplugged")
+        );
+
+        handle.stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        assert_eq!(handle.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn recv_rejects_unexpected_channel_close() {
+        let (handle, tx) = handle();
+        drop(tx);
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message.contains("ended unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn try_recv_distinguishes_empty_and_end() {
+        let (handle, tx) = handle();
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::Empty));
+        handle.stop.store(true, Ordering::Relaxed);
+        drop(tx);
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::End));
+    }
+
+    #[test]
+    fn declared_gain_constraints_match_airspy_protocol() {
+        let capabilities = Airspy::declared_gain_capabilities();
+        assert_eq!(capabilities.lna, (0, 14, 1));
+        assert_eq!(capabilities.mixer, (0, 15, 1));
+        assert_eq!(capabilities.vga, (0, 15, 1));
+        assert_eq!(capabilities.preset, (0, 21, 1));
+        assert_eq!(Airspy::normalize_lna_gain(255), 14);
+    }
 }

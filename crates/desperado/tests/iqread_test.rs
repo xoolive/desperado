@@ -1,8 +1,18 @@
 //! Unit and integration tests for the iqread module
 
-use desperado::{IqFormat, IqSource};
+use desperado::{IqAsyncSource, IqFormat, IqSource};
+use futures::StreamExt;
 use std::fs;
-use tempfile::NamedTempFile;
+use std::io::Write;
+use std::time::Duration;
+use tempfile::{Builder, NamedTempFile};
+
+fn zstd_with_checksum(data: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.include_checksum(true).unwrap();
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
 
 /// Helper to create a temp file with the given bytes and return (NamedTempFile, path String).
 /// The NamedTempFile must be kept alive for the duration of the test.
@@ -11,6 +21,196 @@ fn temp_iq(data: &[u8]) -> (NamedTempFile, String) {
     let path = f.path().to_str().unwrap().to_string();
     fs::write(&path, data).expect("Failed to write test file");
     (f, path)
+}
+
+fn temp_wav_iq(channels: u16, samples: &[i16]) -> NamedTempFile {
+    let file = Builder::new().suffix(".wav").tempfile().unwrap();
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: 2_048_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(file.path(), spec).unwrap();
+    for sample in samples {
+        writer.write_sample(*sample).unwrap();
+    }
+    writer.finalize().unwrap();
+    file
+}
+
+#[test]
+fn test_stereo_pcm16_wav_iq_uses_header_sample_rate() {
+    let file = temp_wav_iq(2, &[-32768, 32767, 0, -16384, 16384, 0]);
+    let mut source = IqSource::from_wav_iq_file(file.path(), 2).unwrap();
+
+    assert_eq!(source.wav_iq_sample_rate(), Some(2_048_000));
+    let first = source.next().unwrap().unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0], num_complex::Complex::new(-1.0, 32767.0 / 32768.0));
+    assert_eq!(first[1], num_complex::Complex::new(0.0, -0.5));
+    assert_eq!(source.next().unwrap().unwrap().len(), 1);
+    assert!(source.next().is_none());
+}
+
+#[test]
+fn test_wav_iq_rejects_mono_input() {
+    let file = temp_wav_iq(1, &[0, 0]);
+    assert!(matches!(
+        IqSource::from_wav_iq_file(file.path(), 2),
+        Err(desperado::Error::Format(_))
+    ));
+}
+
+#[test]
+fn test_sync_zstd_file_is_decompressed_transparently() {
+    let samples = [0_u8, 255, 127, 128, 255, 0];
+    let compressed = zstd::stream::encode_all(samples.as_slice(), 1).unwrap();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .expect("open compressed IQ source");
+    let chunk = source.next().unwrap().unwrap();
+    assert_eq!(chunk.len(), 3);
+    assert!(source.next().is_none());
+}
+
+#[tokio::test]
+async fn test_async_zstd_file_is_decompressed_transparently() {
+    let samples = [0_u8, 255, 127, 128, 255, 0];
+    let compressed = zstd::stream::encode_all(samples.as_slice(), 1).unwrap();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .expect("open compressed async IQ source");
+    let chunk = source.next().await.unwrap().unwrap();
+    assert_eq!(chunk.len(), 3);
+    assert!(source.next().await.is_none());
+}
+
+#[test]
+fn test_sync_zstd_checksum_failure_is_an_error() {
+    let mut compressed = zstd_with_checksum(&[42_u8; 4096]);
+    *compressed.last_mut().unwrap() ^= 1;
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .expect("open corrupt compressed IQ source");
+    assert!(matches!(source.next(), Some(Err(desperado::Error::Io(_)))));
+}
+
+#[tokio::test]
+async fn test_async_zstd_checksum_failure_is_an_error() {
+    let mut compressed = zstd_with_checksum(&[42_u8; 4096]);
+    *compressed.last_mut().unwrap() ^= 1;
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source =
+        IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+            .await
+            .expect("open corrupt compressed async IQ source");
+    assert!(matches!(
+        source.next().await,
+        Some(Err(desperado::Error::Io(_)))
+    ));
+}
+
+#[test]
+fn test_sync_zstd_truncated_frame_is_an_error() {
+    let raw = vec![42_u8; 4096];
+    let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+    compressed.truncate(compressed.len() - 1);
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source = IqSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .expect("open truncated compressed IQ source");
+    let error = source.next().unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        desperado::Error::Io(ref io_error)
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[tokio::test]
+async fn test_async_zstd_truncated_frame_is_an_error() {
+    let raw = vec![42_u8; 4096];
+    let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+    compressed.truncate(compressed.len() - 1);
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(file.path(), compressed).unwrap();
+
+    let mut source =
+        IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+            .await
+            .expect("open truncated compressed async IQ source");
+    let error = source.next().await.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        desperado::Error::Io(ref io_error)
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[test]
+fn test_sync_zstd_spans_multiple_output_chunks() {
+    let samples: Vec<u8> = (0..20).flat_map(|value| [value, value]).collect();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all(samples.as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let source = IqSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8).unwrap();
+
+    assert_eq!(
+        source.map(|chunk| chunk.unwrap().len()).collect::<Vec<_>>(),
+        [3, 3, 3, 3, 3, 3, 2]
+    );
+}
+
+#[tokio::test]
+async fn test_async_zstd_spans_multiple_output_chunks() {
+    let samples: Vec<u8> = (0..20).flat_map(|value| [value, value]).collect();
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all(samples.as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let mut source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .unwrap();
+    let mut lengths = Vec::new();
+    while let Some(chunk) = source.next().await {
+        lengths.push(chunk.unwrap().len());
+    }
+    assert_eq!(lengths, [3, 3, 3, 3, 3, 3, 2]);
+}
+
+#[tokio::test]
+async fn test_async_zstd_source_drop_is_nonblocking() {
+    let file = Builder::new().suffix(".cu8.zst").tempfile().unwrap();
+    fs::write(
+        file.path(),
+        zstd::stream::encode_all([42_u8; 4096].as_slice(), 1).unwrap(),
+    )
+    .unwrap();
+    let source = IqAsyncSource::from_file(file.path(), 162_000_000, 96_000, 2048, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), async move { drop(source) })
+            .await
+            .is_ok()
+    );
 }
 
 #[test]
@@ -193,9 +393,7 @@ fn test_iqread_integration_multiple_chunks() {
 
 #[test]
 fn test_iqread_integration_partial_chunk() {
-    // Integration test: File size not exactly divisible by chunk size
-    // Current behavior: read_exact will fail on partial chunk (UnexpectedEof)
-    // Create 25 samples, request chunks of 10
+    // Create 25 samples, request chunks of 10.
     let mut samples = Vec::new();
     for i in 0..25 {
         samples.push(i as u8);
@@ -216,10 +414,63 @@ fn test_iqread_integration_partial_chunk() {
         assert_eq!(chunk.len(), 10, "Chunk {} should be full", i);
     }
 
-    // Third attempt will encounter UnexpectedEof (only 5 samples = 10 bytes remaining)
-    // The Iterator impl treats UnexpectedEof as None (end of stream)
-    let result = iq_source.next();
-    assert!(result.is_none(), "Partial chunk should result in EOF");
+    // The final complete samples must not be discarded merely because the chunk is short.
+    let final_chunk = iq_source
+        .next()
+        .expect("Missing final partial chunk")
+        .unwrap();
+    assert_eq!(final_chunk.len(), 5);
+    assert!(
+        iq_source.next().is_none(),
+        "Should reach EOF after final chunk"
+    );
+}
+
+#[tokio::test]
+async fn test_iqasyncread_emits_complete_final_partial_chunk() {
+    let samples = [0_u8, 255, 127, 128, 255, 0, 1, 2, 3, 4]; // 5 CU8 samples
+    let (_tmp, path) = temp_iq(&samples);
+    let mut source = IqAsyncSource::from_file(&path, 162_000_000, 96_000, 3, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 3);
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 2);
+    assert!(source.next().await.is_none());
+}
+
+#[test]
+fn test_iqread_reports_trailing_incomplete_sample_after_complete_samples() {
+    let (_tmp, path) = temp_iq(&[0, 255, 127]);
+    let mut source = IqSource::from_file(&path, 162_000_000, 96_000, 2, IqFormat::Cu8).unwrap();
+
+    assert_eq!(source.next().unwrap().unwrap().len(), 1);
+    assert!(matches!(
+        source.next(),
+        Some(Err(desperado::Error::TruncatedIq {
+            format: IqFormat::Cu8,
+            remaining_bytes: 1,
+        }))
+    ));
+    assert!(source.next().is_none());
+}
+
+#[tokio::test]
+async fn test_iqasyncread_reports_trailing_incomplete_sample_after_complete_samples() {
+    let (_tmp, path) = temp_iq(&[0, 255, 127]);
+    let mut source = IqAsyncSource::from_file(&path, 162_000_000, 96_000, 2, IqFormat::Cu8)
+        .await
+        .unwrap();
+
+    assert_eq!(source.next().await.unwrap().unwrap().len(), 1);
+    assert!(matches!(
+        source.next().await,
+        Some(Err(desperado::Error::TruncatedIq {
+            format: IqFormat::Cu8,
+            remaining_bytes: 1,
+        }))
+    ));
+    assert!(source.next().await.is_none());
 }
 
 #[test]

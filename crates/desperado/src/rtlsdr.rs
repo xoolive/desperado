@@ -8,10 +8,15 @@
 //! via nusb's endpoint queue, eliminating the inter-transfer gap that causes
 //! RTL2832U FIFO overflow at high sample rates.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::Stream;
 use num_complex::Complex;
 
-use crate::{Gain, IqFormat, error};
+use crate::{Gain, IqFormat, error, lifecycle};
 
 /// Tokio-side bridge queue depth between the USB reader thread and the async consumer.
 ///
@@ -200,23 +205,53 @@ fn open_and_configure(config: &RtlSdrConfig) -> error::Result<rs_rtl::RtlSdr> {
 
     match config.gain {
         Gain::Manual(gain_db) => {
-            let gain_tenths = (gain_db * 10.0) as i32;
-            tracing::info!(gain_db, gain_tenths, "Setting manual tuner gain");
-            sdr.set_gain_manual(gain_tenths)?;
+            set_manual_tuner_gain(&mut sdr, gain_db)?;
         }
         Gain::Auto => {
             tracing::info!("Setting automatic tuner gain");
             sdr.set_gain_auto()?;
         }
-        Gain::Elements(_) => {
-            tracing::warn!("RTL-SDR does not support element-based gain control, using auto gain");
-            sdr.set_gain_auto()?;
+        Gain::Elements(ref elements) => {
+            let tuner_gain = elements.iter().find_map(|element| match &element.name {
+                crate::GainElementName::Tuner => Some(element.value_db),
+                name => {
+                    tracing::warn!(
+                        ?name,
+                        "RTL-SDR does not support this gain element; ignoring"
+                    );
+                    None
+                }
+            });
+            if let Some(gain_db) = tuner_gain {
+                set_manual_tuner_gain(&mut sdr, gain_db)?;
+            } else {
+                tracing::warn!("RTL-SDR gain elements did not include TUNER; using automatic gain");
+                sdr.set_gain_auto()?;
+            }
         }
     }
 
     let _ = sdr.set_bias_t(config.bias_tee);
 
     Ok(sdr)
+}
+
+/// Select and apply the nearest tuner gain advertised by this RTL-SDR device.
+fn set_manual_tuner_gain(sdr: &mut rs_rtl::RtlSdr, requested_db: f64) -> error::Result<()> {
+    let requested_tenths = (requested_db * 10.0).round() as i32;
+    let effective_tenths = sdr
+        .gains()
+        .iter()
+        .min_by_key(|gain| (i64::from(**gain) - i64::from(requested_tenths)).abs())
+        .copied()
+        .ok_or_else(|| error::Error::device("RTL-SDR reports no tuner gain values"))?;
+    tracing::info!(
+        requested_db,
+        effective_db = f64::from(effective_tenths) / 10.0,
+        "Setting RTL-SDR tuner gain"
+    );
+    sdr.set_gain_manual(effective_tenths)?;
+    Ok(())
 }
 
 /**
@@ -260,13 +295,20 @@ impl RtlSdrReader {
             };
             let _ = tx_init.send(Ok(()));
 
-            while let Some(data) = reader.recv() {
-                if data.is_empty() {
-                    continue;
-                }
-                // Use blocking send for backpressure (lesson 20.1)
-                if tx.send(Ok(data)).is_err() {
-                    break;
+            loop {
+                match reader.recv() {
+                    Ok(Some(data)) if data.is_empty() => continue,
+                    Ok(Some(data)) => {
+                        // Use blocking send for backpressure (lesson 20.1)
+                        if tx.send(Ok(data)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string()));
+                        break;
+                    }
                 }
             }
         });
@@ -346,6 +388,8 @@ pub struct AsyncRtlSdrReader {
     control: rs_rtl::AsyncReadControlHandle,
     /// Async receiver for the decode loop.
     samples_rx: tokio::sync::mpsc::Receiver<error::Result<Vec<Complex<f32>>>>,
+    cancelled: Arc<AtomicBool>,
+    bridge: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncRtlSdrReader {
@@ -362,19 +406,43 @@ impl AsyncRtlSdrReader {
         let control = reader.control_handle();
 
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge_cancelled = Arc::clone(&cancelled);
 
         // Bridge thread: receives raw bytes from the USB streaming thread,
         // converts to complex, sends to tokio channel.
         // Exits when the consumer drops `samples_rx`.
-        std::thread::Builder::new()
+        let bridge = std::thread::Builder::new()
             .name("rtlsdr-bridge".into())
             .spawn(move || {
                 // Keep sdr alive so the device is not dropped while streaming
                 let _sdr = sdr;
-                while let Some(bytes) = reader.recv() {
-                    let samples = Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
-                    if samples_tx.blocking_send(samples).is_err() {
+                loop {
+                    if bridge_cancelled.load(Ordering::Acquire) {
                         break;
+                    }
+                    match reader.recv() {
+                        Ok(Some(bytes)) => {
+                            let samples =
+                                Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
+                            if !lifecycle::send_or_cancel(&samples_tx, &bridge_cancelled, samples) {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(reader_error) => {
+                            if !bridge_cancelled.load(Ordering::Acquire) {
+                                let _ = lifecycle::send_or_cancel(
+                                    &samples_tx,
+                                    &bridge_cancelled,
+                                    Err(error::Error::stream_terminated(
+                                        "RTL-SDR",
+                                        reader_error.to_string(),
+                                    )),
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
             })
@@ -383,6 +451,8 @@ impl AsyncRtlSdrReader {
         Ok(Self {
             control,
             samples_rx,
+            cancelled,
+            bridge: Some(bridge),
         })
     }
 
@@ -403,9 +473,29 @@ impl AsyncRtlSdrReader {
                         .set_gain(gain_tenths)
                         .map_err(|e| error::Error::device(format!("RTL-SDR set gain failed: {e}")))
                 }
-                Gain::Elements(_) => {
-                    tracing::warn!("Element-based gain not supported for RTL-SDR; ignoring");
-                    Ok(())
+                Gain::Elements(elements) => {
+                    let tuner_gain = elements.iter().find_map(|element| match &element.name {
+                        crate::GainElementName::Tuner => Some(element.value_db),
+                        name => {
+                            tracing::warn!(
+                                ?name,
+                                "RTL-SDR does not support this gain element; ignoring"
+                            );
+                            None
+                        }
+                    });
+                    if let Some(gain_db) = tuner_gain {
+                        let gain_tenths = (gain_db * 10.0).round() as i32;
+                        tracing::info!(gain_db, "Setting RTL-SDR runtime tuner gain");
+                        self.control.set_gain(gain_tenths).map_err(|e| {
+                            error::Error::device(format!("RTL-SDR set gain failed: {e}"))
+                        })
+                    } else {
+                        tracing::warn!(
+                            "RTL-SDR gain elements did not include TUNER; leaving gain unchanged"
+                        );
+                        Ok(())
+                    }
                 }
             },
             RtlSdrMessage::SampleRate(_rate) => {
@@ -427,6 +517,22 @@ impl AsyncRtlSdrReader {
     /// Retune to a specific center frequency.
     pub fn tune(&self, center_freq: u32) -> error::Result<()> {
         self.adjust(RtlSdrMessage::Frequency(center_freq))
+    }
+
+    /// Stop the live stream and wait for its bridge thread to exit.
+    pub async fn stop(&mut self) -> error::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        lifecycle::join_bridge(self.bridge.take()).await;
+        Ok(())
+    }
+}
+
+impl Drop for AsyncRtlSdrReader {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.control.stop();
+        // Dropping the JoinHandle detaches; Drop must never block an async executor.
     }
 }
 

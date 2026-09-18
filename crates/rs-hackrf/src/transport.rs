@@ -31,6 +31,19 @@ pub const TRANSFER_BUFFER_SIZE: usize = 262_144;
 /// Recommended buffer size for user reads (same as TRANSFER_BUFFER_SIZE).
 pub const RECOMMENDED_BUFFER_SIZE: usize = TRANSFER_BUFFER_SIZE;
 
+/// Gain constraints declared by the HackRF C driver and hardware protocol.
+///
+/// These are not queried from the device at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HackRfDeclaredGainCapabilities {
+    /// LNA range as `(minimum, maximum, step)` in dB.
+    pub lna: (u32, u32, u32),
+    /// VGA range as `(minimum, maximum, step)` in dB.
+    pub vga: (u32, u32, u32),
+    /// RF amplifier choices in dB.
+    pub amp: [u32; 2],
+}
+
 /// Bulk read timeout for streaming (1 second).
 const BULK_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -49,6 +62,17 @@ pub enum StreamControl {
     SetVgaGain(u32),
     /// Enable/disable RF amplifier
     SetAmpEnable(bool),
+}
+
+/// Result of a non-blocking receive attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TryRecv<T> {
+    /// A sample chunk is available.
+    Item(T),
+    /// The reader is still active but no chunk is available yet.
+    Empty,
+    /// The reader stopped cleanly.
+    End,
 }
 
 /// Handle for receiving streaming data from a HackRF device.
@@ -77,15 +101,32 @@ pub struct AsyncReadControlHandle {
 impl AsyncReadHandle {
     /// Receive the next chunk of raw IQ bytes (blocking).
     ///
-    /// Returns `None` when the streaming thread has exited (device disconnected,
-    /// stop requested, or handle dropped).
-    pub fn recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.recv().ok()
+    /// Returns `Ok(None)` after an intentional stop. An unexpected reader
+    /// termination, including a device disconnect, is returned as `Err`.
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        match self.rx.recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
+            Err(_) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Try to receive the next chunk without blocking.
-    pub fn try_recv(&self) -> Option<Result<Vec<u8>>> {
-        self.rx.try_recv().ok()
+    pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
+        match self.rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::TryRecvError::Disconnected) if self.stop.load(Ordering::Relaxed) => {
+                Ok(TryRecv::End)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::StreamingError(
+                "streaming thread ended unexpectedly".to_string(),
+            )),
+        }
     }
 
     /// Get a clonable control handle for sending commands to the streaming thread.
@@ -567,19 +608,48 @@ impl HackRf {
         Ok(())
     }
 
+    /// Return gain constraints declared by the HackRF C driver and protocol.
+    pub fn declared_gain_capabilities() -> HackRfDeclaredGainCapabilities {
+        HackRfDeclaredGainCapabilities {
+            lna: (0, 40, 8),
+            vga: (0, 62, 2),
+            amp: [0, 14],
+        }
+    }
+
+    /// Normalize an LNA request to the value accepted by the hardware.
+    pub fn normalize_lna_gain(gain_db: u32) -> u32 {
+        let applied = gain_db.min(40) & !0x07;
+        if applied != gain_db {
+            tracing::warn!(
+                requested = gain_db,
+                applied,
+                "HackRF LNA gain was normalized"
+            );
+        }
+        applied
+    }
+
+    /// Normalize a VGA request to the value accepted by the hardware.
+    pub fn normalize_vga_gain(gain_db: u32) -> u32 {
+        let applied = gain_db.min(62) & !0x01;
+        if applied != gain_db {
+            tracing::warn!(
+                requested = gain_db,
+                applied,
+                "HackRF VGA gain was normalized"
+            );
+        }
+        applied
+    }
+
     /// Set LNA (low noise amplifier) gain.
     ///
     /// Range: 0-40 dB in 8 dB steps. Value is rounded down to nearest 8 dB.
     ///
     /// Reference: hackrf.c `hackrf_set_lna_gain()` - vendor request 19
     pub fn set_lna_gain(&self, gain_db: u32) -> Result<()> {
-        if gain_db > 40 {
-            return Err(Error::ConfigFailed(format!(
-                "LNA gain must be 0-40, got {gain_db}"
-            )));
-        }
-        // Round down to 8 dB steps (mask off lower 3 bits)
-        let value = gain_db & !0x07;
+        let value = Self::normalize_lna_gain(gain_db);
 
         let retval = self.control_in(VendorRequest::SetLnaGain, 0, value as u16, 1)?;
 
@@ -599,13 +669,7 @@ impl HackRf {
     ///
     /// Reference: hackrf.c `hackrf_set_vga_gain()` - vendor request 20
     pub fn set_vga_gain(&self, gain_db: u32) -> Result<()> {
-        if gain_db > 62 {
-            return Err(Error::ConfigFailed(format!(
-                "VGA gain must be 0-62, got {gain_db}"
-            )));
-        }
-        // Round down to 2 dB steps (mask off LSB)
-        let value = gain_db & !0x01;
+        let value = Self::normalize_vga_gain(gain_db);
 
         let retval = self.control_in(VendorRequest::SetVgaGain, 0, value as u16, 1)?;
 
@@ -927,7 +991,9 @@ fn streaming_thread(
 
     // Open the bulk IN endpoint
     let Ok(mut ep_in) = iface.endpoint::<Bulk, In>(RX_ENDPOINT_ADDRESS) else {
-        tracing::warn!("failed to open bulk endpoint 0x{:02x}", RX_ENDPOINT_ADDRESS);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to open bulk endpoint 0x{RX_ENDPOINT_ADDRESS:02x}"
+        ))));
         return;
     };
 
@@ -940,7 +1006,9 @@ fn streaming_thread(
     tracing::debug!("submitted {} initial transfers", num_transfers);
 
     if let Err(e) = dev.set_transceiver_mode(TRANSCEIVER_MODE_RECEIVE) {
-        tracing::warn!("failed to enable HackRF RX mode: {}", e);
+        let _ = tx.send(Err(Error::StreamingError(format!(
+            "failed to enable HackRF RX mode: {e}"
+        ))));
         ep_in.cancel_all();
         while ep_in.pending() > 0 {
             let _ = ep_in.wait_next_complete(Duration::from_millis(100));
@@ -1005,6 +1073,9 @@ fn streaming_thread(
                     consecutive_errors,
                     e
                 );
+                let _ = tx.send(Err(Error::StreamingError(format!(
+                    "device disconnected after {consecutive_errors} consecutive USB transfer errors: {e}"
+                ))));
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -1066,7 +1137,55 @@ fn streaming_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_baseband_filter_bw;
+    use super::*;
+
+    fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel();
+        let handle = AsyncReadHandle {
+            rx,
+            ctrl_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            thread: None,
+        };
+        (handle, tx)
+    }
+
+    #[test]
+    fn recv_distinguishes_data_error_and_clean_end() {
+        let (handle, tx) = handle();
+        tx.send(Ok(vec![1, 2])).unwrap();
+        assert_eq!(handle.recv().unwrap(), Some(vec![1, 2]));
+
+        tx.send(Err(Error::StreamingError("unplugged".into())))
+            .unwrap();
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message == "unplugged")
+        );
+
+        handle.stop();
+        drop(tx);
+        assert_eq!(handle.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn recv_rejects_unexpected_channel_close() {
+        let (handle, tx) = handle();
+        drop(tx);
+        assert!(
+            matches!(handle.recv(), Err(Error::StreamingError(message)) if message.contains("ended unexpectedly"))
+        );
+    }
+
+    #[test]
+    fn try_recv_distinguishes_empty_and_end() {
+        let (handle, tx) = handle();
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::Empty));
+        handle.stop();
+        drop(tx);
+        assert!(matches!(handle.try_recv().unwrap(), TryRecv::End));
+    }
 
     #[test]
     fn baseband_filter_bandwidth_matches_libhackrf_round_down() {
@@ -1090,5 +1209,16 @@ mod tests {
     #[test]
     fn baseband_filter_bandwidth_caps_above_maximum() {
         assert_eq!(compute_baseband_filter_bw(99_000_000), 28_000_000);
+    }
+
+    #[test]
+    fn declared_gain_constraints_match_hackrf_protocol() {
+        let capabilities = HackRf::declared_gain_capabilities();
+        assert_eq!(capabilities.lna, (0, 40, 8));
+        assert_eq!(capabilities.vga, (0, 62, 2));
+        assert_eq!(capabilities.amp, [0, 14]);
+        assert_eq!(HackRf::normalize_lna_gain(29), 24);
+        assert_eq!(HackRf::normalize_lna_gain(99), 40);
+        assert_eq!(HackRf::normalize_vga_gain(63), 62);
     }
 }
