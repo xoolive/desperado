@@ -45,7 +45,7 @@ use fmradio::rds::{RdsDecoder, RdsResamplerCustom, StereoDecoderPLL};
 use futures::StreamExt;
 use ratatui::style::{Color, Modifier, Style};
 use std::f32::consts::PI;
-use std::io::{Write, stderr, stdout};
+use std::io::{Seek, SeekFrom, Write, stderr, stdout};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -132,6 +132,10 @@ struct Args {
     /// for optimal RDS decoding with redsea
     #[arg(long)]
     resample_out: Option<u32>,
+
+    /// Write demodulated audio to a 48 kHz 16-bit WAV file.
+    #[arg(long)]
+    wav: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -218,13 +222,14 @@ fn resolve_input_args(args: &mut Args) -> desperado::Result<()> {
     IqFormat::from_str(&format)
         .map_err(|error| std::io::Error::other(format!("Invalid format: {error}")))?;
 
-    // The historical device default tunes 200 kHz above the station and
-    // digitally shifts back. A filename-aware file defaults to its actual
-    // capture-center delta instead; an on-station recording therefore uses 0.
+    // The offset is the station frequency relative to the capture center.
+    // Positive values shift an above-center station down; negative values
+    // shift a below-center station up. A filename-aware file therefore uses
+    // target minus capture center, while an on-center recording uses 0.
     let offset = if let Some(offset) = args.offset_freq {
         offset
     } else if let Some(meta) = metadata {
-        i32::try_from(i64::from(meta.center_freq_hz) - i64::from(target_center)).map_err(|_| {
+        i32::try_from(i64::from(target_center) - i64::from(meta.center_freq_hz)).map_err(|_| {
             std::io::Error::other("capture/target frequency difference exceeds i32 range")
         })?
     } else {
@@ -252,6 +257,58 @@ fn resolve_input_args(args: &mut Args) -> desperado::Result<()> {
 const FM_BANDWIDTH: f32 = 240_000.0;
 const MONO_SIGNAL_BW: f32 = 15_000.0;
 const AUDIO_RATE: usize = 48_000;
+
+struct WavWriter {
+    file: std::fs::File,
+    data_bytes: u32,
+    channels: u16,
+}
+
+impl WavWriter {
+    fn create(path: &std::path::Path, channels: u16) -> std::io::Result<Self> {
+        let mut writer = Self {
+            file: std::fs::File::create(path)?,
+            data_bytes: 0,
+            channels,
+        };
+        writer.write_header()?;
+        Ok(writer)
+    }
+
+    fn write_samples(&mut self, samples: &[f32]) -> std::io::Result<()> {
+        for &sample in samples {
+            let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            self.file.write_all(&value.to_le_bytes())?;
+        }
+        self.data_bytes = self.data_bytes.saturating_add((samples.len() * 2) as u32);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.write_header()
+    }
+
+    fn write_header(&mut self) -> std::io::Result<()> {
+        let byte_rate = AUDIO_RATE as u32 * self.channels as u32 * 2;
+        let block_align = self.channels * 2;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(b"RIFF")?;
+        self.file
+            .write_all(&(36u32.saturating_add(self.data_bytes)).to_le_bytes())?;
+        self.file.write_all(b"WAVEfmt ")?;
+        self.file.write_all(&16u32.to_le_bytes())?;
+        self.file.write_all(&1u16.to_le_bytes())?;
+        self.file.write_all(&self.channels.to_le_bytes())?;
+        self.file.write_all(&(AUDIO_RATE as u32).to_le_bytes())?;
+        self.file.write_all(&byte_rate.to_le_bytes())?;
+        self.file.write_all(&block_align.to_le_bytes())?;
+        self.file.write_all(&16u16.to_le_bytes())?;
+        self.file.write_all(b"data")?;
+        self.file.write_all(&self.data_bytes.to_le_bytes())?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+}
 
 #[derive(Default, Clone)]
 struct TuiState {
@@ -581,6 +638,11 @@ async fn main() -> desperado::Result<()> {
     );
 
     let channels = if args.tui || initial_stereo { 2 } else { 1 };
+    let mut wav_writer = args
+        .wav
+        .as_deref()
+        .map(|path| WavWriter::create(path, channels as u16))
+        .transpose()?;
 
     // Setup audio output - larger buffer for file playback to prevent underruns
     let is_file_source = is_file_like_source(&args.source);
@@ -688,6 +750,7 @@ async fn main() -> desperado::Result<()> {
             &lowpass_fir,
             actual_mpx_rate,
             tx.clone(),
+            wav_writer.as_mut(),
             if args.tui {
                 Some(tui_state.clone())
             } else {
@@ -712,6 +775,7 @@ async fn main() -> desperado::Result<()> {
             &lowpass_fir,
             actual_mpx_rate,
             tx.clone(),
+            wav_writer.as_mut(),
             if args.tui {
                 Some(tui_state.clone())
             } else {
@@ -746,6 +810,9 @@ async fn main() -> desperado::Result<()> {
         warn!(%error, "Unable to stop IQ source cleanly");
     }
 
+    if let Some(writer) = wav_writer.as_mut() {
+        writer.finish()?;
+    }
     run_result
 }
 
@@ -900,6 +967,7 @@ async fn run_mono(
     lowpass_fir: &LowPassFir,
     mpx_sample_rate: f32,
     tx: channel::Sender<f32>,
+    mut wav_writer: Option<&mut WavWriter>,
     tui_state: Option<Arc<Mutex<TuiState>>>,
     tui_mode: bool,
     adjust_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RtlSdrMessage>,
@@ -1006,6 +1074,10 @@ async fn run_mono(
             agc_gain = agc_gain.clamp(0.01, 2.0);
         }
 
+        if let Some(writer) = wav_writer.as_deref_mut() {
+            writer.write_samples(&audio)?;
+        }
+
         let processed: Vec<f32> = audio
             .iter()
             .map(|&s| {
@@ -1069,6 +1141,7 @@ async fn run_stereo(
     _lowpass_fir: &LowPassFir,
     mpx_sample_rate: f32,
     tx: channel::Sender<f32>,
+    mut wav_writer: Option<&mut WavWriter>,
     tui_state: Option<Arc<Mutex<TuiState>>>,
     tui_mode: bool,
     stereo_enabled: Arc<AtomicBool>,
@@ -1317,6 +1390,9 @@ async fn run_stereo(
         }
 
         let audio = audio_resample.process(&interleaved);
+        if let Some(writer) = wav_writer.as_deref_mut() {
+            writer.write_samples(&audio)?;
+        }
 
         if !args.no_audio {
             // Only do adaptive resampling for live sources (not files)
@@ -1588,6 +1664,7 @@ mod tests {
             format: None,
             raw_out: false,
             resample_out: None,
+            wav: None,
         }
     }
 
@@ -1616,7 +1693,7 @@ mod tests {
         let mut args = file_args("gqrx_20260728_225737_94500000_1024000_fc.raw");
         args.center_freq = Some(Frequency(94_700_000));
         resolve_input_args(&mut args).unwrap();
-        assert_eq!(args.offset_freq_hz(), -200_000);
+        assert_eq!(args.offset_freq_hz(), 200_000);
     }
 
     #[test]

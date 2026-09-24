@@ -1,0 +1,19 @@
+[package]
+name = "hdradio-syom"
+version = "0.6.0-hdc.1"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Evgeny Khodzitsky", "Xavier Olive"]
+description = "Pure-Rust AAC/HDC decoder core for NRSC-5 HD Radio"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/xoolive/desperado"
+exclude = ["src/**/*_tests.rs", "src/goldens/**", "tests/**", "benches/**", "examples/**"]
+
+[lib]
+name = "syom"
+path = "src/lib.rs"
+
+[lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
