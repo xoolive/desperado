@@ -13,8 +13,11 @@
 pub mod mp2;
 
 use reed_solomon::Decoder as RsDecoder;
-use tracing::{debug, info, warn};
+#[cfg(feature = "fdk-aac")]
+use tracing::info;
+use tracing::{debug, warn};
 
+#[cfg(feature = "fdk-aac")]
 use crate::pad::{PadData, PadExtractor};
 
 /// Number of logical frames per superframe.
@@ -31,6 +34,7 @@ const RS_DATA: usize = RS_BLOCK_LEN - RS_PARITY; // 110
 
 /// Maximum number of consecutive superframes we conceal by replaying audio.
 /// After this, emit silence instead of repeating stale program content.
+#[cfg(feature = "fdk-aac")]
 const MAX_REPLAYED_SUPERFRAMES: usize = 6;
 
 // ---------------------------------------------------------------------------
@@ -560,6 +564,7 @@ impl SuperframeDecoder {
 // AacDecoder: wrapper around fdk-aac
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "fdk-aac")]
 /// HE-AAC v2 decoder for DAB+ audio.
 pub struct AacDecoder {
     decoder: fdk_aac::dec::Decoder,
@@ -573,6 +578,14 @@ pub struct AacDecoder {
     pub channels: usize,
 }
 
+#[cfg(feature = "fdk-aac")]
+impl Default for AacDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "fdk-aac")]
 impl AacDecoder {
     /// Create a new AAC decoder.
     pub fn new() -> Self {
@@ -645,6 +658,7 @@ impl AacDecoder {
 // DabPlusDecoder: full pipeline combining SuperframeDecoder + AacDecoder
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "fdk-aac")]
 /// Complete DAB+ audio decoder.
 ///
 /// Feed it MSC logical frames and get back PCM audio samples.
@@ -653,6 +667,7 @@ pub struct DabPlusDecodeOutput {
     pub metadata: Vec<PadData>,
 }
 
+#[cfg(feature = "fdk-aac")]
 pub struct DabPlusDecoder {
     pub superframe: SuperframeDecoder,
     pub aac: AacDecoder,
@@ -671,6 +686,7 @@ pub struct DabPlusDecoder {
     consecutive_superframe_concealments: usize,
 }
 
+#[cfg(feature = "fdk-aac")]
 impl DabPlusDecoder {
     /// Create a new DAB+ decoder for the given bitrate.
     pub fn new(bitrate_kbps: u16) -> Self {

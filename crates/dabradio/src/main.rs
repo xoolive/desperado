@@ -1,54 +1,18 @@
-//! dabradio — DAB/DAB+ digital radio decoder.
+//! dabradio — the command-line DAB/DAB+ receiver.
 //!
-//! This crate receives raw I/Q samples (via [`desperado`]) from an SDR device or
-//! file and decodes a DAB Mode I ensemble, extracting services, labels,
-//! programme-associated data (Dynamic Label, MOT slide-show images), and
-//! DAB+ HE-AAC audio.
-//!
-//! # Architecture
-//!
-//! The processing pipeline is split into the following stages:
-//!
-//! ```text
-//! IQ stream ─► OFDM sync & FFT ─► DQPSK decode ─┬─► FIC ─► ensemble metadata
-//!                                               └─► MSC ─► subchannel frames
-//!                                                              │
-//!                                                     FEC (Viterbi + RS)
-//!                                                              │
-//!                                                     AAC decode ─► audio
-//!                                                              │
-//!                                                     PAD ─► DLS / MOT
-//! ```
-//!
-//! # Modules
-//!
-//! | Module | Purpose |
-//! |---|---|
-//! | `ofdm` | Frame synchronisation, FFT, DQPSK differential decoding |
-//! | `fic` | Fast Information Channel — ensemble & service metadata |
-//! | `msc` | Main Service Channel — subchannel extraction |
-//! | `fec` | Forward Error Correction (EEP depuncturing, Viterbi, energy dispersal) |
-//! | `audio` | DAB+ super-frame assembly, Reed-Solomon, AAC decoding |
-//! | `pad` | Programme Associated Data (Dynamic Label Segment, MOT slide-show) |
-//! | `constants` | DAB Mode I parameters and Band III channel table |
-//! | `charsets` | EBU Latin → UTF-8 conversion for service labels |
-//!
+//! Reads I/Q (via [`desperado`]) from an SDR device or a file, feeds the
+//! decoder library, and draws the terminal UI: the service list, the ensemble
+//! and the now-playing information. Everything under the UI lives in the
+//! `dabradio` library crate — see its docs for the pipeline and the modules.
 
-mod audio;
-mod charsets;
-mod constants;
 mod dab_resampler;
-mod fec;
-mod fic;
-mod msc;
-mod ofdm;
-mod pad;
 
 use clap::Parser;
 use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dab_resampler::DabResampler;
+use dabradio::{audio, constants, fic, msc, ofdm, pad};
 use desperado::DeviceConfig;
 use desperado::Gain;
 use desperado::IqAsyncSource;
