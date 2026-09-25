@@ -9,7 +9,7 @@ use desperado::dsp::decimator::Decimator;
 use desperado::dsp::resampler::ComplexResampler;
 use num_complex::Complex;
 
-use crate::constants;
+use dabradio::constants;
 
 const WELLE_INTERMEDIATE_RATE: u32 = 4_096_000;
 

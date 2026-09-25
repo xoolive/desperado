@@ -31,6 +31,34 @@ cargo build --release -p dabradio --features soapy
 
 The binary will be at `target/release/dabradio`.
 
+## Using it as a library
+
+`dabradio` is a library as well as the binary above: the whole decoder — OFDM
+sync, FIC/MSC, FEC, PAD — is available without the terminal UI or an SDR.
+
+```toml
+[dependencies]
+dabradio = { version = "0.5", default-features = false }
+```
+
+With `default-features = false` there is no TUI, no device support and no
+`fdk-aac`. The decoder still syncs, decodes the ensemble and the services, and
+`audio::SuperframeDecoder` hands over the DAB+ super-frames (Reed–Solomon
+corrected, Access Units extracted) for a caller that has its own AAC decoder;
+DAB (MP2) is decoded in pure Rust and is always available.
+
+Features:
+
+- **`fdk-aac`** (default) — `audio::AacDecoder` and `audio::DabPlusDecoder`
+  for DAB+ HE-AAC audio. Without it, the DAB+ super-frames are still produced,
+  but not decoded to PCM.
+- **`bin`** (default) — the command-line receiver's dependencies (TUI, SDR
+  devices). It is what `cargo build -p dabradio` builds.
+
+The modules map to the pipeline: `ofdm` (sync, FFT, DQPSK), `fic` (ensemble and
+services), `msc` (subchannel extraction), `fec`, `audio`, `pad` (DLS and MOT),
+`constants`, `charsets`.
+
 ## Usage
 
 ### List all services in a DAB ensemble
@@ -308,12 +336,17 @@ Key debug output:
 
 ## Dependencies
 
-Core:
+Core (library):
 
 - **rustfft** — FFT for OFDM processing
-- **fdk-aac** — AAC audio decoding
 - **reed-solomon** — Forward error correction
+- **oxideav-mp2** — DAB (MP2) audio, pure Rust
+- **fdk-aac** — DAB+ HE-AAC audio (optional, `fdk-aac` feature)
+
+Binary only (`bin` feature):
+
 - **tinyaudio** — Cross-platform audio output
+- **desperado** — SDR device front ends
 
 Utilities:
 

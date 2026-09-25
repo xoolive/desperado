@@ -93,6 +93,12 @@ pub struct OfdmProcessor {
     samples_consumed: usize,
 }
 
+impl Default for OfdmProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OfdmProcessor {
     pub fn new() -> Self {
         let mut planner = FftPlanner::new();
