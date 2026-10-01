@@ -2154,9 +2154,9 @@ dependencies = [
 
 [[package]]
 name = "oxideav-mp2"
-version = "0.0.9"
+version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d078671403ba6f7efd48d8580cad13a046812c420f63eacb140ee3a0966d374e"
+checksum = "19c132641af52d4dce3d1f56e92325f0c682e9b49d1dceadc96bd6d02fa74ee1"
 dependencies = [
  "oxideav-core",
 ]
