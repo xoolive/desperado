@@ -739,7 +739,27 @@ async fn main() -> desperado::Result<()> {
         let _ = handle.join();
     }
 
+    // Join the SDR workers before returning, even if decoding failed.
+    if is_device_uri(&args.source)
+        && let Err(error) = iq_source.stop().await
+    {
+        warn!(%error, "Unable to stop IQ source cleanly");
+    }
+
     run_result
+}
+
+/// Periodically observe quit requests even when an IQ stream stops delivering samples.
+async fn next_while_running<S: futures::Stream + Unpin>(
+    source: &mut S,
+    running: &AtomicBool,
+) -> Option<S::Item> {
+    while running.load(Ordering::Relaxed) {
+        if let Ok(chunk) = tokio::time::timeout(Duration::from_millis(100), source.next()).await {
+            return chunk;
+        }
+    }
+    None
 }
 
 /// Build the IQ source and return `(source, effective_gain_db)`.
@@ -896,7 +916,7 @@ async fn run_mono(
     const AGC_RELEASE: f32 = 0.9999;
 
     let is_file_source = is_file_like_source(&args.source);
-    while let Some(chunk) = iq_source.next().await {
+    while let Some(chunk) = next_while_running(iq_source, &running).await {
         if !running.load(Ordering::Relaxed) {
             break;
         }
@@ -1117,7 +1137,7 @@ async fn run_stereo(
     };
     let mut raw_leftover: Vec<f32> = Vec::new();
 
-    while let Some(chunk) = iq_source.next().await {
+    while let Some(chunk) = next_while_running(iq_source, &running).await {
         if !running.load(Ordering::Relaxed) {
             break;
         }
@@ -1533,6 +1553,24 @@ fn next_gain_down(current: f64, steps: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn quit_wakes_an_idle_iq_stream() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let quit = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            quit.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut source = futures::stream::pending::<()>();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::next_while_running(&mut source, &running),
+        )
+        .await
+        .expect("quit must not wait for another IQ chunk");
+        assert!(result.is_none());
+    }
+
     use super::*;
 
     fn file_args(source: &str) -> Args {

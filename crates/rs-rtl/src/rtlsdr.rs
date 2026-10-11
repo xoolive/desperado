@@ -769,12 +769,54 @@ impl RtlSdr {
     }
 }
 
+/// Register operations in librtlsdr's baseband deinitialization sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownStep {
+    I2cRepeater(bool),
+    TunerStandby,
+    WriteRegister {
+        block: u16,
+        addr: u16,
+        value: u16,
+        len: u8,
+    },
+}
+
+/// Attempt every shutdown operation, even when the tuner or USB device fails.
+fn deinit_baseband(mut execute: impl FnMut(ShutdownStep) -> Result<()>) {
+    // Match librtlsdr's rtlsdr_deinit_baseband: tuner standby alone does not
+    // power off the RTL2832U demodulator and ADCs (DEMOD_CTL = 0x20).
+    // https://github.com/osmocom/rtl-sdr/blob/797f8143266d983c56d8f35d2d442527529dd8a5/src/librtlsdr.c#L667-L684
+    for step in [
+        ShutdownStep::I2cRepeater(true),
+        ShutdownStep::TunerStandby,
+        ShutdownStep::I2cRepeater(false),
+        ShutdownStep::WriteRegister {
+            block: device::BLOCK_SYS,
+            addr: device::DEMOD_CTL,
+            value: 0x20,
+            len: 1,
+        },
+    ] {
+        if let Err(error) = execute(step) {
+            warn!(?step, %error, "RTL-SDR shutdown operation failed");
+        }
+    }
+}
+
 impl Drop for RtlSdr {
     fn drop(&mut self) {
-        debug!("RtlSdr::drop: putting tuner in standby");
-        let _ = self.dev.set_i2c_repeater(true);
-        let _ = self.tuner.standby(&self.dev);
-        let _ = self.dev.set_i2c_repeater(false);
+        debug!("RtlSdr::drop: powering off tuner and baseband");
+        deinit_baseband(|step| match step {
+            ShutdownStep::I2cRepeater(enabled) => self.dev.set_i2c_repeater(enabled),
+            ShutdownStep::TunerStandby => self.tuner.standby(&self.dev),
+            ShutdownStep::WriteRegister {
+                block,
+                addr,
+                value,
+                len,
+            } => self.dev.write_reg(block, addr, value, len),
+        });
 
         // Note: nusb releases the interface automatically when all
         // Interface clones are dropped. No explicit release needed.
@@ -1120,6 +1162,49 @@ fn streaming_thread(
 #[cfg(test)]
 mod reader_tests {
     use super::*;
+
+    fn expected_shutdown() -> [ShutdownStep; 4] {
+        [
+            ShutdownStep::I2cRepeater(true),
+            ShutdownStep::TunerStandby,
+            ShutdownStep::I2cRepeater(false),
+            ShutdownStep::WriteRegister {
+                block: 2,
+                addr: 0x3000,
+                value: 0x20,
+                len: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn shutdown_matches_c_tuner_and_baseband_poweroff_order() {
+        let mut operations = Vec::new();
+        deinit_baseband(|step| {
+            operations.push(step);
+            Ok(())
+        });
+        assert_eq!(operations, expected_shutdown());
+    }
+
+    #[test]
+    fn shutdown_attempts_every_step_despite_errors() {
+        // Each single failure, and a fully disconnected device, must still
+        // attempt repeater disable and the final baseband power-off write.
+        for failed_step in 0..=4 {
+            let mut operations = Vec::new();
+            deinit_baseband(|step| {
+                let index = operations.len();
+                operations.push(step);
+                if index == failed_step || failed_step == 4 {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(operations, expected_shutdown());
+        }
+    }
 
     fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
         let (tx, rx) = mpsc::sync_channel(2);

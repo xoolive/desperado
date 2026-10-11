@@ -366,6 +366,13 @@ impl Iterator for RtlSdrReader {
     }
 }
 
+/// Own the reader before the SDR so field destruction joins USB transfers
+/// before device destruction powers off the tuner and baseband.
+struct ReaderSession<R, D> {
+    reader: R,
+    _sdr: D,
+}
+
 /// Asynchronous RTL-SDR I/Q Reader.
 ///
 /// Uses `rs_rtl::RtlSdr::start_streaming()` which runs multi-transfer USB I/O
@@ -404,6 +411,7 @@ impl AsyncRtlSdrReader {
             .start_streaming()
             .map_err(|e| error::Error::device(format!("Failed to start streaming: {e}")))?;
         let control = reader.control_handle();
+        let session = ReaderSession { reader, _sdr: sdr };
 
         let (samples_tx, samples_rx) = tokio::sync::mpsc::channel(BRIDGE_QUEUE_DEPTH);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -415,13 +423,14 @@ impl AsyncRtlSdrReader {
         let bridge = std::thread::Builder::new()
             .name("rtlsdr-bridge".into())
             .spawn(move || {
-                // Keep sdr alive so the device is not dropped while streaming
-                let _sdr = sdr;
+                // Keep the aggregate intact: its reader field must drop/join
+                // before its SDR field, including on unwind or spawn failure.
+                let session = session;
                 loop {
                     if bridge_cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    match reader.recv() {
+                    match session.reader.recv() {
                         Ok(Some(bytes)) => {
                             let samples =
                                 Ok(crate::convert_bytes_to_complex(IqFormat::Cu8, &bytes));
@@ -550,4 +559,65 @@ impl Stream for AsyncRtlSdrReader {
 /// Get the index of the first available RTL-SDR device (always 0).
 pub fn get_first_device_index() -> usize {
     0
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::ReaderSession;
+    use std::sync::{Arc, Mutex};
+
+    struct DropSpy {
+        name: &'static str,
+        drops: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push(self.name);
+        }
+    }
+
+    fn session(drops: &Arc<Mutex<Vec<&'static str>>>) -> ReaderSession<DropSpy, DropSpy> {
+        ReaderSession {
+            reader: DropSpy {
+                name: "reader",
+                drops: Arc::clone(drops),
+            },
+            _sdr: DropSpy {
+                name: "sdr",
+                drops: Arc::clone(drops),
+            },
+        }
+    }
+
+    #[test]
+    fn session_drops_reader_before_powering_off_device() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        drop(session(&drops));
+        assert_eq!(*drops.lock().unwrap(), ["reader", "sdr"]);
+    }
+
+    #[test]
+    fn unstarted_bridge_preserves_shutdown_order() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let session = session(&drops);
+        let bridge = move || {
+            let session = session;
+            let _reader = &session.reader;
+        };
+        // A failed thread spawn drops the closure without executing it.
+        drop(bridge);
+        assert_eq!(*drops.lock().unwrap(), ["reader", "sdr"]);
+    }
+
+    #[test]
+    fn session_preserves_shutdown_order_on_unwind() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let result = std::panic::catch_unwind(|| {
+            let _session = session(&drops);
+            panic!("bridge failure");
+        });
+        assert!(result.is_err());
+        assert_eq!(*drops.lock().unwrap(), ["reader", "sdr"]);
+    }
 }

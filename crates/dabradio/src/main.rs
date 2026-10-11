@@ -126,6 +126,14 @@ impl IqChunkSource {
         }
     }
 
+    /// Stop and join live SDR workers. No-op for synchronous file sources.
+    async fn stop(&mut self) -> desperado::error::Result<()> {
+        match self {
+            Self::Sync(_) => Ok(()),
+            Self::Async { source, .. } => source.stop().await,
+        }
+    }
+
     /// Adjust tuner gain on live SDR sources. No-op for file/stdin sources.
     fn set_gain(&self, gain: Gain) -> desperado::error::Result<()> {
         match self {
@@ -878,6 +886,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_size = constants::T_F; // One frame's worth of samples
     let (mut source, is_file_source, input_sample_rate, effective_gain) =
         open_iq_source(source, input_center, input_rate, chunk_size, iq_format).await?;
+    // Keep ownership outside the receiver future so errors also join SDR workers.
+    let run_result = async {
     // Round startup discard to the nearest whole T_F so the OFDM processor
     // always receives its first chunk on a frame boundary. A non-multiple of
     // T_F causes a partial first chunk that forces the null-symbol detector
@@ -1722,6 +1732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     audio_measure_active.store(false, Ordering::Relaxed);
 
+    // Stop hardware before audio teardown can force process::exit.
+    if let Err(error) = source.stop().await {
+        warn!(%error, "Unable to stop IQ source cleanly");
+    }
+
     // Drop the audio device with a timeout. tinyaudio's ALSA backend calls
     // thread::join() inside Drop, which hangs if snd_pcm_writei is blocked.
     // If the drop doesn't complete in 2 seconds, force-exit to avoid
@@ -1845,6 +1860,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+    }.await;
+    if let Err(error) = source.stop().await {
+        warn!(%error, "Unable to stop IQ source cleanly");
+    }
+    run_result
 }
 
 async fn open_iq_source(
@@ -2334,6 +2354,14 @@ fn restart_audio_server() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopping_a_sync_source_is_a_noop() {
+        let source = IqSource::from_stdin(223_936_000, 2_048_000, 1024, IqFormat::Cu8)
+            .expect("stdin source should open");
+        let mut source = IqChunkSource::Sync(Box::new(source));
+        source.stop().await.expect("non-hardware stop must succeed");
+    }
 
     #[test]
     fn hackrf_default_uri_enables_rf_amp() {
