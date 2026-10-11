@@ -147,6 +147,42 @@ const AUDIO_RATE: usize = 48_000;
 const AUDIO_QUEUE_SECONDS: usize = 4;
 const AUDIO_QUEUE_MAX: usize = AUDIO_RATE * 2 * AUDIO_QUEUE_SECONDS; // stereo buffer in samples
 
+/// Playback state shared by service selection and the PCM producer.
+struct AudioControl {
+    switch_pending: Arc<AtomicBool>,
+    primed: Arc<AtomicBool>,
+    rx: channel::Receiver<f32>,
+}
+
+impl AudioControl {
+    fn flush_for_switch(&self) {
+        self.primed.store(false, Ordering::Relaxed);
+        while self.rx.try_recv().is_ok() {}
+        self.primed.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Keep playback lossless, but interrupt a full/stalled queue on quit/switch.
+fn enqueue_audio(
+    tx: &channel::Sender<f32>,
+    pcm: &[f32],
+    running: &AtomicBool,
+    switch_pending: &AtomicBool,
+) {
+    for &sample in pcm {
+        loop {
+            if !running.load(Ordering::Relaxed) || switch_pending.load(Ordering::Relaxed) {
+                return;
+            }
+            match tx.send_timeout(sample, Duration::from_millis(20)) {
+                Ok(()) => break,
+                Err(channel::SendTimeoutError::Timeout(_)) => continue,
+                Err(channel::SendTimeoutError::Disconnected(_)) => return,
+            }
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct TuiState {
     // Header
@@ -162,6 +198,7 @@ struct TuiState {
     selected_service_idx: usize,
     // Decode info
     service_switch_request: Option<String>, // written by TUI, consumed by main loop
+    service_switch_pending: Arc<AtomicBool>, // interrupts blocked PCM enqueue
     service: String,
     dls: String,
     mot_count: usize,
@@ -175,6 +212,17 @@ struct TuiState {
     // Gain
     gain: Option<f64>,                // current gain in dB; None = auto/unknown
     gain_change_request: Option<f64>, // written by TUI thread, consumed by main loop
+}
+
+impl TuiState {
+    fn request_service(&mut self, label: String) {
+        // Enter on the active station is a no-op, not an audio interruption.
+        if label.trim().eq_ignore_ascii_case(self.service.trim()) {
+            return;
+        }
+        self.service_switch_request = Some(label);
+        self.service_switch_pending.store(true, Ordering::Relaxed);
+    }
 }
 
 fn should_pause_for_tui_selection(
@@ -233,6 +281,7 @@ fn spawn_dab_tui(
         };
 
         let mut save_message_until: Option<Instant> = None;
+        let mut last_image: Option<(String, Rect, usize)> = None;
 
         while running.load(Ordering::Relaxed) {
             // Auto-clear save feedback after a few seconds
@@ -245,7 +294,10 @@ fn spawn_dab_tui(
                 }
             }
 
-            if let Ok(s) = state.lock() {
+            // Never hold decoder/control state across slow terminal/image I/O.
+            let snapshot = state.lock().ok().map(|s| s.clone());
+            if let Some(s) = snapshot {
+                let mut image_to_draw = None;
                 let _ = terminal.draw(|f| {
                     let area = f.area();
 
@@ -418,9 +470,16 @@ fn spawn_dab_tui(
                     f.render_widget(right_panel, right);
 
                     if inline_image_support && let Some(path) = &s.mot_preview_path {
-                        draw_tui_image(path, right);
+                        image_to_draw = Some((path.clone(), right, s.mot_count));
                     }
                 });
+                // Decode/transmit MOT only when its content or layout changes.
+                if image_to_draw != last_image {
+                    if let Some((path, area, _)) = &image_to_draw {
+                        draw_tui_image(path, *area);
+                    }
+                    last_image = image_to_draw;
+                }
             }
 
             // Erase Kitty image when service switches
@@ -439,7 +498,8 @@ fn spawn_dab_tui(
                 }
             }
 
-            if keyboard_available && event::poll(Duration::from_millis(1)).unwrap_or(false) {
+            // Drain keys rather than postponing Enter/q one tick per key.
+            while keyboard_available && event::poll(Duration::ZERO).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Resize(_, _)) => {
                         // Clear Kitty graphics layer images before resize;
@@ -451,6 +511,7 @@ fn spawn_dab_tui(
                         }
                         let _ = terminal.autoresize();
                         let _ = terminal.clear();
+                        last_image = None;
                     }
                     Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {
@@ -473,7 +534,7 @@ fn spawn_dab_tui(
                                 && let Some((label, _)) =
                                     s.services.get(s.selected_service_idx).cloned()
                             {
-                                s.service_switch_request = Some(label);
+                                s.request_service(label);
                             }
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -514,7 +575,7 @@ fn spawn_dab_tui(
                 }
             }
 
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(50));
         }
 
         let _ = terminal.clear();
@@ -931,6 +992,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let term_image_support = inline_image_support && !tui_enabled;
 
     let app_running = Arc::new(AtomicBool::new(true));
+    let service_switch_pending = Arc::new(AtomicBool::new(false));
     let tui_state = Arc::new(Mutex::new(TuiState {
         channel: cli
             .channel
@@ -941,6 +1003,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_rate_hz: constants::SAMPLE_RATE,
         iq_level_dbfs: -60.0,
         gain: effective_gain,
+        service_switch_pending: Arc::clone(&service_switch_pending),
         status: "starting".to_string(),
         ..Default::default()
     }));
@@ -993,6 +1056,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_underruns = Arc::new(AtomicU64::new(0));
     let audio_dropped = Arc::new(AtomicU64::new(0));
     let audio_primed = Arc::new(AtomicBool::new(false));
+    let audio_control = AudioControl {
+        switch_pending: service_switch_pending,
+        primed: Arc::clone(&audio_primed),
+        rx: rx.clone(),
+    };
     let audio_measure_active = Arc::new(AtomicBool::new(true));
     // 1 s stereo for both sources. DAB+ decodes audio in superframe bursts (~46k samples
     // every 480 ms); the prebuffer must hold at least 2 bursts so the audio callback
@@ -1136,10 +1204,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut msc_handler,
                     &mut dab_plus_decoder,
                     &mut mp2_decoder,
-                    &audio_primed,
+                    &audio_control,
                     &mut announced_service_label,
                 ) {
                     decoding_service = true;
+                    first_pcm_logged = false;
+                    audio_primed_logged = false;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1425,11 +1495,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut msc_handler,
                     &mut dab_plus_decoder,
                     &mut mp2_decoder,
-                    &audio_primed,
+                    &audio_control,
                     &mut announced_service_label,
                 )
             {
                 decoding_service = true;
+                first_pcm_logged = false;
+                audio_primed_logged = false;
             }
 
             // Gain change request from TUI +/- keys
@@ -1554,7 +1626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !decoded_out.pcm.is_empty() && _device.is_some() {
                                 if !first_pcm_logged {
                                     first_pcm_logged = true;
-                                    info!(
+                                    info!(target: "dabradio::audio_pipeline",
                                         prebuffer_samples = audio_prebuffer_samples,
                                         "First PCM samples from DAB+ decoder — filling prebuffer"
                                     );
@@ -1566,24 +1638,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // absorbs any stall while the audio callback drains the queue.
                                 // block_in_place lets tokio know this thread will block briefly.
                                 tokio::task::block_in_place(|| {
-                                    for sample in &decoded_out.pcm {
-                                        loop {
-                                            match tx
-                                                .send_timeout(*sample, Duration::from_millis(100))
-                                            {
-                                                Ok(()) => break,
-                                                Err(channel::SendTimeoutError::Timeout(_)) => {
-                                                    if !app_running.load(Ordering::Relaxed) {
-                                                        return;
-                                                    }
-                                                    // Queue full, retry after timeout
-                                                }
-                                                Err(channel::SendTimeoutError::Disconnected(_)) => {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
+                                    enqueue_audio(
+                                        &tx,
+                                        &decoded_out.pcm,
+                                        &app_running,
+                                        &audio_control.switch_pending,
+                                    );
                                 });
 
                                 if !audio_primed_logged && audio_primed.load(Ordering::Relaxed) {
@@ -1672,29 +1732,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !pcm.is_empty() && _device.is_some() {
                                 if !first_pcm_logged {
                                     first_pcm_logged = true;
-                                    info!(
+                                    info!(target: "dabradio::audio_pipeline",
                                         prebuffer_samples = audio_prebuffer_samples,
                                         "First PCM samples from MP2 decoder — filling prebuffer"
                                     );
                                 }
                                 tokio::task::block_in_place(|| {
-                                    for sample in &pcm {
-                                        loop {
-                                            match tx
-                                                .send_timeout(*sample, Duration::from_millis(100))
-                                            {
-                                                Ok(()) => break,
-                                                Err(channel::SendTimeoutError::Timeout(_)) => {
-                                                    if !app_running.load(Ordering::Relaxed) {
-                                                        return;
-                                                    }
-                                                }
-                                                Err(channel::SendTimeoutError::Disconnected(_)) => {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
+                                    enqueue_audio(
+                                        &tx,
+                                        &pcm,
+                                        &app_running,
+                                        &audio_control.switch_pending,
+                                    );
                                 });
                                 if !audio_primed_logged && audio_primed.load(Ordering::Relaxed) {
                                     audio_primed_logged = true;
@@ -2199,13 +2248,18 @@ fn apply_tui_service_switch(
     msc_handler: &mut Option<msc::MscHandler>,
     dab_plus_decoder: &mut Option<audio::DabPlusDecoder>,
     mp2_decoder: &mut Option<audio::mp2::Mp2Decoder>,
-    audio_primed: &AtomicBool,
+    audio_control: &AudioControl,
     announced_service_label: &mut bool,
 ) -> bool {
-    let switch_to = tui_state
-        .try_lock()
-        .ok()
-        .and_then(|mut state| state.service_switch_request.take());
+    let switch_to = tui_state.lock().ok().and_then(|mut state| {
+        let request = state.service_switch_request.take();
+        if request.is_some() {
+            state.service_switch_pending.store(false, Ordering::Relaxed);
+        }
+        request.filter(|label| {
+            msc_handler.is_none() || !label.trim().eq_ignore_ascii_case(state.service.trim())
+        })
+    });
     let Some(label) = switch_to else {
         return false;
     };
@@ -2228,12 +2282,14 @@ fn apply_tui_service_switch(
         }
         fic::fib::AudioCoding::Other(_) => unreachable!(),
     }
-    audio_primed.store(false, Ordering::Relaxed);
+    // Discard old-station PCM instead of replaying/priming it after switching.
+    audio_control.flush_for_switch();
     *announced_service_label = true;
-    info!(service = %label, bitrate, "Switching service");
-    if let Ok(mut state) = tui_state.try_lock() {
+    info!(target: "dabradio::audio_pipeline", service = %label, bitrate, "Switching service");
+    if let Ok(mut state) = tui_state.lock() {
         state.service = label;
         state.status = format!("decoding @ {} kbps", bitrate);
+        state.audio_q_fill = 0;
         state.dls.clear();
         state.mot_count = 0;
         state.mot_info.clear();
@@ -2361,6 +2417,154 @@ mod tests {
             .expect("stdin source should open");
         let mut source = IqChunkSource::Sync(Box::new(source));
         source.stop().await.expect("non-hardware stop must succeed");
+    }
+
+    #[test]
+    fn enter_on_active_service_does_not_interrupt_audio() {
+        let mut state = TuiState {
+            service: "FIP".into(),
+            ..Default::default()
+        };
+        state.request_service(" fip ".into());
+        assert!(state.service_switch_request.is_none());
+        assert!(!state.service_switch_pending.load(Ordering::Relaxed));
+        state.request_service("FRANCE CULTURE".into());
+        assert_eq!(
+            state.service_switch_request.as_deref(),
+            Some("FRANCE CULTURE")
+        );
+        assert!(state.service_switch_pending.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn audio_enqueue_observes_quit_and_switch_on_a_full_queue() {
+        for switching in [false, true] {
+            let (tx, rx) = channel::bounded(1);
+            tx.send(1.0).unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let pending = Arc::new(AtomicBool::new(false));
+            let worker_running = Arc::clone(&running);
+            let worker_pending = Arc::clone(&pending);
+            let (done_tx, done_rx) = channel::bounded(1);
+            let worker = thread::spawn(move || {
+                enqueue_audio(&tx, &[2.0, 3.0], &worker_running, &worker_pending);
+                done_tx.send(()).unwrap();
+            });
+            assert!(done_rx.recv_timeout(Duration::from_millis(10)).is_err());
+            if switching {
+                pending.store(true, Ordering::Relaxed);
+            } else {
+                running.store(false, Ordering::Relaxed);
+            }
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(rx.try_recv().unwrap(), 1.0);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn audio_enqueue_preserves_backpressure_and_sample_order() {
+        let (tx, rx) = channel::bounded(1);
+        let worker = thread::spawn(move || {
+            enqueue_audio(
+                &tx,
+                &[1.0, 2.0, 3.0],
+                &AtomicBool::new(true),
+                &AtomicBool::new(false),
+            );
+        });
+        for expected in [1.0, 2.0, 3.0] {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), expected);
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn switching_discards_old_audio_for_both_codecs_without_restarting_same_service() {
+        for coding in [
+            fic::fib::AudioCoding::DabPlus,
+            fic::fib::AudioCoding::MpegLayer2,
+        ] {
+            let mut ensemble = fic::fib::EnsembleInfo::new();
+            ensemble.services.insert(
+                1,
+                fic::fib::ServiceInfo {
+                    service_id: 1,
+                    label: Some("New".into()),
+                    subchannel_id: Some(1),
+                    is_audio: true,
+                    audio_coding: Some(coding),
+                    ..Default::default()
+                },
+            );
+            ensemble.subchannels.insert(
+                1,
+                fic::fib::SubchannelInfo {
+                    id: 1,
+                    start_addr: 0,
+                    sub_size: 96,
+                    protection_level: 3,
+                    is_eep: false,
+                    eep_option: 0,
+                    uep_table_index: Some(35),
+                    bitrate: 128,
+                },
+            );
+            let pending = Arc::new(AtomicBool::new(true));
+            let state = Arc::new(Mutex::new(TuiState {
+                service: "Old".into(),
+                service_switch_request: Some("New".into()),
+                service_switch_pending: Arc::clone(&pending),
+                ..Default::default()
+            }));
+            let (tx, rx) = channel::bounded(2);
+            tx.send(1.0).unwrap();
+            tx.send(2.0).unwrap();
+            let control = AudioControl {
+                switch_pending: pending,
+                primed: Arc::new(AtomicBool::new(true)),
+                rx,
+            };
+            let (mut handler, mut dab, mut mp2) = (None, None, None);
+            let mut announced = false;
+            assert!(apply_tui_service_switch(
+                &mut ensemble,
+                &state,
+                &mut handler,
+                &mut dab,
+                &mut mp2,
+                &control,
+                &mut announced
+            ));
+            assert!(control.rx.is_empty());
+            assert!(!control.primed.load(Ordering::Relaxed));
+            assert!(!control.switch_pending.load(Ordering::Relaxed));
+            assert_eq!(state.lock().unwrap().service, "New");
+            assert!(announced);
+            assert_eq!(dab.is_some(), coding == fic::fib::AudioCoding::DabPlus);
+            assert_eq!(mp2.is_some(), coding == fic::fib::AudioCoding::MpegLayer2);
+
+            // Repeated Enter on the active station must not reset its decoder
+            // warmup or discard newly buffered audio.
+            handler.as_mut().unwrap().frames_decoded = 17;
+            tx.send(3.0).unwrap();
+            control.primed.store(true, Ordering::Relaxed);
+            state.lock().unwrap().service_switch_request = Some("New".into());
+            control.switch_pending.store(true, Ordering::Relaxed);
+            assert!(!apply_tui_service_switch(
+                &mut ensemble,
+                &state,
+                &mut handler,
+                &mut dab,
+                &mut mp2,
+                &control,
+                &mut announced
+            ));
+            assert_eq!(handler.as_ref().unwrap().frames_decoded, 17);
+            assert!(control.primed.load(Ordering::Relaxed));
+            assert_eq!(control.rx.try_recv().unwrap(), 3.0);
+        }
     }
 
     #[test]
