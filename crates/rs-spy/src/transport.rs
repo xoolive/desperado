@@ -113,7 +113,7 @@ pub enum TryRecv<T> {
 }
 
 pub struct AsyncReadHandle {
-    rx: mpsc::Receiver<Result<Vec<u8>>>,
+    rx: Option<mpsc::Receiver<Result<Vec<u8>>>>,
     ctrl_tx: mpsc::Sender<AsyncReadControl>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
@@ -138,7 +138,10 @@ impl AsyncReadHandle {
     /// Returns `Ok(None)` after an intentional stop. An unexpected reader
     /// termination, including a device disconnect, is returned as `Err`.
     pub fn recv(&self) -> Result<Option<Vec<u8>>> {
-        match self.rx.recv() {
+        let Some(rx) = &self.rx else {
+            return Ok(None);
+        };
+        match rx.recv() {
             Ok(Ok(bytes)) => Ok(Some(bytes)),
             Ok(Err(error)) => Err(error),
             Err(_) if self.stop.load(Ordering::Relaxed) => Ok(None),
@@ -150,7 +153,10 @@ impl AsyncReadHandle {
 
     /// Try to receive the next chunk without blocking.
     pub fn try_recv(&self) -> Result<TryRecv<Vec<u8>>> {
-        match self.rx.try_recv() {
+        let Some(rx) = &self.rx else {
+            return Ok(TryRecv::End);
+        };
+        match rx.try_recv() {
             Ok(Ok(bytes)) => Ok(TryRecv::Item(bytes)),
             Ok(Err(error)) => Err(error),
             Err(mpsc::TryRecvError::Empty) => Ok(TryRecv::Empty),
@@ -175,6 +181,8 @@ impl AsyncReadHandle {
 impl Drop for AsyncReadHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Unblock a producer waiting on a full sample queue before joining.
+        self.rx.take();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -986,7 +994,7 @@ impl Airspy {
         });
 
         Ok(AsyncReadHandle {
-            rx,
+            rx: Some(rx),
             ctrl_tx,
             stop,
             dropped,
@@ -1243,11 +1251,33 @@ fn apply_gain_stages(dev: &Airspy, stages: AirspyGainStages) -> Result<()> {
 mod reader_tests {
     use super::*;
 
+    #[test]
+    fn drop_unblocks_a_worker_with_a_full_sample_queue() {
+        let (mut handle, tx) = handle();
+        tx.send(Ok(vec![1])).unwrap();
+        tx.send(Ok(vec![2])).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        handle.thread = Some(std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            assert!(tx.send(Ok(vec![3])).is_err());
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(handle);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader Drop must wake and join a blocked producer");
+        dropper.join().unwrap();
+    }
+
     fn handle() -> (AsyncReadHandle, mpsc::SyncSender<Result<Vec<u8>>>) {
         let (tx, rx) = mpsc::sync_channel(2);
         let (ctrl_tx, _ctrl_rx) = mpsc::channel();
         let handle = AsyncReadHandle {
-            rx,
+            rx: Some(rx),
             ctrl_tx,
             stop: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
