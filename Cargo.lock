@@ -1484,7 +1484,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tinyaudio 1.1.0",
  "tracing",
  "tracing-subscriber",
