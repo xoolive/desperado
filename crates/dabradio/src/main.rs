@@ -215,6 +215,14 @@ struct TuiState {
 }
 
 impl TuiState {
+    fn take_render_snapshot(&mut self) -> Self {
+        let snapshot = self.clone();
+        // Acknowledge only the clear request captured in this snapshot. A new
+        // service switch during terminal I/O must remain pending for next time.
+        self.clear_mot_image = false;
+        snapshot
+    }
+
     fn request_service(&mut self, label: String) {
         // Enter on the active station is a no-op, not an audio interruption.
         if label.trim().eq_ignore_ascii_case(self.service.trim()) {
@@ -295,8 +303,15 @@ fn spawn_dab_tui(
             }
 
             // Never hold decoder/control state across slow terminal/image I/O.
-            let snapshot = state.lock().ok().map(|s| s.clone());
+            let snapshot = state.lock().ok().map(|mut s| s.take_render_snapshot());
             if let Some(s) = snapshot {
+                if inline_image_support && s.clear_mot_image {
+                    // Clear before drawing: the snapshot may already contain
+                    // the new station's first image. Invalidate its cache too.
+                    let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
+                    let _ = std::io::stdout().flush();
+                    last_image = None;
+                }
                 let mut image_to_draw = None;
                 let _ = terminal.draw(|f| {
                     let area = f.area();
@@ -479,22 +494,6 @@ fn spawn_dab_tui(
                         draw_tui_image(path, *area);
                     }
                     last_image = image_to_draw;
-                }
-            }
-
-            // Erase Kitty image when service switches
-            if inline_image_support {
-                let needs_clear = state
-                    .try_lock()
-                    .ok()
-                    .map(|s| s.clear_mot_image)
-                    .unwrap_or(false);
-                if needs_clear {
-                    let _ = std::io::stdout().write_all(b"\x1b_Ga=d\x1b\\");
-                    let _ = std::io::stdout().flush();
-                    if let Ok(mut s) = state.lock() {
-                        s.clear_mot_image = false;
-                    }
                 }
             }
 
@@ -2417,6 +2416,34 @@ mod tests {
             .expect("stdin source should open");
         let mut source = IqChunkSource::Sync(Box::new(source));
         source.stop().await.expect("non-hardware stop must succeed");
+    }
+
+    #[test]
+    fn render_snapshot_preserves_new_image_and_consumes_only_its_clear_request() {
+        let mut state = TuiState {
+            clear_mot_image: true,
+            mot_preview_path: Some("new-station.jpg".into()),
+            mot_count: 1,
+            ..Default::default()
+        };
+        // The first new image may arrive before rendering the switch's clear.
+        let snapshot = state.take_render_snapshot();
+        assert!(snapshot.clear_mot_image);
+        assert_eq!(
+            snapshot.mot_preview_path.as_deref(),
+            Some("new-station.jpg")
+        );
+        assert_eq!(snapshot.mot_count, 1);
+        assert!(!state.clear_mot_image);
+
+        // A switch during slow terminal/image I/O must not be acknowledged by
+        // the old render pass. The following snapshot still requests a clear.
+        state.clear_mot_image = true;
+        state.mot_preview_path = None;
+        let next = state.take_render_snapshot();
+        assert!(next.clear_mot_image);
+        assert!(next.mot_preview_path.is_none());
+        assert!(!state.take_render_snapshot().clear_mot_image);
     }
 
     #[test]
