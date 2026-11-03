@@ -110,13 +110,7 @@ fn parse_gqrx_stem(stem: &str) -> Option<GqrxMeta> {
 /// GQRX labels complex-float captures `fc`; other tools sometimes use `cf32`.
 /// Both are accepted, as are the bare integer variants.
 fn parse_format_token(token: &str) -> Option<IqFormat> {
-    match token.to_ascii_lowercase().as_str() {
-        "fc" | "cf32" | "float" | "f32" => Some(IqFormat::Cf32),
-        "cu8" | "u8" => Some(IqFormat::Cu8),
-        "cs8" | "s8" => Some(IqFormat::Cs8),
-        "cs16" | "s16" | "c16" => Some(IqFormat::Cs16),
-        _ => None,
-    }
+    token.parse().ok()
 }
 
 #[cfg(test)]

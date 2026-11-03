@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 
 #[cfg(feature = "airspy")]
 pub mod airspy;
+pub mod capture;
 pub mod dsp;
 pub mod error;
 pub mod gqrx;
@@ -76,6 +77,11 @@ pub fn expanduser(path: PathBuf) -> PathBuf {
 /// - `M`: multiply by 1,000,000 (mega)
 /// - `G`: multiply by 1,000,000,000 (giga)
 ///
+/// A trailing `Hz` unit is also accepted, case-insensitively and optionally
+/// separated by whitespace (`131.725 MHz`, `12.5kHz`, `1090000000Hz`). With
+/// the unit present the multiplier is case-insensitive, so `mhz` is mega,
+/// never milli.
+///
 /// # Examples
 ///
 /// ```
@@ -86,6 +92,8 @@ pub fn expanduser(path: PathBuf) -> PathBuf {
 /// assert_eq!(parse_si_value::<u32>("1090000000").unwrap(), 1090000000);
 /// assert_eq!(parse_si_value::<f64>("2.4M").unwrap(), 2400000.0);
 /// assert_eq!(parse_si_value::<i64>("1090M").unwrap(), 1090000000);
+/// assert_eq!(parse_si_value::<u32>("131.725 MHz").unwrap(), 131725000);
+/// assert_eq!(parse_si_value::<u32>("12.5kHz").unwrap(), 12500);
 /// ```
 pub fn parse_si_value<T>(s: &str) -> Result<T>
 where
@@ -93,6 +101,19 @@ where
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {
     let s = s.trim();
+
+    // Optional `Hz` unit; when present, the multiplier is case-insensitive.
+    let lower = s.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix("hz") {
+        let stripped = stripped.trim_end();
+        let (num_str, multiplier) = match stripped.chars().last() {
+            Some('g') => (&stripped[..stripped.len() - 1], 1_000_000_000.0),
+            Some('m') => (&stripped[..stripped.len() - 1], 1_000_000.0),
+            Some('k') => (&stripped[..stripped.len() - 1], 1_000.0),
+            _ => (stripped, 1.0),
+        };
+        return scale_si(num_str.trim_end(), multiplier);
+    }
 
     // Check for SI suffix
     let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix('G') {
@@ -108,6 +129,14 @@ where
             .map_err(|e| Error::other(format!("Invalid numeric value '{}': {}", s, e)));
     };
 
+    scale_si(num_str.trim_end(), multiplier)
+}
+
+fn scale_si<T>(num_str: &str, multiplier: f64) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
     // Parse as f64 first to handle both integers and floats with suffixes
     let value_f64: f64 = num_str
         .parse()
@@ -835,12 +864,19 @@ impl std::str::FromStr for IqFormat {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "cu8" => Ok(IqFormat::Cu8),
-            "cs8" => Ok(IqFormat::Cs8),
-            "cs16" => Ok(IqFormat::Cs16),
-            "cf32" => Ok(IqFormat::Cf32),
-            _ => Err(Error::format(format!("Invalid IQ format: '{}'", s))),
+        // Canonical names plus the spellings used by other tools: rtl_sdr and
+        // acarsdec/dumpvdl2 (`U8`, `S16`, `S16_LE`), GQRX (`fc`) and SoapySDR
+        // (`CF32`, `CS16`, ...). Separators are ignored.
+        let token = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
+        match token.as_str() {
+            "cu8" | "u8" => Ok(IqFormat::Cu8),
+            "cs8" | "s8" => Ok(IqFormat::Cs8),
+            "cs16" | "s16" | "s16le" | "cs16le" | "c16" => Ok(IqFormat::Cs16),
+            "cf32" | "f32" | "f32le" | "cf32le" | "fc" | "fc32" | "float" => Ok(IqFormat::Cf32),
+            _ => Err(Error::format(format!(
+                "Invalid IQ format: '{}' (expected cu8, cs8, cs16 or cf32)",
+                s
+            ))),
         }
     }
 }
