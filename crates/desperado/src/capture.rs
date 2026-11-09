@@ -115,17 +115,19 @@ fn parse_sdruno(parts: &[&str]) -> Option<CaptureMeta> {
 
 fn parse_rtlsdr(path: &Path, parts: &[&str]) -> Option<CaptureMeta> {
     let is_date = |s: &str| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit());
-    // Optional date (no time of day, so it does not give a start time).
-    let rest = if parts.len() > 1 && is_date(parts[1]) {
-        &parts[2..]
-    } else {
-        &parts[1..]
+    let freq_and_rate = |rest: &[&str]| -> Option<(u32, u32)> {
+        let center: u32 = rest.first()?.parse().ok()?;
+        let rate: u32 = rest.get(1)?.parse().ok()?;
+        (center != 0 && rate != 0).then_some((center, rate))
     };
-    let center_freq_hz: u32 = rest.first()?.parse().ok()?;
-    let sample_rate_hz: u32 = rest.get(1)?.parse().ok()?;
-    if center_freq_hz == 0 || sample_rate_hz == 0 {
-        return None;
-    }
+    // Optional date (no time of day, so it does not give a start time). An
+    // 8-digit field may also be a 10-99 MHz frequency, so the dated layout is
+    // only used when a frequency and a rate follow it.
+    let dated = parts.len() > 1 && is_date(parts[1]);
+    let (rest, (center_freq_hz, sample_rate_hz)) = dated
+        .then(|| freq_and_rate(&parts[2..]).map(|fr| (&parts[2..], fr)))
+        .flatten()
+        .or_else(|| freq_and_rate(&parts[1..]).map(|fr| (&parts[1..], fr)))?;
     // Format from the next token or the extension; rtl_sdr itself writes cu8.
     let extension = path
         .file_name()
@@ -245,6 +247,14 @@ mod tests {
 
         let meta = parse_capture_filename("rtlsdr_199360000_2048000_dabradio_8C.cu8").unwrap();
         assert_eq!(meta.format, Some(IqFormat::Cu8));
+
+        // An 8-digit frequency (10-99 MHz) is not mistaken for a date.
+        let meta = parse_capture_filename("rtlsdr_94500000_1024000_paris.cu8").unwrap();
+        assert_eq!(meta.center_freq_hz, Some(94_500_000));
+        assert_eq!(meta.sample_rate_hz, Some(1_024_000));
+        let meta = parse_capture_filename("rtlsdr_20210215_94500000_1024000_cs8.bin").unwrap();
+        assert_eq!(meta.center_freq_hz, Some(94_500_000));
+        assert_eq!(meta.format, Some(IqFormat::Cs8));
     }
 
     #[test]
