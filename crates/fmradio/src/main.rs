@@ -160,41 +160,38 @@ fn default_sample_rate_for_source(source: &str) -> u32 {
     }
 }
 
-/// Parse the RTL-SDR recording convention used by the FM fixture corpus:
-/// `rtlsdr_<date>_<centerHz>_<sampleRateHz>_<format>.<ext>`.
-fn parse_rtlsdr_filename(path: &str) -> Option<desperado::gqrx::GqrxMeta> {
-    let file_name = std::path::Path::new(path).file_name()?.to_str()?;
-    let uncompressed_name = file_name
-        .strip_suffix(".zst")
-        .or_else(|| file_name.strip_suffix(".ZST"))
-        .unwrap_or(file_name);
-    let stem = std::path::Path::new(uncompressed_name)
-        .file_stem()?
-        .to_str()?;
-    let parts: Vec<&str> = stem.split('_').collect();
-    if parts.len() != 5
-        || !parts[0].eq_ignore_ascii_case("rtlsdr")
-        || parts[1].len() != 8
-        || !parts[1].bytes().all(|byte| byte.is_ascii_digit())
-    {
+/// Capture parameters fmradio can take from a recording's file name.
+#[derive(Debug, Clone, Copy)]
+struct FileMeta {
+    center_freq_hz: u32,
+    sample_rate_hz: u32,
+    format: IqFormat,
+}
+
+/// Recognise raw I/Q capture names (GQRX and rtl_sdr conventions, including
+/// `.zst`) via [`desperado::capture`]. Names that do not encode center
+/// frequency, sample rate and format, such as SDRuno WAV files, are ignored.
+fn capture_file_metadata(path: &str) -> Option<FileMeta> {
+    use desperado::capture::{CaptureConvention, parse_capture_filename};
+
+    let meta = parse_capture_filename(path)?;
+    if !matches!(
+        meta.convention,
+        CaptureConvention::Gqrx | CaptureConvention::RtlSdr
+    ) {
         return None;
     }
-
-    let format = IqFormat::from_str(parts[4]).ok()?;
-    Some(desperado::gqrx::GqrxMeta {
-        center_freq_hz: parts[2].parse().ok()?,
-        sample_rate_hz: parts[3].parse().ok()?,
-        format,
+    Some(FileMeta {
+        center_freq_hz: meta.center_freq_hz?,
+        sample_rate_hz: meta.sample_rate_hz?,
+        format: meta.format?,
     })
 }
 
 fn resolve_input_args(args: &mut Args) -> desperado::Result<()> {
     let is_file = args.source != "-" && !is_device_uri(&args.source);
     let metadata = is_file
-        .then(|| {
-            desperado::gqrx::parse_gqrx_filename(&args.source)
-                .or_else(|| parse_rtlsdr_filename(&args.source))
-        })
+        .then(|| capture_file_metadata(&args.source))
         .flatten();
 
     let target_center = args
@@ -1609,6 +1606,20 @@ mod tests {
         assert_eq!(args.sample_rate_hz(), 1_102_500);
         assert_eq!(args.format_name(), "cu8");
         assert_eq!(args.offset_freq_hz(), 0);
+    }
+
+    #[test]
+    fn resolves_undated_rtlsdr_file_metadata() {
+        let mut args = file_args("rtlsdr_94500000_1024000_paris.cu8");
+        resolve_input_args(&mut args).unwrap();
+        assert_eq!(args.center_freq_hz(), 94_500_000);
+        assert_eq!(args.sample_rate_hz(), 1_024_000);
+        assert_eq!(args.format_name(), "cu8");
+    }
+
+    #[test]
+    fn sdruno_wav_names_are_not_raw_capture_metadata() {
+        assert!(capture_file_metadata("SDRuno_20200908_152020Z_94500kHz.wav").is_none());
     }
 
     #[test]
