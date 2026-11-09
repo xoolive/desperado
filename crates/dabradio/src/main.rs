@@ -708,7 +708,7 @@ struct Cli {
     freq: Option<u32>,
 
     /// IQ format for file sources: cu8, cs8, cs16, cf32 (auto-detected from GQRX
-    /// file names; defaults to cu8)
+    /// and rtl_sdr file names; defaults to cu8)
     #[arg(long)]
     format: Option<String>,
 
@@ -717,7 +717,7 @@ struct Cli {
     sample_rate: Option<u32>,
 
     /// RF center frequency of the captured signal, in Hz (auto-detected from
-    /// GQRX file names; defaults to the selected multiplex, i.e. no downconversion
+    /// GQRX and rtl_sdr file names; defaults to the selected multiplex, i.e. no downconversion
     /// shift). For live SDR, sets the device tune center when the URI does not
     /// specify one — meaningful for wideband/high-rate sources such as HACKRF
     /// (to dodge a DC spike), not useful for RTL-SDR where bandwidth == sample
@@ -865,8 +865,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open IQ source (file or live SDR URI).
     //
     // Parameter resolution for file/stdin sources, with precedence:
-    //   explicit CLI flag  >  GQRX filename auto-detect  >  existing default
-    // For live SDR, GQRX detection is skipped (the source is a device URI).
+    //   explicit CLI flag  >  capture filename auto-detect  >  existing default
+    // For live SDR, filename detection is skipped (the source is a device URI).
     //
     // - stdin/file: use --sample-rate / --format when provided
     // - airspy://: 4.096 MS/s IQ (matching welle.io's approach).
@@ -877,14 +877,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   This avoids fractional resampling, giving clean OFDM sync.
     // - others default: 2.048 MS/s
     let is_device = is_device_uri(source);
-    let gqrx_meta = if !is_device {
-        desperado::gqrx::parse_gqrx_filename(source)
+    let file_meta = if !is_device {
+        capture_file_metadata(source)
     } else {
         None
     };
 
     // Resolve the actual RF center of the captured signal:
-    //   explicit --center-freq  >  GQRX filename  >  selected multiplex (no shift)
+    //   explicit --center-freq  >  capture filename  >  selected multiplex (no shift)
     // The default (== multiplex frequency) yields a zero downconversion shift,
     // preserving behavior for narrowband captures centred on the channel. For
     // live SDR the device is tuned to this resolved center; a non-default value
@@ -893,7 +893,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for RTL-SDR where bandwidth == sample rate.)
     let input_center = if let Some(hz) = cli.center_freq {
         hz
-    } else if let Some(meta) = gqrx_meta {
+    } else if let Some(meta) = file_meta {
         meta.center_freq_hz
     } else {
         center_freq
@@ -901,14 +901,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shift_hz: i32 = center_freq as i32 - input_center as i32;
 
     let iq_format = if let Some(fmt) = &cli.format {
-        match fmt.as_str() {
-            "cu8" => IqFormat::Cu8,
-            "cs8" => IqFormat::Cs8,
-            "cs16" => IqFormat::Cs16,
-            "cf32" => IqFormat::Cf32,
-            other => return Err(format!("Unknown IQ format: {}", other).into()),
-        }
-    } else if let Some(meta) = gqrx_meta {
+        fmt.parse::<IqFormat>()
+            .map_err(|err| format!("Unknown IQ format: {err}"))?
+    } else if let Some(meta) = file_meta {
         meta.format
     } else {
         IqFormat::Cu8
@@ -921,18 +916,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let input_rate = if let Some(r) = cli.sample_rate {
         r
-    } else if let Some(meta) = gqrx_meta {
+    } else if let Some(meta) = file_meta {
         meta.sample_rate_hz
     } else {
         default_input_rate
     };
 
-    if let Some(meta) = gqrx_meta {
+    if let Some(meta) = file_meta {
         info!(
             center_freq_hz = meta.center_freq_hz,
             sample_rate_hz = meta.sample_rate_hz,
             format = %meta.format,
-            "Auto-detected GQRX capture parameters from file name"
+            "Auto-detected capture parameters from file name"
         );
     }
     info!(
@@ -2406,9 +2401,62 @@ fn restart_audio_server() {
     );
 }
 
+/// Capture parameters dabradio can take from a recording's file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileMeta {
+    center_freq_hz: u32,
+    sample_rate_hz: u32,
+    format: IqFormat,
+}
+
+/// Recognise raw I/Q capture names (GQRX and rtl_sdr conventions, including
+/// `.zst`) via [`desperado::capture`]. Names that do not encode center
+/// frequency, sample rate and format, such as SDRuno WAV files, are ignored.
+fn capture_file_metadata(path: &str) -> Option<FileMeta> {
+    use desperado::capture::{CaptureConvention, parse_capture_filename};
+
+    let meta = parse_capture_filename(path)?;
+    if !matches!(
+        meta.convention,
+        CaptureConvention::Gqrx | CaptureConvention::RtlSdr
+    ) {
+        return None;
+    }
+    Some(FileMeta {
+        center_freq_hz: meta.center_freq_hz?,
+        sample_rate_hz: meta.sample_rate_hz?,
+        format: meta.format?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_gqrx_and_rtlsdr_capture_names() {
+        assert_eq!(
+            capture_file_metadata("gqrx_20260314_131130_223936000_2048000_fc.raw.zst"),
+            Some(FileMeta {
+                center_freq_hz: 223_936_000,
+                sample_rate_hz: 2_048_000,
+                format: IqFormat::Cf32,
+            })
+        );
+        assert_eq!(
+            capture_file_metadata("rtlsdr_199360000_2048000_dabradio_8C.cu8"),
+            Some(FileMeta {
+                center_freq_hz: 199_360_000,
+                sample_rate_hz: 2_048_000,
+                format: IqFormat::Cu8,
+            })
+        );
+        assert_eq!(capture_file_metadata("dab_12A_2min.iq"), None);
+        assert_eq!(
+            capture_file_metadata("SDRuno_20200908_152020Z_223936kHz.wav"),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn stopping_a_sync_source_is_a_noop() {
