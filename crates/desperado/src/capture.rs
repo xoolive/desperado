@@ -8,6 +8,7 @@
 //! | Convention | Example | Carries |
 //! |---|---|---|
 //! | GQRX | `gqrx_20260603_083011_134000000_8000000_fc.raw` | center, rate, format, start (UTC) |
+//! | RTL-SDR/Airspy (timestamped) | `airspy_20260127_141241_1090000000_6000000_cs16_v8_l8_m0.raw` | center, rate, format, start (UTC) |
 //! | SDRuno | `SDRuno_20200908_152020Z_129535kHz.wav` | center, start (UTC) |
 //! | rtl_sdr (dated) | `rtlsdr_20260728_94500000_1024000_cu8.iq` | center, rate, format |
 //! | rtl_sdr | `rtlsdr_136850000_1050000_dumpvdl_6min.rtl` | center, rate, format (`cu8`) |
@@ -37,8 +38,10 @@ pub enum CaptureConvention {
     Gqrx,
     /// `SDRuno_<YYYYMMDD>_<HHMMSS>Z_<freq>kHz`
     Sdruno,
-    /// `rtlsdr_[<YYYYMMDD>_]<freqHz>_<rateHz>[_...]`
+    /// `rtlsdr_[<YYYYMMDD>_[<HHMMSS>_]]<freqHz>_<rateHz>[_...]`
     RtlSdr,
+    /// `airspy_<YYYYMMDD>_<HHMMSS>_<freqHz>_<rateHz>_<fmt>[_...]`
+    Airspy,
 }
 
 /// Capture parameters recovered from a file name. Fields a convention does
@@ -54,7 +57,9 @@ pub struct CaptureMeta {
     pub sample_rate_hz: Option<u32>,
     /// Raw I/Q sample format. `None` for container formats such as WAV.
     pub format: Option<IqFormat>,
-    /// Start of the recording, when the name carries a full UTC date and time.
+    /// Nominal start encoded by a full UTC date and time in the name.
+    /// Filename parsing does not certify clock accuracy or GPS provenance;
+    /// recorder/filesystem-derived timing should be documented separately.
     pub start: Option<SystemTime>,
 }
 
@@ -68,6 +73,7 @@ pub fn parse_capture_filename(path: impl AsRef<Path>) -> Option<CaptureMeta> {
         "gqrx" => parse_gqrx(path, &parts),
         "sdruno" => parse_sdruno(&parts),
         "rtlsdr" => parse_rtlsdr(path, &parts),
+        "airspy" => parse_timestamped_raw(&parts, CaptureConvention::Airspy),
         _ => None,
     }
 }
@@ -113,6 +119,26 @@ fn parse_sdruno(parts: &[&str]) -> Option<CaptureMeta> {
     })
 }
 
+/// Shared GQRX-style raw layout for receiver-prefixed recordings. Trailing
+/// settings are labels only; they do not change frequency/rate/format. A full
+/// but invalid UTC date/time leaves the clock absent, as for GQRX.
+fn parse_timestamped_raw(parts: &[&str], convention: CaptureConvention) -> Option<CaptureMeta> {
+    let digits = |s: &str, width| s.len() == width && s.bytes().all(|b| b.is_ascii_digit());
+    if parts.len() < 6 || !digits(parts[1], 8) || !digits(parts[2], 6) {
+        return None;
+    }
+    let center_freq_hz = parts[3].parse::<u32>().ok()?;
+    let sample_rate_hz = parts[4].parse::<u32>().ok()?;
+    let format = parts[5].parse::<IqFormat>().ok()?;
+    (center_freq_hz != 0 && sample_rate_hz != 0).then(|| CaptureMeta {
+        convention,
+        center_freq_hz: Some(center_freq_hz),
+        sample_rate_hz: Some(sample_rate_hz),
+        format: Some(format),
+        start: utc_from_parts(parts[1], parts[2]),
+    })
+}
+
 fn parse_rtlsdr(path: &Path, parts: &[&str]) -> Option<CaptureMeta> {
     let is_date = |s: &str| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit());
     let freq_and_rate = |rest: &[&str]| -> Option<(u32, u32)> {
@@ -124,6 +150,23 @@ fn parse_rtlsdr(path: &Path, parts: &[&str]) -> Option<CaptureMeta> {
     // 8-digit field may also be a 10-99 MHz frequency, so the dated layout is
     // only used when a frequency and a rate follow it.
     let dated = parts.len() > 1 && is_date(parts[1]);
+    if dated && parts.len() >= 5 {
+        // Prefer an explicit legacy format at field4: a dated LF capture can
+        // have a six-digit frequency, which must not become HHMMSS. Otherwise
+        // reserve the timestamped layout before the legacy numeric fallback,
+        // including malformed clock/format tokens, to avoid reading a time
+        // such as071950 as the center frequency.
+        let legacy_format = parts[4].parse::<IqFormat>().is_ok();
+        let timestamped = parts[2].len() <= 6
+            && (parts[2].len() == 6
+                || parts
+                    .get(5)
+                    .is_some_and(|token| token.parse::<IqFormat>().is_ok())
+                || (parts[3].parse::<u32>().is_ok() && parts[4].parse::<u32>().is_ok()));
+        if !legacy_format && timestamped {
+            return parse_timestamped_raw(parts, CaptureConvention::RtlSdr);
+        }
+    }
     let (rest, (center_freq_hz, sample_rate_hz)) = dated
         .then(|| freq_and_rate(&parts[2..]).map(|fr| (&parts[2..], fr)))
         .flatten()
@@ -266,6 +309,97 @@ mod tests {
         assert!(parse_capture_filename("rtlsdr_dab_12A.iq").is_none());
         // An impossible date keeps the other GQRX fields but gives no start.
         let meta = parse_capture_filename("gqrx_20260230_083011_134000000_8000000_fc.raw").unwrap();
+        assert_eq!(meta.start, None);
+    }
+
+    #[test]
+    fn timestamped_receiver_names_keep_time_out_of_frequency_fields() {
+        for (name, convention, rate, format, start) in [
+            (
+                "rtlsdr_20251105_071950_1090000000_2400000_cu8.raw",
+                CaptureConvention::RtlSdr,
+                2_400_000,
+                IqFormat::Cu8,
+                1_762_327_190,
+            ),
+            (
+                "airspy_20260112_230839_1090000000_6000000_cs16.raw",
+                CaptureConvention::Airspy,
+                6_000_000,
+                IqFormat::Cs16,
+                1_768_259_319,
+            ),
+            (
+                "airspy_20260127_141241_1090000000_6000000_cs16_v8_l8_m0.raw",
+                CaptureConvention::Airspy,
+                6_000_000,
+                IqFormat::Cs16,
+                1_769_523_161,
+            ),
+        ] {
+            for name in [
+                name.to_owned(),
+                format!("{name}.zst"),
+                format!("{}.ZST", name.to_uppercase()),
+            ] {
+                let meta = parse_capture_filename(name).unwrap();
+                assert_eq!(meta.convention, convention);
+                assert_eq!(meta.center_freq_hz, Some(1_090_000_000));
+                assert_eq!(meta.sample_rate_hz, Some(rate));
+                assert_eq!(meta.format, Some(format));
+                assert_eq!(meta.start, at(start));
+            }
+        }
+    }
+
+    #[test]
+    fn timestamped_receivers_require_complete_parameter_fields() {
+        for prefix in ["rtlsdr", "airspy"] {
+            for tail in [
+                "20251105_071950_1090000000_2400000_bad.raw",
+                "20251105_071950_0_2400000_cu8.raw",
+                "20251105_071950_1090000000_0_cu8.raw",
+                "20251105_071950_4294967296_2400000_cu8.raw",
+                "20251105_071950_bad_2400000_cu8.raw",
+                "20251105_071950_1090000000_bad_cu8.raw",
+                "20251105_71950_1090000000_2400000_cu8.raw",
+                "20251105_07xx50_1090000000_2400000_cu8.raw",
+                "20251105_071950_1090000000_2400000.raw",
+            ] {
+                assert!(
+                    parse_capture_filename(format!("{prefix}_{tail}")).is_none(),
+                    "{prefix}_{tail}"
+                );
+            }
+            let meta = parse_capture_filename(format!(
+                "{prefix}_20260230_250000_1090000000_6000000_cs16.raw"
+            ))
+            .unwrap();
+            assert_eq!(meta.center_freq_hz, Some(1_090_000_000));
+            assert_eq!(meta.sample_rate_hz, Some(6_000_000));
+            assert_eq!(meta.start, None); // Never fabricate an invalid UTC clock.
+        }
+    }
+
+    #[test]
+    fn receiver_extensions_preserve_legacy_dated_frequency_layouts() {
+        for name in [
+            "rtlsdr_20260728_500000_1024000_cu8_extra.iq",
+            "rtlsdr_20260728_500000_1024000_cu8.iq",
+        ] {
+            let meta = parse_capture_filename(name).unwrap();
+            assert_eq!(meta.center_freq_hz, Some(500_000));
+            assert_eq!(meta.sample_rate_hz, Some(1_024_000));
+            assert_eq!(meta.start, None);
+        }
+        let numeric_label =
+            parse_capture_filename("rtlsdr_20260728_94500000_1024000_12_gain.raw").unwrap();
+        assert_eq!(numeric_label.center_freq_hz, Some(94_500_000));
+        assert_eq!(numeric_label.sample_rate_hz, Some(1_024_000));
+        let meta =
+            parse_capture_filename("rtlsdr_20260728_136850000_1050000_dumpvdl_6min.rtl").unwrap();
+        assert_eq!(meta.center_freq_hz, Some(136_850_000));
+        assert_eq!(meta.sample_rate_hz, Some(1_050_000));
         assert_eq!(meta.start, None);
     }
 
