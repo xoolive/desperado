@@ -1,0 +1,5 @@
+This directory vendors syom 0.6.0, an MIT-licensed pure-Rust AAC codec:
+https://github.com/ekhodzitsky/syom
+
+The source has been reduced by removing upstream tests, test vectors, and
+benchmarks. Local HDC adaptations will be documented here as they are added.
