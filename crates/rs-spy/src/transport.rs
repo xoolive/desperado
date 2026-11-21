@@ -312,22 +312,11 @@ impl Airspy {
 
     /// Open a device from nusb DeviceInfo.
     ///
-    /// This follows the libairspy initialization sequence:
-    /// 1. Open the USB device
-    /// 2. Detach kernel driver (Linux only)
-    /// 3. Claim interface 0
+    /// Claim interface 0 without detaching another userspace owner.
     fn open_device_info(dev_info: nusb::DeviceInfo) -> Result<Self> {
         let usb_device = dev_info.open().wait().map_err(Error::OpenFailed)?;
-
-        // On Linux, detach kernel driver if attached to interface 0
-        #[cfg(target_os = "linux")]
-        {
-            let _ = usb_device.detach_kernel_driver(0);
-        }
-
-        // Claim interface 0
         let iface = usb_device
-            .claim_interface(0)
+            .detach_and_claim_interface(0)
             .wait()
             .map_err(Error::ClaimFailed)?;
 
