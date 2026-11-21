@@ -825,7 +825,7 @@ impl Airspy {
         // First, ensure receiver is off
         self.set_receiver_mode(RECEIVER_MODE_OFF)?;
 
-        // Clear the bulk endpoint to remove any stale data
+        // Clear halt and reset the bulk endpoint's data toggle.
         if let Err(e) = self.clear_halt() {
             tracing::debug!("Failed to clear halt on bulk endpoint: {}", e);
         }
@@ -1016,15 +1016,16 @@ impl Airspy {
         }
     }
 
-    /// Clear halt on the bulk IN endpoint.
-    ///
-    /// nusb does not expose a direct clear_halt API on Interface; the endpoint
-    /// queue handles stale state through the submit/complete cycle. This is
-    /// kept as a no-op to preserve the libairspy initialization sequence
-    /// comments without changing behavior.
+    /// Clear halt and reset the bulk IN endpoint's data toggle.
     fn clear_halt(&self) -> Result<()> {
-        // nusb handles endpoint state internally — no explicit clear_halt needed
-        Ok(())
+        let mut endpoint = self
+            .iface
+            .endpoint::<Bulk, In>(BULK_ENDPOINT_IN)
+            .map_err(|e| Error::StreamingError(format!("failed to open bulk endpoint: {e}")))?;
+        endpoint
+            .clear_halt()
+            .wait()
+            .map_err(|e| Error::StreamingError(format!("failed to clear bulk endpoint halt: {e}")))
     }
 
     // ========================================================================
