@@ -312,22 +312,11 @@ impl Airspy {
 
     /// Open a device from nusb DeviceInfo.
     ///
-    /// This follows the libairspy initialization sequence:
-    /// 1. Open the USB device
-    /// 2. Detach kernel driver (Linux only)
-    /// 3. Claim interface 0
+    /// Claim interface 0 without detaching another userspace owner.
     fn open_device_info(dev_info: nusb::DeviceInfo) -> Result<Self> {
         let usb_device = dev_info.open().wait().map_err(Error::OpenFailed)?;
-
-        // On Linux, detach kernel driver if attached to interface 0
-        #[cfg(target_os = "linux")]
-        {
-            let _ = usb_device.detach_kernel_driver(0);
-        }
-
-        // Claim interface 0
         let iface = usb_device
-            .claim_interface(0)
+            .detach_and_claim_interface(0)
             .wait()
             .map_err(Error::ClaimFailed)?;
 
@@ -836,7 +825,7 @@ impl Airspy {
         // First, ensure receiver is off
         self.set_receiver_mode(RECEIVER_MODE_OFF)?;
 
-        // Clear the bulk endpoint to remove any stale data
+        // Clear halt and reset the bulk endpoint's data toggle.
         if let Err(e) = self.clear_halt() {
             tracing::debug!("Failed to clear halt on bulk endpoint: {}", e);
         }
@@ -1027,15 +1016,16 @@ impl Airspy {
         }
     }
 
-    /// Clear halt on the bulk IN endpoint.
-    ///
-    /// nusb does not expose a direct clear_halt API on Interface; the endpoint
-    /// queue handles stale state through the submit/complete cycle. This is
-    /// kept as a no-op to preserve the libairspy initialization sequence
-    /// comments without changing behavior.
+    /// Clear halt and reset the bulk IN endpoint's data toggle.
     fn clear_halt(&self) -> Result<()> {
-        // nusb handles endpoint state internally — no explicit clear_halt needed
-        Ok(())
+        let mut endpoint = self
+            .iface
+            .endpoint::<Bulk, In>(BULK_ENDPOINT_IN)
+            .map_err(|e| Error::StreamingError(format!("failed to open bulk endpoint: {e}")))?;
+        endpoint
+            .clear_halt()
+            .wait()
+            .map_err(|e| Error::StreamingError(format!("failed to clear bulk endpoint halt: {e}")))
     }
 
     // ========================================================================
